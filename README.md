@@ -5,6 +5,57 @@
 
 ---
 
+## v2.0 (CascadiaMesh fork): what changed and why
+
+v1.1 relayed traffic but behaved in ways that hurt a shared regional mesh. v2.0
+rewrites the forwarding logic to follow upstream MeshCore
+(`src/Mesh.cpp` + `examples/simple_repeater`) as closely as a 20 KB-RAM,
+no-filesystem part allows.
+
+| Problem in v1.1 | v2.0 behaviour |
+|---|---|
+| The 2-minute "local" advert was sent as `FLOOD`, so every repeater relayed it mesh-wide | Zero-hop adverts are `DIRECT` with an empty path (upstream `sendZeroHop`). Flood adverts every 47 h, as upstream |
+| `TRANSPORT_*` packets parsed without their 4 transport-code bytes → corrupted on relay | Parsed per `Packet::readFrom`; codes preserved |
+| Region scoping ignored | Scoped floods forwarded only for regions in `REGIONS` (same HMAC check as `RegionMap::findMatch`). Own flood adverts can be scoped with `ADVERT_SCOPE` |
+| `DIRECT` relayed if our hash appeared *anywhere* in the path, unchanged, no dedup → broken DMs, possible ping-pong | Forwarded only when we are the next hop, self removed from path, deduplicated. ACK / multipart ACK / TRACE handled as upstream |
+| Every payload type flooded | Only types upstream floods; adverts signature-verified first; hop limits `flood.max`, `flood.max.unscoped`, `flood.max.advert` (8); loop detection |
+| Blind 300–800 ms `delay()` with the radio deaf | Listen-before-talk on SX1262 preamble/header IRQs, randomized `tx_delay_factor` delays, TX queue with RX running, airtime budget |
+| Advert timestamp = build time + uptime → goes backwards on every reboot (nodes ignore it as a replay); wraps at 49 days | Flash journal keeps time monotonic across reboots; clock pulled forward to the median of verified neighbour adverts |
+| EU frequency hard-coded, preamble 8 | US/Canada preset by default, everything a build flag; preamble 16 as upstream; TCXO/crystal auto-detected |
+| Busy-polling at 72 MHz | MCU sleeps (`WFI`) between polls |
+
+Still **not** included (no room / no storage): CLI, remote admin login, telemetry,
+private (`$`) regions, path-return / neighbour tables. It is a dumb, well-behaved
+repeater: configure at build time, flash, deploy.
+
+**Status:** compiles (≈60 KB of the 63 KB budget) and passes the host-side tests in
+`test/host/` (forwarding rules, region codes cross-checked against a Python HMAC
+reference, journal wear/rollover). **Not yet RF-tested on hardware.** Test on the bench
+next to a known-good MeshCore repeater before deploying.
+
+### Configuring (platformio.ini `build_flags`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `LORA_FREQ` / `LORA_BW` / `LORA_SF` / `LORA_CR` | 910.525 / 62.5 / 7 / 5 | Radio preset (`env:specter_eu` has the old EU values) |
+| `LORA_TX_POWER` | 20 | dBm (DX-LR30 max 22) |
+| `NODE_NAME_STR` | `SPECTER-XXXX` | Callsign, ≤ 23 chars |
+| `NODE_LAT_I` / `NODE_LON_I` | — | Location × 1e6 |
+| `REGIONS` | `""` | Comma list of hashtag regions whose scoped floods we forward. **Empty = scoped floods are dropped**, same as an unconfigured upstream repeater |
+| `ADVERT_SCOPE` | — | Region to scope our own flood adverts to |
+| `ALLOW_UNSCOPED_FLOOD` | 1 | Forward plain `FLOOD` packets (0 = wildcard deny) |
+| `FLOOD_MAX` / `FLOOD_MAX_UNSCOPED` / `FLOOD_MAX_ADVERT` | 64 / 64 / 8 | Hop limits |
+| `ADVERT_INTERVAL_MIN` / `FLOOD_ADVERT_INTERVAL_H` | 2 / 47 | Advert timing (upstream defaults) |
+| `PATH_HASH_SIZE` | 1 | Path hash bytes for packets we originate |
+| `TX_DELAY_FACTOR` / `DIRECT_TX_DELAY_FACTOR` / `AIRTIME_FACTOR` | 0.5 / 0.3 / 1.0 | Upstream repeater defaults |
+| `IDENTITY_SALT` | old v1 salt | Secret mixed into the UID-derived key. The default keeps v1 identities but means anyone who learns a board's UID can derive its key; set a private salt for new deployments (changes the node's identity) |
+| `FIXED_PRIVKEY_HEX` | — | Use an explicit key instead (see `tools/gen_identity.py`) |
+
+The serial log prints the active preset, regions, and whether the radio came up in
+TCXO or plain-crystal mode.
+
+---
+
 ## What is this?
 
 A fully autonomous **MeshCore flood repeater** running native C++ firmware on a
@@ -27,7 +78,7 @@ flowchart LR
 
     subgraph DX30["  DX-LR30 Module  "]
         STM["STM32F103C8T6\n72 MHz Cortex-M3\n64 KB Flash · 20 KB RAM"]:::hw
-        SX["SX1262\nLoRa Transceiver\n869.6 MHz"]:::hw
+        SX["SX1262\nLoRa Transceiver\n910.525 MHz"]:::hw
         STM -- "SPI1 + RF switch" --> SX
     end
 
@@ -95,7 +146,7 @@ flowchart TD
 
     BOOT([Power On]):::init
     ID["Identity Init\nUID → pubkey · hash"]:::init
-    RADIO["Radio Init\n869.618 MHz · SF8 · BW62.5\nSyncWord=0x12 · 14 dBm"]:::init
+    RADIO["Radio Init\n910.525 MHz · SF7 · BW62.5\nSyncWord=0x12 · 20 dBm"]:::init
     OK{Init OK?}:::init
     HALT(["⚠ Halt, LED blinks"]):::drop
 
@@ -183,26 +234,29 @@ Bytes N..:  payload (ADVERT / MESSAGE / etc.)
 
 | Route type | Value | SPECTER action |
 |---|---|---|
-| `TRANSPORT_FLOOD` | `0x00` | Relay — append own hash, flood |
-| `FLOOD` | `0x01` | Relay — append own hash, flood |
-| `DIRECT` | `0x02` | Relay unchanged **if** own hash is in pre-built path |
-| `TRANSPORT_DIRECT` | `0x03` | Relay unchanged **if** own hash is in pre-built path |
+| `TRANSPORT_FLOOD` | `0x00` | Relay only if the transport code matches a region in `REGIONS`; codes kept, own hash appended |
+| `FLOOD` | `0x01` | Relay if `ALLOW_UNSCOPED_FLOOD`; own hash appended |
+| `DIRECT` | `0x02` | Relay only if own hash is the **first** (next-hop) entry; own hash removed |
+| `TRANSPORT_DIRECT` | `0x03` | Same as `DIRECT`, transport codes kept |
 
-For **FLOOD** types: dedup cache + loop detection (own hash already in path) prevent
-storms. For **DIRECT** types: the full route is pre-computed by the source node;
-SPECTER only forwards if it is on that route.
+Floods also pass hop limits, loop detection, a payload-type check, dedup, and (for
+adverts) Ed25519 verification. Direct packets are deduplicated too. See the v2.0
+table above.
 
 ### Radio Configuration
 
 | Parameter | Value | Why |
 |-----------|-------|-----|
-| Frequency | 869.618 MHz | EU868 MeshCore channel |
-| Spreading Factor | SF8 | Balance range/speed |
-| Bandwidth | 62.5 kHz | Narrow, more range |
-| Coding Rate | 4/8 | EU/UK Narrow preset standard |
+| Frequency | 910.525 MHz | MeshCore USA/Canada (Recommended) |
+| Spreading Factor | SF7 | |
+| Bandwidth | 62.5 kHz | Narrow preset |
+| Coding Rate | 4/5 | |
+| Preamble | 16 symbols | Matches upstream MeshCore |
 | Sync Word | 0x12 | LoRa private network |
-| TX Power | 14 dBm | Compliant + range |
-| CRC | 16-bit | Enabled |
+| TX Power | 20 dBm | Override with `LORA_TX_POWER` |
+| CRC | on | |
+
+`pio run -e specter_eu` builds the original EU/UK narrow settings (869.618 MHz, SF8, CR4/8, 14 dBm).
 
 ---
 
@@ -238,12 +292,19 @@ pio run -e specter
 ### Memory Usage
 
 ```
-RAM:   ██░░░░░░░░  15.2%  (3116 / 20480 bytes)
-Flash: ████░░░░░░  38.5%  (50408 / 131072 bytes)*
+RAM:   ███░░░░░░░  29.6%  (6068 / 20480 bytes)
+Flash: █████████░  92.9%  (59948 / 64512 bytes)
 ```
 
-\* Many STM32F103C8T6 clones have 128KB flash (labeled as 64KB). SPECTER
-fits comfortably in genuine 64KB chips as well (~79% utilization).
+The image is capped at 63 KB (`board_upload.maximum_size`) because the last 1 KB page
+of the first 64 KB holds the clock journal, so it works on genuine 64 KB C8 chips.
+
+### Host tests
+
+```bash
+git clone https://github.com/rweather/arduinolibs
+CRYPTO_DIR=$PWD/arduinolibs/libraries/Crypto ./test/host/run.sh
+```
 
 ---
 

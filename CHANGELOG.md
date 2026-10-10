@@ -2,7 +2,31 @@
 
 All notable changes to SPECTER firmware are documented here.
 
-## [1.1.0] - Current
+## [2.0.0-cascadia] - 2026-10-09
+
+Forwarding rewritten to follow upstream MeshCore (Mesh.cpp + simple_repeater).
+
+### Fixed
+- Zero-hop adverts were sent as FLOOD and relayed mesh-wide every 2 minutes; now DIRECT with an empty path
+- TRANSPORT_FLOOD / TRANSPORT_DIRECT packets were mis-parsed (transport codes treated as path length) and corrupted on relay
+- DIRECT packets were relayed when our hash appeared anywhere in the path, without removing ourselves or deduplicating (broken DMs/acks, possible ping-pong between two SPECTER nodes)
+- Advert timestamps went backwards after every reboot and wrapped at 49.7 days of uptime
+- Preamble length 8 → 16 to match upstream
+- Blocking `delay()` before every transmit left the radio deaf
+
+### Added
+- Region scoping: `REGIONS` (forward scoped floods for these hashtag regions) and `ADVERT_SCOPE`
+- Flood hop limits, loop detection, payload-type filter, Ed25519 verification of forwarded adverts
+- ACK, multipart ACK and TRACE direct forwarding
+- Listen-before-talk, randomized retransmit delays, TX queue, airtime budget
+- Flash journal for monotonic time and last flood-advert time; clock learning from verified adverts
+- All radio/advert/policy settings as build flags; US/Canada preset by default, `env:specter_eu` for the old settings
+- TCXO auto-detect with plain-crystal fallback
+- `IDENTITY_SALT` option
+- WFI sleep between polls
+- Host-side tests in `test/host/`
+
+## [1.1.0]
 
 ### Added
 - **Ed25519 cryptographic signing** of ADVERT packets using rweather/Crypto library
