@@ -22,13 +22,24 @@ inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
 inline int analogRead(int) { return 0; }
 inline void __WFI() {}
+inline void NVIC_SystemReset() {}
+#include <string>
 struct FakeSerial {
+  std::string out, in;
+  int available() { return (int)in.size(); }
+  char read() { char c = in[0]; in.erase(0, 1); return c; }
+  void flush() {}
   void begin(int) {}
-  template<class T> void print(T v) { (void)v; }
+  void print(const char* v) { out += v; }
+  void print(char* v) { out += v; }
+  void print(char v) { out += v; }
+  template<class T> void print(T v) { out += std::to_string(v); }
   template<class T> void print(T v, int) { (void)v; }
-  template<class T> void println(T v) { (void)v; }
+  void println(const char* v) { out += v; out += "\n"; }
+  void println(char* v) { out += v; out += "\n"; }
+  template<class T> void println(T v) { out += std::to_string(v); out += "\n"; }
   template<class T> void println(T v, int) { (void)v; }
-  void println() {}
+  void println() { out += "\n"; }
 };
 extern FakeSerial Serial1;
 // Fake flash

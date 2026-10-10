@@ -1,27 +1,15 @@
 /*
  * SPECTER — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.0.0-cascadia
+ * Version: 2.1.0-cascadia
  *
- * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). The forwarding rules
- * below follow upstream MeshCore's Mesh.cpp + simple_repeater as closely as a
- * 20 KB-RAM, no-filesystem target allows:
+ * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). Forwarding follows upstream
+ * MeshCore (src/Mesh.cpp + examples/simple_repeater) as closely as a 20 KB-RAM,
+ * no-filesystem target allows, and the USB serial console speaks the same
+ * command language as an upstream MeshCore repeater ("set name …", "get radio",
+ * "region put …", replies prefixed with "  -> ").
  *
- *   - Zero-hop adverts are sent DIRECT with an empty path (never flooded).
- *   - Flood adverts every FLOOD_ADVERT_INTERVAL_H hours (default 47, as upstream),
- *     optionally region-scoped via ADVERT_SCOPE.
- *   - TRANSPORT_* packets are parsed with their 4 bytes of transport codes.
- *     Scoped floods are forwarded only for regions listed in REGIONS
- *     (same HMAC transport-code check as upstream RegionMap::findMatch).
- *   - DIRECT packets are forwarded only when this node is the NEXT hop, with
- *     itself removed from the path, and deduplicated. TRACE is supported.
- *   - Flood hop limits (flood.max / unscoped / advert) and loop detection.
- *   - Only payload types upstream would forward are flooded.
- *   - Advert signatures are verified before forwarding.
- *   - Listen-before-talk using the SX1262 preamble/header IRQs, randomized
- *     retransmit delays (tx_delay_factor), and an airtime budget.
- *   - Advert timestamps never go backwards across reboots (flash journal), and
- *     the clock is pulled forward to the median of verified neighbor adverts.
- *   - MCU sleeps (WFI) between polls.
+ * Settings live in a 1 KB flash page and survive reboots. The -D build flags
+ * below are only the defaults used on first boot or after "erase".
  *
  * Pin mapping (DX-LR30):
  *   SPI1 : SCK=PA5  MISO=PA6  MOSI=PA7
@@ -38,18 +26,17 @@
 #include <Ed25519.h>
 #include <IWatchdog.h>
 
-#define FW_VERSION "2.0.0-cascadia"
+#define FW_VERSION "2.1.0-cascadia"
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Configuration — every value can be overridden with -D in platformio.ini
+//  First-boot defaults — override with -D in platformio.ini (or change at
+//  runtime over USB serial; runtime settings win once saved).
 // ═════════════════════════════════════════════════════════════════════════════
-
-// Radio. Defaults = MeshCore "USA/Canada (Recommended)" preset.
-#ifndef LORA_FREQ
-#define LORA_FREQ 910.525f
+#ifndef LORA_FREQ_KHZ
+#define LORA_FREQ_KHZ 910525      // MeshCore "USA/Canada (Recommended)"
 #endif
-#ifndef LORA_BW
-#define LORA_BW 62.5f
+#ifndef LORA_BW_HZ
+#define LORA_BW_HZ 62500
 #endif
 #ifndef LORA_SF
 #define LORA_SF 7
@@ -64,25 +51,20 @@
 #define LORA_PREAMBLE 16          // upstream MeshCore uses 16
 #endif
 #ifndef LORA_SYNC
-#define LORA_SYNC 0x12            // RADIOLIB_SX126X_SYNC_WORD_PRIVATE
+#define LORA_SYNC 0x12
 #endif
 #ifndef LORA_TCXO_VOLTAGE
 #define LORA_TCXO_VOLTAGE 1.6f    // retried at 0.0 (plain crystal) if init fails
 #endif
-
-// Adverts
 #ifndef ADVERT_INTERVAL_MIN
-#define ADVERT_INTERVAL_MIN 2     // zero-hop advert interval (upstream default); 0 = off
+#define ADVERT_INTERVAL_MIN 2     // zero-hop advert interval (upstream new-install default)
 #endif
 #ifndef FLOOD_ADVERT_INTERVAL_H
 #define FLOOD_ADVERT_INTERVAL_H 47
 #endif
-#ifndef PATH_HASH_SIZE
-#define PATH_HASH_SIZE 1          // 1..3 bytes per hop for packets we originate
+#ifndef PATH_HASH_MODE
+#define PATH_HASH_MODE 0          // 0..2 → 1..3 byte path hashes for packets we originate
 #endif
-// #define ADVERT_SCOPE "se-wa"   // send flood adverts scoped to this region
-
-// Forwarding policy
 #ifndef FLOOD_MAX
 #define FLOOD_MAX 64
 #endif
@@ -93,43 +75,28 @@
 #define FLOOD_MAX_ADVERT 8
 #endif
 #ifndef ALLOW_UNSCOPED_FLOOD
-#define ALLOW_UNSCOPED_FLOOD 1    // forward plain (un-scoped) FLOOD packets
+#define ALLOW_UNSCOPED_FLOOD 1    // wildcard region "*" allows flood
 #endif
 #ifndef REGIONS
-#define REGIONS ""                // e.g. "se-wa,seattle" — scoped floods to forward
+#define REGIONS ""                // e.g. "se-wa,seattle"
 #endif
-#ifndef TX_DELAY_FACTOR
-#define TX_DELAY_FACTOR 0.5f
+#ifndef DEFAULT_SCOPE
+#define DEFAULT_SCOPE ""          // region our flood adverts are scoped to ("" = un-scoped)
 #endif
-#ifndef DIRECT_TX_DELAY_FACTOR
-#define DIRECT_TX_DELAY_FACTOR 0.3f
+#ifndef TX_DELAY_X100
+#define TX_DELAY_X100 50          // txdelay 0.50
 #endif
-#ifndef AIRTIME_FACTOR
-#define AIRTIME_FACTOR 1.0f       // duty cycle = 1/(1+factor) → 50%
+#ifndef DIRECT_TX_DELAY_X100
+#define DIRECT_TX_DELAY_X100 30   // direct.txdelay 0.30
 #endif
-#ifndef VERIFY_ADVERTS
-#define VERIFY_ADVERTS 1          // check Ed25519 before forwarding adverts
+#ifndef AF_X100
+#define AF_X100 100               // af 1.00 → 50 % duty cycle
 #endif
-
-// Clock
-#ifndef LEARN_TIME
-#define LEARN_TIME 1              // pull clock forward from verified neighbor adverts
+#ifndef LOOP_DETECT
+#define LOOP_DETECT 2             // 0 off, 1 minimal, 2 moderate, 3 strict
 #endif
 #ifndef PERSIST_INTERVAL_MIN
-#define PERSIST_INTERVAL_MIN 15   // flash journal write interval
-#endif
-
-// Identity
-#ifndef IDENTITY_SALT
-#define IDENTITY_SALT "SPECTER-MESHCORE-KEY-V1"   // keep default to preserve old identities
-#endif
-
-// Misc
-#ifndef HEARTBEAT_S
-#define HEARTBEAT_S 60
-#endif
-#ifndef LED_ENABLE
-#define LED_ENABLE 1
+#define PERSIST_INTERVAL_MIN 15
 #endif
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -143,18 +110,21 @@
 #define PIN_RXEN  PA1
 #define PIN_LED   PB11
 
-// Flash journal: last 1 KB page of the first 64 KB (safe on genuine 64 KB parts).
-// platformio.ini caps the image at 63 KB so code can never overlap it.
+// Two 1 KB pages at the top of the first 64 KB (safe on genuine 64 KB parts).
+// platformio.ini caps the image at 62 KB so code can never overlap them.
+#ifndef CONFIG_ADDR
+#define CONFIG_ADDR   0x0800F800UL
+#endif
 #ifndef JOURNAL_ADDR
 #define JOURNAL_ADDR  0x0800FC00UL
 #endif
-#define JOURNAL_SIZE  1024U
+#define PAGE_SIZE     1024U
 #ifndef UID_BASE
-#define UID_BASE      0x1FFFF7E8UL    // 96-bit factory unique ID
+#define UID_BASE      0x1FFFF7E8UL
 #endif
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  MeshCore protocol constants (src/Packet.h, src/MeshCore.h)
+//  MeshCore protocol constants
 // ═════════════════════════════════════════════════════════════════════════════
 #define ROUTE_TRANSPORT_FLOOD   0x00
 #define ROUTE_FLOOD             0x01
@@ -185,95 +155,143 @@
 #define ADV_NAME_MASK     0x80
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  Persistent configuration
+// ═════════════════════════════════════════════════════════════════════════════
+#define CFG_MAGIC    0x32435053UL   // "SPC2"
+#define MAX_REGIONS  8
+#define REGION_NAME  20
+#define REGION_DENY_FLOOD 0x01
+
+struct Config {
+    uint32_t magic;
+    uint32_t freq_khz;
+    uint32_t bw_hz;
+    int32_t  lat_e6, lon_e6;
+    uint8_t  sf, cr, path_hash_mode, loop_detect;
+    int8_t   tx_dbm;
+    uint8_t  repeat, wildcard_flags, advert_interval_min;
+    uint8_t  flood_advert_h, flood_max, flood_max_unscoped, flood_max_advert;
+    uint8_t  txdelay_x100, direct_txdelay_x100;
+    uint16_t af_x100;
+    uint8_t  num_regions, default_region;     // default_region 0xFF = none
+    uint8_t  region_flags[MAX_REGIONS];
+    char     regions[MAX_REGIONS][REGION_NAME];
+    char     name[32];
+    uint8_t  privkey[32];
+    uint32_t check;
+};
+static Config cfg;
+
+static uint32_t cfg_checksum(const Config& c) {
+    const uint32_t* w = (const uint32_t*)&c;
+    uint32_t h = 0x811C9DC5UL;
+    for (unsigned i = 0; i < offsetof(Config, check) / 4; i++) { h ^= w[i]; h *= 16777619UL; }
+    return h;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  Small utilities
 // ═════════════════════════════════════════════════════════════════════════════
+static bool log_on = false;
+#define LOG(x)    do { if (log_on) Serial1.print(x); } while (0)
+#define LOGLN(x)  do { if (log_on) Serial1.println(x); } while (0)
+
 static uint32_t rng_state = 0x9E3779B9;
-static uint32_t rnd(void) {                 // xorshift32
+static uint32_t rnd(void) {
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 17;
     rng_state ^= rng_state << 5;
     return rng_state;
 }
-static uint32_t rnd_range(uint32_t lo, uint32_t hi) {   // [lo, hi)
+static uint32_t rnd_range(uint32_t lo, uint32_t hi) {
     return (hi <= lo) ? lo : lo + (rnd() % (hi - lo));
 }
 
-static void led(bool on) {
-#if LED_ENABLE
-    digitalWrite(PIN_LED, on ? HIGH : LOW);
-#else
-    (void)on;
-#endif
+static void led(bool on) { digitalWrite(PIN_LED, on ? HIGH : LOW); }
+
+static const char* skip_ws(const char* s) { while (*s == ' ') s++; return s; }
+
+// Parse "[-]123.456" into an integer scaled by 10^dec. Returns false on junk.
+static bool parse_fixed(const char* s, int dec, int32_t* out) {
+    s = skip_ws(s);
+    bool neg = false;
+    if (*s == '-') { neg = true; s++; } else if (*s == '+') s++;
+    if (!(*s >= '0' && *s <= '9') && *s != '.') return false;
+    int64_t v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    int d = 0;
+    if (*s == '.') { s++; while (*s >= '0' && *s <= '9') { if (d < dec) { v = v * 10 + (*s - '0'); d++; } s++; } }
+    while (d++ < dec) v *= 10;
+    s = skip_ws(s);
+    if (*s && *s != ',') return false;
+    *out = (int32_t)(neg ? -v : v);
+    return true;
 }
-static void led_blink(uint8_t n, uint16_t ms) {
-#if LED_ENABLE
-    for (uint8_t i = 0; i < n; i++) { led(true); delay(ms); led(false); if (i + 1 < n) delay(ms); }
-#else
-    (void)n; (void)ms;
-#endif
+
+// Format an integer scaled by 10^dec, trimming trailing zeros ("62500",3 → "62.5").
+static char* fmt_fixed(char* out, int32_t v, int dec) {
+    char* p = out;
+    if (v < 0) { *p++ = '-'; v = -v; }
+    uint32_t div = 1;
+    for (int i = 0; i < dec; i++) div *= 10;
+    p += sprintf(p, "%lu", (unsigned long)(v / div));
+    uint32_t frac = v % div;
+    if (dec && frac) {
+        *p++ = '.';
+        for (uint32_t d = div / 10; d && frac; d /= 10) { *p++ = '0' + frac / d; frac %= d; }
+    }
+    *p = 0;
+    return out;
+}
+
+static void to_hex(char* out, const uint8_t* b, int n) {
+    static const char hx[] = "0123456789ABCDEF";
+    for (int i = 0; i < n; i++) { *out++ = hx[b[i] >> 4]; *out++ = hx[b[i] & 15]; }
+    *out = 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Flash helpers
+// ═════════════════════════════════════════════════════════════════════════════
+static void flash_erase(uint32_t addr) {
+    FLASH_EraseInitTypeDef er = {};
+    er.TypeErase   = FLASH_TYPEERASE_PAGES;
+    er.PageAddress = addr;
+    er.NbPages     = 1;
+    uint32_t err = 0;
+    IWatchdog.reload();
+    HAL_FLASHEx_Erase(&er, &err);
+}
+
+static void cfg_save(void) {
+    cfg.check = cfg_checksum(cfg);
+    HAL_FLASH_Unlock();
+    flash_erase(CONFIG_ADDR);
+    const uint32_t* w = (const uint32_t*)&cfg;
+    for (unsigned i = 0; i < sizeof(Config) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CONFIG_ADDR + i * 4, w[i]);
+    HAL_FLASH_Lock();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Identity
 // ═════════════════════════════════════════════════════════════════════════════
-#ifdef NODE_NAME_STR
-static const char node_name[] = NODE_NAME_STR;
-#else
-static char node_name[14];
-#endif
-static uint8_t own_privkey[32];
 static uint8_t own_pubkey[32];
-
-#ifdef FIXED_PRIVKEY_HEX
-static void hex2bin(const char* hex, uint8_t* out, int len) {
-    for (int i = 0; i < len; i++) {
-        uint8_t hi = hex[2*i], lo = hex[2*i+1];
-        hi = (hi >= 'a') ? hi-'a'+10 : (hi >= 'A') ? hi-'A'+10 : hi-'0';
-        lo = (lo >= 'a') ? lo-'a'+10 : (lo >= 'A') ? lo-'A'+10 : lo-'0';
-        out[i] = (hi << 4) | lo;
-    }
-}
-#endif
-
-static void identity_init(void) {
-    const uint32_t uid[3] = {
-        ((volatile uint32_t*)UID_BASE)[0],
-        ((volatile uint32_t*)UID_BASE)[1],
-        ((volatile uint32_t*)UID_BASE)[2],
-    };
-    rng_state ^= uid[0] ^ (uid[1] << 7) ^ (uid[2] << 13);
-#ifndef NODE_NAME_STR
-    snprintf(node_name, sizeof(node_name), "SPECTER-%04X", (unsigned)(uid[2] & 0xFFFF));
-#endif
-#ifdef FIXED_PRIVKEY_HEX
-    hex2bin(FIXED_PRIVKEY_HEX, own_privkey, 32);
-#else
-    SHA256 sha;
-    sha.reset();
-    sha.update(IDENTITY_SALT, sizeof(IDENTITY_SALT) - 1);
-    sha.update((const uint8_t*)uid, 12);
-    sha.finalize(own_privkey, 32);
-#endif
-    Ed25519::derivePublicKey(own_pubkey, own_privkey);
-}
 
 static inline bool is_own_hash(const uint8_t* h, uint8_t len) {
     return memcmp(h, own_pubkey, len) == 0;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Regions (transport codes) — mirrors TransportKey::calcTransportCode
+//  Regions — mirrors RegionMap / TransportKey::calcTransportCode
 // ═════════════════════════════════════════════════════════════════════════════
-#define MAX_REGIONS 8
 static uint8_t region_keys[MAX_REGIONS][16];
-static char    region_names[MAX_REGIONS][24];
-static uint8_t num_regions = 0;
 
-// Key for a public hashtag region = first 16 bytes of SHA256("#name").
 static void region_key_for(const char* name, uint8_t key[16]) {
-    char tmp[26];
-    if (name[0] == '#') snprintf(tmp, sizeof(tmp), "%s", name);
-    else                snprintf(tmp, sizeof(tmp), "#%s", name);
+    char tmp[REGION_NAME + 2];
+    tmp[0] = '#';
+    strncpy(tmp + 1, name[0] == '#' ? name + 1 : name, REGION_NAME);
+    tmp[REGION_NAME + 1] = 0;
     uint8_t full[32];
     SHA256 sha;
     sha.reset();
@@ -282,25 +300,17 @@ static void region_key_for(const char* name, uint8_t key[16]) {
     memcpy(key, full, 16);
 }
 
-static void regions_init(void) {
-    const char* p = REGIONS;
-    while (*p && num_regions < MAX_REGIONS) {
-        while (*p == ',' || *p == ' ') p++;
-        if (!*p) break;
-        char name[24]; int n = 0;
-        while (*p && *p != ',' && *p != ' ' && n < (int)sizeof(name) - 1) name[n++] = *p++;
-        name[n] = 0;
-        while (*p && *p != ',') p++;
-        if (name[0] == '$') continue;       // private regions need a keystore — unsupported
-        const char* bare = (name[0] == '#') ? name + 1 : name;
-        strcpy(region_names[num_regions], bare);
-        region_key_for(name, region_keys[num_regions]);
-        num_regions++;
-    }
+static void regions_rekey(void) {
+    for (int i = 0; i < cfg.num_regions; i++) region_key_for(cfg.regions[i], region_keys[i]);
 }
 
-static uint16_t transport_code(const uint8_t key[16], uint8_t ptype,
-                               const uint8_t* payload, int plen) {
+static int region_find(const char* name) {
+    if (name[0] == '#') name++;
+    for (int i = 0; i < cfg.num_regions; i++) if (!strcmp(cfg.regions[i], name)) return i;
+    return -1;
+}
+
+static uint16_t transport_code(const uint8_t key[16], uint8_t ptype, const uint8_t* payload, int plen) {
     SHA256 sha;
     sha.resetHMAC(key, 16);
     sha.update(&ptype, 1);
@@ -314,9 +324,10 @@ static uint16_t transport_code(const uint8_t key[16], uint8_t ptype,
     return code;
 }
 
-// Returns region index, or -1 if this scoped packet belongs to no configured region.
+// Index of the flood-allowed region this scoped packet belongs to, or -1.
 static int region_match(uint16_t code0, uint8_t ptype, const uint8_t* payload, int plen) {
-    for (int i = 0; i < num_regions; i++) {
+    for (int i = 0; i < cfg.num_regions; i++) {
+        if (cfg.region_flags[i] & REGION_DENY_FLOOD) continue;
         if (transport_code(region_keys[i], ptype, payload, plen) == code0) return i;
     }
     return -1;
@@ -326,48 +337,48 @@ static int region_match(uint16_t code0, uint8_t ptype, const uint8_t* payload, i
 //  Clock — monotonic across reboots, learns forward from verified adverts
 // ═════════════════════════════════════════════════════════════════════════════
 static bool is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+static const uint8_t month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
 static uint32_t build_unix_ts(void) {
-    const char* d = __DATE__;   // "Oct  9 2026"
-    const char* t = __TIME__;   // "18:30:00"
+    const char* d = __DATE__;
+    const char* t = __TIME__;
     static const char mn[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     int month = 1;
     for (int m = 0; m < 12; m++)
         if (d[0]==mn[m*3] && d[1]==mn[m*3+1] && d[2]==mn[m*3+2]) { month = m+1; break; }
     int day  = (d[4]==' ' ? 0 : d[4]-'0')*10 + (d[5]-'0');
     int year = (d[7]-'0')*1000+(d[8]-'0')*100+(d[9]-'0')*10+(d[10]-'0');
-    int hour = (t[0]-'0')*10+(t[1]-'0');
-    int min  = (t[3]-'0')*10+(t[4]-'0');
-    int sec  = (t[6]-'0')*10+(t[7]-'0');
     uint32_t days = 0;
     for (int y = 1970; y < year; y++) days += is_leap(y) ? 366 : 365;
-    static const uint8_t md[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    for (int m = 1; m < month; m++) days += md[m-1] + ((m == 2 && is_leap(year)) ? 1 : 0);
+    for (int m = 1; m < month; m++) days += month_days[m-1] + ((m == 2 && is_leap(year)) ? 1 : 0);
     days += day - 1;
-    return days * 86400UL + hour*3600UL + min*60UL + sec;
+    return days * 86400UL + ((t[0]-'0')*10+(t[1]-'0'))*3600UL + ((t[3]-'0')*10+(t[4]-'0'))*60UL
+           + (t[6]-'0')*10+(t[7]-'0');
 }
 
-static uint32_t clk_base = 0;       // epoch seconds at uptime 0
-static uint32_t clk_uptime_s = 0;   // wrap-safe uptime in seconds
-static uint32_t clk_last_ms = 0;
-static uint32_t clk_ms_accum = 0;
+static uint32_t clk_base = 0, clk_uptime_s = 0, clk_last_ms = 0, clk_ms_accum = 0;
 
 static uint32_t uptime_s(void) {
     uint32_t now = millis();
-    clk_ms_accum += now - clk_last_ms;    // unsigned math survives the 49.7-day wrap
+    clk_ms_accum += now - clk_last_ms;     // wrap-safe
     clk_last_ms = now;
     while (clk_ms_accum >= 1000) { clk_ms_accum -= 1000; clk_uptime_s++; }
     return clk_uptime_s;
 }
 static uint32_t clock_now(void) { return clk_base + uptime_s(); }
 
-// ── Flash journal ───────────────────────────────────────────────────────────
-// Records of 3 words: { now_ts, last_flood_advert_ts, ~(now_ts ^ last_flood) }.
-// Appended until the page is full, then the page is erased (≈1 erase per
-// 85 writes → decades of endurance at a 15-minute interval).
-#define JREC_WORDS 3
-#define JREC_COUNT (JOURNAL_SIZE / (JREC_WORDS * 4))
+// "HH:MM - d/m/yyyy UTC", same as upstream "clock"
+static void fmt_clock(char* out, uint32_t ts) {
+    uint32_t days = ts / 86400, rem = ts % 86400;
+    int y = 1970;
+    while (days >= (uint32_t)(is_leap(y) ? 366 : 365)) { days -= is_leap(y) ? 366 : 365; y++; }
+    int m = 0;
+    while (days >= (uint32_t)(month_days[m] + (m == 1 && is_leap(y)))) { days -= month_days[m] + (m == 1 && is_leap(y)); m++; }
+    sprintf(out, "%02d:%02d - %d/%d/%d UTC", (int)(rem / 3600), (int)(rem / 60 % 60), (int)days + 1, m + 1, y);
+}
 
+// Journal: records { now_ts, last_flood_ts, ~(a^b) } appended until the page fills.
+#define JREC_COUNT (PAGE_SIZE / 12)
 static uint32_t j_last_flood_ts = 0;
 static int      j_next_slot = 0;
 
@@ -375,29 +386,18 @@ static bool journal_read(uint32_t* ts, uint32_t* flood_ts) {
     bool found = false;
     j_next_slot = 0;
     for (int i = 0; i < (int)JREC_COUNT; i++) {
-        const volatile uint32_t* r = (const volatile uint32_t*)(JOURNAL_ADDR + i * JREC_WORDS * 4);
+        const volatile uint32_t* r = (const volatile uint32_t*)(JOURNAL_ADDR + i * 12);
         if (r[0] == 0xFFFFFFFFUL && r[1] == 0xFFFFFFFFUL && r[2] == 0xFFFFFFFFUL) break;
         j_next_slot = i + 1;
-        if (r[2] == ~(r[0] ^ r[1])) {             // skip torn writes
-            if (!found || r[0] >= *ts) { *ts = r[0]; *flood_ts = r[1]; found = true; }
-        }
+        if (r[2] == ~(r[0] ^ r[1]) && (!found || r[0] >= *ts)) { *ts = r[0]; *flood_ts = r[1]; found = true; }
     }
     return found;
 }
 
 static void journal_write(uint32_t ts, uint32_t flood_ts) {
     HAL_FLASH_Unlock();
-    if (j_next_slot >= (int)JREC_COUNT) {
-        FLASH_EraseInitTypeDef er = {};
-        er.TypeErase   = FLASH_TYPEERASE_PAGES;
-        er.PageAddress = JOURNAL_ADDR;
-        er.NbPages     = 1;
-        uint32_t err = 0;
-        IWatchdog.reload();
-        HAL_FLASHEx_Erase(&er, &err);
-        j_next_slot = 0;
-    }
-    uint32_t addr = JOURNAL_ADDR + j_next_slot * JREC_WORDS * 4;
+    if (j_next_slot >= (int)JREC_COUNT) { flash_erase(JOURNAL_ADDR); j_next_slot = 0; }
+    uint32_t addr = JOURNAL_ADDR + j_next_slot * 12;
     uint32_t w[3] = { ts, flood_ts, ~(ts ^ flood_ts) };
     for (int i = 0; i < 3; i++) HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i * 4, w[i]);
     HAL_FLASH_Lock();
@@ -408,8 +408,7 @@ static void clock_init(void) {
     uint32_t stored = 0, flood = 0;
     uint32_t start = build_unix_ts();
     if (journal_read(&stored, &flood)) {
-        // We may have advertised up to one persist interval past the last record.
-        uint32_t resume = stored + PERSIST_INTERVAL_MIN * 60UL + 1;
+        uint32_t resume = stored + PERSIST_INTERVAL_MIN * 60UL + 1;   // may have advertised up to here
         if (resume > start) start = resume;
         j_last_flood_ts = flood;
     }
@@ -418,7 +417,14 @@ static void clock_init(void) {
     journal_write(clock_now(), j_last_flood_ts);
 }
 
-#if LEARN_TIME
+static bool clock_set_forward(uint32_t ts) {
+    uint32_t now = clock_now();
+    if (ts <= now) return ts == now;
+    clk_base += ts - now;
+    journal_write(clock_now(), j_last_flood_ts);
+    return true;
+}
+
 // Median of recent verified-advert timestamps from distinct senders.
 #define TSAMPLES 5
 static uint32_t ts_samples[TSAMPLES];
@@ -436,21 +442,16 @@ static void clock_learn(const uint8_t* pubkey, uint32_t ts) {
         if (ts_count < TSAMPLES) ts_count++;
     }
     if (ts_count < 3) return;
-
     uint32_t s[TSAMPLES];
     memcpy(s, ts_samples, sizeof(s));
-    for (int i = 1; i < ts_count; i++)            // insertion sort
+    for (int i = 1; i < ts_count; i++)
         for (int j = i; j > 0 && s[j-1] > s[j]; j--) { uint32_t t = s[j]; s[j] = s[j-1]; s[j-1] = t; }
     uint32_t median = s[ts_count / 2];
-    uint32_t now = clock_now();
-    // Only move forward, and ignore anything implausibly far ahead (10 years).
-    if (median > now + 120 && median < build_unix_ts() + 315360000UL) {
-        clk_base += median - now;
-        Serial1.print("Clock advanced to "); Serial1.println(clock_now());
-        journal_write(clock_now(), j_last_flood_ts);
+    if (median > clock_now() + 120 && median < build_unix_ts() + 315360000UL) {
+        clock_set_forward(median);
+        LOGLN("clock advanced from adverts");
     }
 }
-#endif
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Dedup table — 8-byte prefix of SHA256(type [‖ path_len for TRACE] ‖ payload)
@@ -482,11 +483,17 @@ static void mark_seen(const uint8_t h[8]) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Radio
 // ═════════════════════════════════════════════════════════════════════════════
-SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI);
+// Thin subclass: raw packet status gives SNR in MeshCore's ×4 units without
+// pulling in RadioLib's double-precision getSNR()/getRSSI().
+class Radio : public SX1262 {
+public:
+    Radio(Module* m) : SX1262(m) {}
+    uint32_t packetStatus() { return getPacketStatus(); }
+};
+Radio radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
 
-static float    tcxo_used = LORA_TCXO_VOLTAGE;
-static uint32_t preamble_ms = 0;     // how long a preamble-only detection may block TX
-static uint32_t max_pkt_ms = 0;      // longest possible packet on air
+static bool     radio_has_tcxo = true;
+static uint32_t preamble_ms = 0, max_pkt_ms = 0;
 
 static uint32_t airtime_ms(int len) {
     return (uint32_t)(radio.getTimeOnAir(len) / 1000UL) + 1;
@@ -494,21 +501,20 @@ static uint32_t airtime_ms(int len) {
 
 static bool radio_init(void) {
     SPI.begin();
-    int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, LORA_SYNC,
-                            LORA_TX_POWER, LORA_PREAMBLE, tcxo_used, false);
+    float freq = cfg.freq_khz / 1000.0f, bw = cfg.bw_hz / 1000.0f;
+    int state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, LORA_PREAMBLE, LORA_TCXO_VOLTAGE, false);
     if (state == RADIOLIB_ERR_SPI_CMD_FAILED || state == RADIOLIB_ERR_SPI_CMD_INVALID) {
-        tcxo_used = 0.0f;               // board has a plain crystal, not a TCXO
-        state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, LORA_SYNC,
-                            LORA_TX_POWER, LORA_PREAMBLE, tcxo_used, false);
+        radio_has_tcxo = false;          // plain crystal
+        state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, LORA_PREAMBLE, 0.0f, false);
     }
     if (state != RADIOLIB_ERR_NONE) {
-        Serial1.print(" FAILED: "); Serial1.println(state);
+        Serial1.print("ERROR: radio init failed: "); Serial1.println(state);
         return false;
     }
     radio.setRfSwitchPins(PIN_RXEN, PIN_TXEN);
     radio.setCRC(1);
-    float sym_ms = (float)(1UL << LORA_SF) / LORA_BW;          // BW in kHz → ms
-    preamble_ms = (uint32_t)((LORA_PREAMBLE + 4.25f) * sym_ms * 1.5f) + 5;
+    uint32_t sym_us = (1000000UL << cfg.sf) / cfg.bw_hz;
+    preamble_ms = (uint32_t)((LORA_PREAMBLE * 4 + 17) * sym_us * 3 / 8000) + 5;   // ×1.5 margin
     max_pkt_ms  = airtime_ms(255) + 50;
     return true;
 }
@@ -519,7 +525,7 @@ static void rx_start(void) {
                        RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
 }
 
-// Listen-before-talk: same logic as upstream CustomSX1262::isReceiving().
+// Listen-before-talk: upstream CustomSX1262::isReceiving()
 static uint32_t activity_at = 0;
 static bool     header_seen = false;
 #define IRQ_ACTIVITY_CLEAR (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID | \
@@ -529,46 +535,29 @@ static bool channel_busy(uint32_t irq) {
     uint32_t now = millis();
     if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
         radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
-        activity_at = 0; header_seen = false;
-        return false;
-    }
-    if (!(irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) && header_seen) {
-        activity_at = 0; header_seen = false;
-        return false;
-    }
-    if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
+    } else if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
         if (!header_seen) { header_seen = true; activity_at = now; }
-        if (now - activity_at > max_pkt_ms) {
-            radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
-            activity_at = 0; header_seen = false;
-            return false;
-        }
-        return true;
-    }
-    if (irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED) {
+        if (now - activity_at <= max_pkt_ms) return true;
+        radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
+    } else if (!header_seen && (irq & RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED)) {
         if (activity_at == 0) activity_at = now;
-        if (now - activity_at > preamble_ms) {
-            radio.clearIrqFlags(RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
-            activity_at = 0;
-            return false;
-        }
-        return true;
+        if (now - activity_at <= preamble_ms) return true;
+        radio.clearIrqFlags(RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED);
     }
     activity_at = 0; header_seen = false;
     return false;
 }
 
-// ── Airtime budget (Dispatcher::updateTxBudget, 1-hour window) ──────────────
-#define DUTY_CYCLE (1.0f / (1.0f + (AIRTIME_FACTOR)))
-static const uint32_t budget_max = (uint32_t)(3600000UL * DUTY_CYCLE);
-static uint32_t budget_ms = 0;
-static uint32_t budget_updated = 0;
+// Airtime budget (Dispatcher::updateTxBudget, 1-hour window); duty = 1/(1+af)
+static uint32_t budget_ms = 0, budget_updated = 0;
+static uint32_t budget_max(void) { return (uint32_t)(3600000ULL * 100 / (100 + cfg.af_x100)); }
 
 static void budget_refill(void) {
     uint32_t now = millis();
-    uint32_t add = (uint32_t)((now - budget_updated) * DUTY_CYCLE);
+    uint32_t add = (uint32_t)((uint64_t)(now - budget_updated) * 100 / (100 + cfg.af_x100));
     budget_updated = now;
-    budget_ms = (budget_ms + add > budget_max) ? budget_max : budget_ms + add;
+    budget_ms += add;
+    if (budget_ms > budget_max()) budget_ms = budget_max();
 }
 
 static bool transmit(const uint8_t* buf, int len) {
@@ -588,7 +577,7 @@ static bool transmit(const uint8_t* buf, int len) {
     budget_ms = (budget_ms > toa) ? budget_ms - toa : 0;
     activity_at = 0; header_seen = false;
     rx_start();
-    if (state != RADIOLIB_ERR_NONE) { Serial1.print("TX err: "); Serial1.println(state); }
+    if (state != RADIOLIB_ERR_NONE) { LOG("TX err: "); LOGLN(state); }
     return state == RADIOLIB_ERR_NONE;
 }
 
@@ -598,10 +587,8 @@ static bool transmit(const uint8_t* buf, int len) {
 #define TXQ_SIZE 6
 struct TxItem {
     bool     used;
-    uint8_t  pri;          // lower = sooner (0 = direct-routed traffic)
-    uint8_t  len;
-    uint32_t due;
-    uint32_t busy_since;   // when LBT first deferred it
+    uint8_t  pri, len;
+    uint32_t due, busy_since;
     uint8_t  buf[MAX_PKT];
 };
 static TxItem txq[TXQ_SIZE];
@@ -610,10 +597,10 @@ static bool txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms
     if (len <= 0) return false;
     int slot = -1;
     for (int i = 0; i < TXQ_SIZE; i++) if (!txq[i].used) { slot = i; break; }
-    if (slot < 0) {                                  // full: evict the lowest-priority entry
+    if (slot < 0) {
         for (int i = 0; i < TXQ_SIZE; i++)
             if (txq[i].pri > pri && (slot < 0 || txq[i].pri > txq[slot].pri)) slot = i;
-        if (slot < 0) { Serial1.println("  txq full"); return false; }
+        if (slot < 0) { LOGLN("  txq full"); return false; }
     }
     TxItem& t = txq[slot];
     t.used = true; t.pri = pri; t.len = (uint8_t)len;
@@ -634,19 +621,18 @@ static void txq_service(uint32_t irq) {
     }
     if (best < 0) return;
     TxItem& t = txq[best];
-
     if (channel_busy(irq)) {
         if (t.busy_since == 0) t.busy_since = now;
-        if (now - t.busy_since < 4000) {             // upstream getCADFailMaxDuration()
-            t.due = now + rnd_range(1, 5) * 120;     // upstream getCADFailRetryDelay()
+        if (now - t.busy_since < 4000) {             // getCADFailMaxDuration()
+            t.due = now + rnd_range(1, 5) * 120;     // getCADFailRetryDelay()
             stat_lbt++;
             return;
         }
     }
     budget_refill();
     uint32_t toa = airtime_ms(t.len);
-    if (budget_ms < toa / 2) {                       // MIN_TX_BUDGET_AIRTIME_DIV
-        t.due = now + (uint32_t)((toa / 2 - budget_ms) / DUTY_CYCLE) + 1;
+    if (budget_ms < toa / 2) {
+        t.due = now + (toa / 2 - budget_ms) * (100 + cfg.af_x100) / 100 + 1;
         return;
     }
     if (transmit(t.buf, t.len)) stat_tx++;
@@ -654,14 +640,12 @@ static void txq_service(uint32_t irq) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Packet parsing (Packet::readFrom)
+//  Packet parsing / building (Packet::readFrom / writeTo)
 // ═════════════════════════════════════════════════════════════════════════════
 struct Pkt {
     uint8_t        header, route, ptype;
-    bool           has_tc;
     uint16_t       tc[2];
-    uint8_t        path_len;     // raw wire byte: [hash_size-1 : 2][count : 6]
-    uint8_t        hash_size, hash_count;
+    uint8_t        path_len, hash_size, hash_count;
     const uint8_t* path;
     const uint8_t* payload;
     int            payload_len;
@@ -673,47 +657,40 @@ static bool parse(const uint8_t* d, int len, Pkt& p) {
     p.header = d[i++];
     p.route  = p.header & 0x03;
     p.ptype  = (p.header >> 2) & 0x0F;
-    p.has_tc = (p.route == ROUTE_TRANSPORT_FLOOD || p.route == ROUTE_TRANSPORT_DIRECT);
-    if (p.has_tc) {
+    if (p.route == ROUTE_TRANSPORT_FLOOD || p.route == ROUTE_TRANSPORT_DIRECT) {
         if (len < 7) return false;
-        memcpy(&p.tc[0], d + i, 2); i += 2;
-        memcpy(&p.tc[1], d + i, 2); i += 2;
+        memcpy(p.tc, d + i, 4); i += 4;
     } else {
         p.tc[0] = p.tc[1] = 0;
     }
     p.path_len   = d[i++];
     p.hash_size  = (p.path_len >> 6) + 1;
     p.hash_count = p.path_len & 0x3F;
-    if (p.hash_size == 4) return false;                              // reserved
+    if (p.hash_size == 4) return false;
     int pbytes = p.hash_count * p.hash_size;
     if (pbytes > MAX_PATH_SIZE) return false;
     p.path = d + i; i += pbytes;
-    if (i >= len) return false;                                      // no payload
+    if (i >= len) return false;
     p.payload = d + i;
     p.payload_len = len - i;
     return true;
 }
 
-// Serialize a packet with an explicit header/path (Packet::writeTo).
-static int build(uint8_t* out, uint8_t header, const uint16_t* tc,
-                 uint8_t path_len, const uint8_t* path, int path_bytes,
-                 const uint8_t* payload, int plen) {
+static int build(uint8_t* out, uint8_t header, const uint16_t* tc, uint8_t path_len,
+                 const uint8_t* path, int path_bytes, const uint8_t* payload, int plen) {
     int i = 0;
     out[i++] = header;
     uint8_t route = header & 0x03;
-    if (route == ROUTE_TRANSPORT_FLOOD || route == ROUTE_TRANSPORT_DIRECT) {
-        memcpy(out + i, &tc[0], 2); i += 2;
-        memcpy(out + i, &tc[1], 2); i += 2;
-    }
+    if (route == ROUTE_TRANSPORT_FLOOD || route == ROUTE_TRANSPORT_DIRECT) { memcpy(out + i, tc, 4); i += 4; }
     out[i++] = path_len;
     if (path_bytes) { memcpy(out + i, path, path_bytes); i += path_bytes; }
-    if (i + plen > 255) return -1;                                   // MAX_TRANS_UNIT
+    if (i + plen > 255) return -1;
     memcpy(out + i, payload, plen); i += plen;
     return i;
 }
 
-static uint32_t delay_for(const Pkt& p, float factor) {
-    uint32_t t = (uint32_t)(airtime_ms(p.hash_count * p.hash_size + p.payload_len + 2) * factor);
+static uint32_t delay_for(const Pkt& p, uint8_t factor_x100) {
+    uint32_t t = airtime_ms(p.hash_count * p.hash_size + p.payload_len + 2) * factor_x100 / 100;
     return rnd_range(0, 5 * t + 1);
 }
 
@@ -721,20 +698,18 @@ static uint32_t delay_for(const Pkt& p, float factor) {
 //  Advert verification (+ clock learning)
 // ═════════════════════════════════════════════════════════════════════════════
 static bool advert_verify(const uint8_t* payload, int plen) {
-    if (plen < 32 + 4 + 64) return false;
-    if (memcmp(payload, own_pubkey, 32) == 0) return false;   // our own advert echoed back
+    if (plen < 100) return false;
+    if (memcmp(payload, own_pubkey, 32) == 0) return false;
     int app_len = plen - 100;
     if (app_len > MAX_ADVERT_DATA_SIZE) app_len = MAX_ADVERT_DATA_SIZE;
-    uint8_t msg[32 + 4 + MAX_ADVERT_DATA_SIZE];
+    uint8_t msg[36 + MAX_ADVERT_DATA_SIZE];
     memcpy(msg, payload, 36);
-    if (app_len > 0) memcpy(msg + 36, payload + 100, app_len);
+    memcpy(msg + 36, payload + 100, app_len);
     IWatchdog.reload();
     if (!Ed25519::verify(payload + 36, payload, msg, 36 + app_len)) return false;
-#if LEARN_TIME
     uint32_t ts;
     memcpy(&ts, payload + 32, 4);
     clock_learn(payload, ts);
-#endif
     return true;
 }
 
@@ -743,82 +718,69 @@ static bool advert_verify(const uint8_t* payload, int plen) {
 // ═════════════════════════════════════════════════════════════════════════════
 static uint8_t out_buf[MAX_PKT];
 
-// DIRECT / TRANSPORT_DIRECT
 static const char* handle_direct(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
 
     if (p.ptype == PT_TRACE) {
         if (p.path_len >= MAX_PATH_SIZE || p.payload_len < 9) return "trace bad";
-        uint8_t flags   = p.payload[8];
-        uint8_t path_sz = flags & 0x03;
+        uint8_t path_sz = p.payload[8] & 0x03;
         int     tlen    = p.payload_len - 9;
-        uint16_t offset = (uint16_t)p.path_len << path_sz;
+        int     offset  = (int)p.path_len << path_sz;
         if (offset >= tlen) return "trace end";
         if (offset + (1 << path_sz) > tlen) return "trace bad";
         if (!is_own_hash(p.payload + 9 + offset, 1 << path_sz)) return "trace not ours";
+        if (!cfg.repeat) return "repeat off";
         packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
         if (was_seen(h)) return "dedup";
         mark_seen(h);
         uint8_t newpath[MAX_PATH_SIZE];
         memcpy(newpath, p.path, p.path_len);
-        newpath[p.path_len] = (uint8_t)snr4;               // TRACE path carries SNRs
-        int n = build(out_buf, p.header, p.tc, p.path_len + 1, newpath, p.path_len + 1,
-                      p.payload, p.payload_len);
+        newpath[p.path_len] = (uint8_t)snr4;
+        int n = build(out_buf, p.header, p.tc, p.path_len + 1, newpath, p.path_len + 1, p.payload, p.payload_len);
         if (n < 0) return "too big";
-        txq_push(out_buf, n, 5, delay_for(p, DIRECT_TX_DELAY_FACTOR));
+        txq_push(out_buf, n, 5, delay_for(p, cfg.direct_txdelay_x100));
         return NULL;
     }
 
     if (p.ptype == PT_CONTROL && (p.payload[0] & 0x80)) return "zero-hop control";
     if (p.hash_count == 0) {
-#if LEARN_TIME
-        if (p.ptype == PT_ADVERT) {                        // neighbor's zero-hop advert
+        if (p.ptype == PT_ADVERT) {                    // neighbour advert: verify, learn time
             packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
             if (!was_seen(h)) { mark_seen(h); advert_verify(p.payload, p.payload_len); }
         }
-#endif
         return "zero-hop";
     }
     if (!is_own_hash(p.path, p.hash_size)) return "not next hop";
+    if (!cfg.repeat) return "repeat off";
 
-    // Remove ourselves from the front of the path (Mesh::removeSelfFromPath).
-    uint8_t new_path_len = (p.path_len & 0xC0) | ((p.hash_count - 1) & 0x3F);
-    const uint8_t* rest  = p.path + p.hash_size;
-    int rest_bytes       = (p.hash_count - 1) * p.hash_size;
+    uint8_t new_path_len  = (p.path_len & 0xC0) | ((p.hash_count - 1) & 0x3F);
+    const uint8_t* rest   = p.path + p.hash_size;
+    int rest_bytes        = (p.hash_count - 1) * p.hash_size;
     const uint8_t hdr_ack = (PT_ACK << 2) | ROUTE_DIRECT;
+    const uint8_t* pl = p.payload;
+    int plen = p.payload_len;
+    uint8_t header = p.header, pri = 0;
+    uint32_t delay;
 
-    if (p.ptype == PT_MULTIPART) {                         // Mesh::forwardMultipartDirect
-        if (p.payload_len < 5 || (p.payload[0] & 0x0F) != PT_ACK) return "multipart";
-        uint8_t remaining = p.payload[0] >> 4;
-        packet_hash(h, PT_ACK, 0, p.payload + 1, p.payload_len - 1);
-        if (was_seen(h)) return "dedup";
-        mark_seen(h);
-        int n = build(out_buf, hdr_ack, p.tc, new_path_len, rest, rest_bytes,
-                      p.payload + 1, p.payload_len - 1);
-        if (n < 0) return "too big";
-        txq_push(out_buf, n, 0, ((uint32_t)remaining + 1) * 300);
-        return NULL;
+    if (p.ptype == PT_MULTIPART) {                     // forwardMultipartDirect
+        if (plen < 5 || (pl[0] & 0x0F) != PT_ACK) return "multipart";
+        delay = ((uint32_t)(pl[0] >> 4) + 1) * 300;
+        pl++; plen--;
+        packet_hash(h, PT_ACK, 0, pl, plen);
+        header = hdr_ack;
+    } else {
+        packet_hash(h, p.ptype, p.path_len, pl, plen);
+        if (p.ptype == PT_ACK) { header = hdr_ack; delay = 0; }      // routeDirectRecvAcks
+        else delay = delay_for(p, cfg.direct_txdelay_x100);
     }
-
-    packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
     if (was_seen(h)) return "dedup";
     mark_seen(h);
-
-    if (p.ptype == PT_ACK) {                               // routeDirectRecvAcks: plain DIRECT ACK
-        int n = build(out_buf, hdr_ack, p.tc, new_path_len, rest, rest_bytes,
-                      p.payload, p.payload_len);
-        if (n < 0) return "too big";
-        txq_push(out_buf, n, 0, 0);
-        return NULL;
-    }
-
-    int n = build(out_buf, p.header, p.tc, new_path_len, rest, rest_bytes, p.payload, p.payload_len);
+    int n = build(out_buf, header, p.tc, new_path_len, rest, rest_bytes, pl, plen);
     if (n < 0) return "too big";
-    txq_push(out_buf, n, 0, delay_for(p, DIRECT_TX_DELAY_FACTOR));
+    txq_push(out_buf, n, pri, delay);
     return NULL;
 }
 
-// Payload sanity per upstream switch(); unknown/unsupported types are never flooded.
 static bool flood_type_ok(const Pkt& p) {
     switch (p.ptype) {
         case PT_ACK:        return p.payload_len >= 4;
@@ -829,32 +791,31 @@ static bool flood_type_ok(const Pkt& p) {
         case PT_ANON_REQ:   return 1 + 32 + 2 < p.payload_len;
         case PT_GRP_DATA:
         case PT_GRP_TXT:    return 1 + 2 < p.payload_len;
-        case PT_ADVERT:     return p.payload_len >= 32 + 4 + 64;
+        case PT_ADVERT:     return p.payload_len >= 100;
         default:            return false;
     }
 }
 
-// FLOOD / TRANSPORT_FLOOD
 static const char* handle_flood(const Pkt& p) {
-    // allowPacketForward(): hop limits
-    if (p.hash_count >= FLOOD_MAX) return "flood.max";
-    if (p.route == ROUTE_FLOOD && p.hash_count >= FLOOD_MAX_UNSCOPED) return "flood.max.unscoped";
-    if (p.ptype == PT_ADVERT && p.hash_count >= FLOOD_MAX_ADVERT) return "flood.max.advert";
+    if (!cfg.repeat) return "repeat off";
+    if (p.hash_count >= cfg.flood_max) return "flood.max";
+    if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
+    if (p.ptype == PT_ADVERT && p.hash_count >= cfg.flood_max_advert) return "flood.max.advert";
 
-    // allowPacketForward(): region scope
     if (p.route == ROUTE_TRANSPORT_FLOOD) {
-        if (p.tc[0] == 0 && p.tc[1] == 0) return "share";          // {0,0} = send to nowhere
+        if (p.tc[0] == 0 && p.tc[1] == 0) return "share";
         if (region_match(p.tc[0], p.ptype, p.payload, p.payload_len) < 0) return "region";
-    } else if (!ALLOW_UNSCOPED_FLOOD) {
-        return "unscoped";
+    } else if (cfg.wildcard_flags & REGION_DENY_FLOOD) {
+        return "unscoped denied";
     }
 
-    // allowPacketForward(): loop detection (LOOP_DETECT_MODERATE)
-    static const uint8_t max_loop[4] = { 0, 2, 1, 1 };
-    uint8_t seen_self = 0;
-    for (int k = 0; k < p.hash_count; k++)
-        if (is_own_hash(p.path + k * p.hash_size, p.hash_size)) seen_self++;
-    if (seen_self >= max_loop[p.hash_size]) return "loop";
+    if (cfg.loop_detect) {
+        static const uint8_t max_loop[4][4] = { {0}, {0,4,2,1}, {0,2,1,1}, {0,1,1,1} };
+        uint8_t n = 0;
+        for (int k = 0; k < p.hash_count; k++)
+            if (is_own_hash(p.path + k * p.hash_size, p.hash_size)) n++;
+        if (n >= max_loop[cfg.loop_detect & 3][p.hash_size]) return "loop";
+    }
 
     if (!flood_type_ok(p)) return "type";
 
@@ -863,23 +824,17 @@ static const char* handle_flood(const Pkt& p) {
     if (was_seen(h)) return "dedup";
     mark_seen(h);
 
-#if VERIFY_ADVERTS
     if (p.ptype == PT_ADVERT && !advert_verify(p.payload, p.payload_len)) return "advert sig";
-#else
-    if (p.ptype == PT_ADVERT && memcmp(p.payload, own_pubkey, 32) == 0) return "own advert";
-#endif
 
-    // routeRecvPacket(): append our hash
     int pbytes = p.hash_count * p.hash_size;
     if (pbytes + p.hash_size > MAX_PATH_SIZE) return "path full";
     uint8_t newpath[MAX_PATH_SIZE];
     memcpy(newpath, p.path, pbytes);
     memcpy(newpath + pbytes, own_pubkey, p.hash_size);
     uint8_t new_len = (p.path_len & 0xC0) | ((p.hash_count + 1) & 0x3F);
-    int n = build(out_buf, p.header, p.tc, new_len, newpath, pbytes + p.hash_size,
-                  p.payload, p.payload_len);
+    int n = build(out_buf, p.header, p.tc, new_len, newpath, pbytes + p.hash_size, p.payload, p.payload_len);
     if (n < 0) return "too big";
-    txq_push(out_buf, n, p.hash_count + 1, delay_for(p, TX_DELAY_FACTOR));
+    txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100));
     return NULL;
 }
 
@@ -889,77 +844,423 @@ static void on_receive(const uint8_t* d, int len, int8_t snr4) {
     if (!parse(d, len, p)) why = "malformed";
     else if (p.route == ROUTE_DIRECT || p.route == ROUTE_TRANSPORT_DIRECT) why = handle_direct(p, snr4);
     else why = handle_flood(p);
-
-    if (why) { stat_drop++; Serial1.print("  drop: "); Serial1.println(why); }
-    else     { stat_fwd++;  Serial1.println("  fwd"); led_blink(2, 30); }
+    if (why) { stat_drop++; LOG("  drop: "); LOGLN(why); }
+    else     { stat_fwd++;  LOGLN("  fwd"); }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Adverts (Mesh::createAdvert + sendZeroHop / sendFloodScoped)
 // ═════════════════════════════════════════════════════════════════════════════
 static void send_advert(bool flood) {
-    uint8_t payload[32 + 4 + 64 + MAX_ADVERT_DATA_SIZE];
-    int i = 0;
-    memcpy(payload + i, own_pubkey, 32); i += 32;
+    uint8_t payload[100 + MAX_ADVERT_DATA_SIZE];
+    memcpy(payload, own_pubkey, 32);
     uint32_t ts = clock_now();
-    memcpy(payload + i, &ts, 4); i += 4;
-    int sig_at = i; i += 64;
-
-    int app_at = i;
-#if defined(NODE_LAT_I) && defined(NODE_LON_I)
-    payload[i++] = ADV_TYPE_REPEATER | ADV_LATLON_MASK | ADV_NAME_MASK;
-    int32_t lat = (int32_t)(NODE_LAT_I), lon = (int32_t)(NODE_LON_I);
-    memcpy(payload + i, &lat, 4); i += 4;
-    memcpy(payload + i, &lon, 4); i += 4;
-#else
-    payload[i++] = ADV_TYPE_REPEATER | ADV_NAME_MASK;
-#endif
-    int room = MAX_ADVERT_DATA_SIZE - (i - app_at);
-    int nlen = strlen(node_name);
+    memcpy(payload + 32, &ts, 4);
+    int i = 100;
+    bool has_loc = cfg.lat_e6 || cfg.lon_e6;
+    payload[i++] = ADV_TYPE_REPEATER | ADV_NAME_MASK | (has_loc ? ADV_LATLON_MASK : 0);
+    if (has_loc) { memcpy(payload + i, &cfg.lat_e6, 4); memcpy(payload + i + 4, &cfg.lon_e6, 4); i += 8; }
+    int nlen = strlen(cfg.name), room = 100 + MAX_ADVERT_DATA_SIZE - i;
     if (nlen > room) nlen = room;
-    memcpy(payload + i, node_name, nlen); i += nlen;
-    int app_len = i - app_at;
+    memcpy(payload + i, cfg.name, nlen); i += nlen;
 
-    uint8_t msg[32 + 4 + MAX_ADVERT_DATA_SIZE];
+    uint8_t msg[36 + MAX_ADVERT_DATA_SIZE];
     memcpy(msg, payload, 36);
-    memcpy(msg + 36, payload + app_at, app_len);
+    memcpy(msg + 36, payload + 100, i - 100);
     IWatchdog.reload();
-    Ed25519::sign(payload + sig_at, own_privkey, own_pubkey, msg, 36 + app_len);
+    Ed25519::sign(payload + 36, cfg.privkey, own_pubkey, msg, 36 + i - 100);
 
     uint8_t h[8];
     packet_hash(h, PT_ADVERT, 0, payload, i);
-    mark_seen(h);                                        // ignore our own echoes
+    mark_seen(h);
 
     int n;
     if (!flood) {
         n = build(out_buf, (PT_ADVERT << 2) | ROUTE_DIRECT, NULL, 0, NULL, 0, payload, i);
-        txq_push(out_buf, n, 3, 0);
-        Serial1.println("ADVERT zero-hop");
-        return;
+    } else {
+        uint8_t path_len = (uint8_t)(cfg.path_hash_mode << 6);
+        if (cfg.default_region < cfg.num_regions) {
+            uint16_t tc[2] = { transport_code(region_keys[cfg.default_region], PT_ADVERT, payload, i), 0 };
+            n = build(out_buf, (PT_ADVERT << 2) | ROUTE_TRANSPORT_FLOOD, tc, path_len, NULL, 0, payload, i);
+        } else {
+            n = build(out_buf, (PT_ADVERT << 2) | ROUTE_FLOOD, NULL, path_len, NULL, 0, payload, i);
+        }
+        j_last_flood_ts = ts;
+        journal_write(ts, j_last_flood_ts);
     }
-    uint8_t path_len = (uint8_t)((PATH_HASH_SIZE - 1) << 6);
-#ifdef ADVERT_SCOPE
-    uint8_t key[16];
-    region_key_for(ADVERT_SCOPE, key);
-    uint16_t tc[2] = { transport_code(key, PT_ADVERT, payload, i), 0 };
-    n = build(out_buf, (PT_ADVERT << 2) | ROUTE_TRANSPORT_FLOOD, tc, path_len, NULL, 0, payload, i);
-    Serial1.println("ADVERT flood (scoped " ADVERT_SCOPE ")");
-#else
-    n = build(out_buf, (PT_ADVERT << 2) | ROUTE_FLOOD, NULL, path_len, NULL, 0, payload, i);
-    Serial1.println("ADVERT flood");
-#endif
     txq_push(out_buf, n, 3, 0);
-    j_last_flood_ts = ts;
-    journal_write(ts, j_last_flood_ts);
+    LOGLN(flood ? "ADVERT flood" : "ADVERT zero-hop");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Configuration defaults / load
+// ═════════════════════════════════════════════════════════════════════════════
+static void cfg_defaults(void) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.magic = CFG_MAGIC;
+    cfg.freq_khz = LORA_FREQ_KHZ;  cfg.bw_hz = LORA_BW_HZ;
+    cfg.sf = LORA_SF;              cfg.cr = LORA_CR;
+    cfg.tx_dbm = LORA_TX_POWER;
+#if defined(NODE_LAT_I) && defined(NODE_LON_I)
+    cfg.lat_e6 = NODE_LAT_I;       cfg.lon_e6 = NODE_LON_I;
+#endif
+    cfg.path_hash_mode = PATH_HASH_MODE;
+    cfg.loop_detect = LOOP_DETECT;
+    cfg.repeat = 1;
+    cfg.wildcard_flags = ALLOW_UNSCOPED_FLOOD ? 0 : REGION_DENY_FLOOD;
+    cfg.advert_interval_min = ADVERT_INTERVAL_MIN;
+    cfg.flood_advert_h = FLOOD_ADVERT_INTERVAL_H;
+    cfg.flood_max = FLOOD_MAX;     cfg.flood_max_unscoped = FLOOD_MAX_UNSCOPED;
+    cfg.flood_max_advert = FLOOD_MAX_ADVERT;
+    cfg.txdelay_x100 = TX_DELAY_X100;
+    cfg.direct_txdelay_x100 = DIRECT_TX_DELAY_X100;
+    cfg.af_x100 = AF_X100;
+    cfg.default_region = 0xFF;
+
+    const char* p = REGIONS;                       // "a,b,#c"
+    while (*p && cfg.num_regions < MAX_REGIONS) {
+        while (*p == ',' || *p == ' ' || *p == '#') p++;
+        int n = 0;
+        while (*p && *p != ',' && *p != ' ') { if (n < REGION_NAME - 1) cfg.regions[cfg.num_regions][n++] = *p; p++; }
+        if (n) cfg.num_regions++;
+    }
+    regions_rekey();
+    int d = region_find(DEFAULT_SCOPE);
+    if (d >= 0) cfg.default_region = d;
+
+    const uint32_t* uid = (const uint32_t*)UID_BASE;
+#ifdef NODE_NAME_STR
+    strncpy(cfg.name, NODE_NAME_STR, sizeof(cfg.name) - 1);
+#else
+    sprintf(cfg.name, "SPECTER-%04X", (unsigned)(uid[2] & 0xFFFF));
+#endif
+    // Identity seed: UID only for now; setup() mixes in radio noise before saving.
+    SHA256 sha;
+    sha.reset();
+    sha.update(uid, 12);
+    sha.finalize(cfg.privkey, 32);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Serial CLI — same syntax and reply style as upstream MeshCore repeaters
+// ═════════════════════════════════════════════════════════════════════════════
+static bool reboot_pending = false;
+static bool timers_dirty = false;
+
+static bool valid_name(const char* n) {
+    if (!*n) return false;
+    for (; *n; n++) if (strchr("[]\\:,?*", *n) || *n < 0x20) return false;
+    return true;
+}
+
+static int atoi_s(const char* s) {
+    s = skip_ws(s);
+    bool neg = (*s == '-');
+    if (neg || *s == '+') s++;
+    int v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    return neg ? -v : v;
+}
+
+static int hexval(char c) {
+    return (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+           (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+}
+
+static int atoi_u(const char* s, bool* ok) {
+    s = skip_ws(s);
+    int v = 0; const char* st = s;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    *ok = (s != st) && *skip_ws(s) == 0;
+    return v;
+}
+
+// Copy the next space-separated token into out; returns the rest of the string.
+static const char* next_token(const char* s, char* out, int max) {
+    s = skip_ws(s);
+    int n = 0;
+    while (*s && *s != ' ') { if (n < max - 1) out[n++] = *s; s++; }
+    out[n] = 0;
+    return s;
+}
+
+static void region_list(char* reply, int mask_deny, bool want_deny) {
+    char* p = reply;
+    for (int i = 0; i < cfg.num_regions; i++) {
+        bool deny = cfg.region_flags[i] & REGION_DENY_FLOOD;
+        if (mask_deny && deny != want_deny) continue;
+        if (p - reply > 120) break;
+        if (p != reply) *p++ = ',';
+        p += sprintf(p, "%s", cfg.regions[i]);
+    }
+    if (p == reply) strcpy(reply, "-none-");
+}
+
+static void handle_region(const char* args, char* reply) {
+    char a1[16], a2[REGION_NAME + 2];
+    args = next_token(args, a1, sizeof(a1));
+    next_token(args, a2, sizeof(a2));
+    const char* nm = a2[0] == '#' ? a2 + 1 : a2;
+    int idx = region_find(nm);
+
+    if (!a1[0]) {                                   // "region": list with flood flags
+        char* p = reply;
+        p += sprintf(p, "* %s", (cfg.wildcard_flags & REGION_DENY_FLOOD) ? "" : "F");
+        for (int i = 0; i < cfg.num_regions && p - reply < 130; i++)
+            p += sprintf(p, "\n %s %s%s", cfg.regions[i], (cfg.region_flags[i] & REGION_DENY_FLOOD) ? "" : "F",
+                         i == cfg.default_region ? " (default)" : "");
+    } else if (!strcmp(a1, "save")) {
+        cfg_save();
+        strcpy(reply, "OK");
+    } else if (!strcmp(a1, "put") && a2[0]) {
+        if (idx < 0) {
+            if (cfg.num_regions >= MAX_REGIONS) { strcpy(reply, "Err - unable to put"); return; }
+            if (strlen(nm) >= REGION_NAME) { strcpy(reply, "Err - name too long"); return; }
+            idx = cfg.num_regions++;
+            strcpy(cfg.regions[idx], nm);
+            region_key_for(nm, region_keys[idx]);
+        }
+        cfg.region_flags[idx] = 0;
+        strcpy(reply, "OK - (flood allowed)");
+    } else if (!strcmp(a1, "remove") && a2[0]) {
+        if (idx < 0) { strcpy(reply, "Err - not found"); return; }
+        for (int i = idx; i + 1 < cfg.num_regions; i++) {
+            strcpy(cfg.regions[i], cfg.regions[i + 1]);
+            cfg.region_flags[i] = cfg.region_flags[i + 1];
+            memcpy(region_keys[i], region_keys[i + 1], 16);
+        }
+        cfg.num_regions--;
+        if (cfg.default_region == idx) cfg.default_region = 0xFF;
+        else if (cfg.default_region != 0xFF && cfg.default_region > idx) cfg.default_region--;
+        strcpy(reply, "OK");
+    } else if ((!strcmp(a1, "allowf") || !strcmp(a1, "denyf")) && a2[0]) {
+        uint8_t* f = !strcmp(a2, "*") ? &cfg.wildcard_flags : (idx >= 0 ? &cfg.region_flags[idx] : NULL);
+        if (!f) { strcpy(reply, "Err - unknown region"); return; }
+        if (a1[0] == 'a') *f &= ~REGION_DENY_FLOOD; else *f |= REGION_DENY_FLOOD;
+        strcpy(reply, "OK");
+    } else if (!strcmp(a1, "get") && a2[0]) {
+        if (!strcmp(a2, "*")) sprintf(reply, " * %s", (cfg.wildcard_flags & REGION_DENY_FLOOD) ? "" : "F");
+        else if (idx < 0) strcpy(reply, "Err - unknown region");
+        else sprintf(reply, " %s %s", cfg.regions[idx], (cfg.region_flags[idx] & REGION_DENY_FLOOD) ? "" : "F");
+    } else if (!strcmp(a1, "default")) {
+        if (!a2[0]) {
+            sprintf(reply, " default scope is %s", cfg.default_region < cfg.num_regions ? cfg.regions[cfg.default_region] : "<null>");
+            return;
+        }
+        if (!strcmp(a2, "<null>")) {
+            cfg.default_region = 0xFF;
+        } else {
+            if (idx < 0) {                                // auto-create, as upstream
+                if (cfg.num_regions >= MAX_REGIONS || strlen(nm) >= REGION_NAME) { strcpy(reply, "Err - region table full"); return; }
+                idx = cfg.num_regions++;
+                strcpy(cfg.regions[idx], nm);
+                region_key_for(nm, region_keys[idx]);
+            }
+            cfg.region_flags[idx] = 0;
+            cfg.default_region = idx;
+        }
+        cfg_save();
+        sprintf(reply, " default scope is now %s", cfg.default_region == 0xFF ? "<null>" : cfg.regions[idx]);
+    } else if (!strcmp(a1, "list") && (!strcmp(a2, "allowed") || !strcmp(a2, "denied"))) {
+        region_list(reply, 1, a2[0] == 'd');
+    } else {
+        strcpy(reply, "Err - ??");
+    }
+}
+
+static void handle_get(const char* k, char* reply) {
+    char a[16], b[16];
+    if      (!strcmp(k, "name"))   sprintf(reply, "> %s", cfg.name);
+    else if (!strcmp(k, "lat"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lat_e6, 6));
+    else if (!strcmp(k, "lon"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lon_e6, 6));
+    else if (!strcmp(k, "radio"))  sprintf(reply, "> %s,%s,%d,%d", fmt_fixed(a, cfg.freq_khz, 3),
+                                           fmt_fixed(b, cfg.bw_hz, 3), cfg.sf, cfg.cr);
+    else if (!strcmp(k, "freq"))   sprintf(reply, "> %s", fmt_fixed(a, cfg.freq_khz, 3));
+    else if (!strcmp(k, "tx"))     sprintf(reply, "> %d", cfg.tx_dbm);
+    else if (!strcmp(k, "repeat")) sprintf(reply, "> %s", cfg.repeat ? "on" : "off");
+    else if (!strcmp(k, "advert.interval"))       sprintf(reply, "> %d", cfg.advert_interval_min);
+    else if (!strcmp(k, "flood.advert.interval")) sprintf(reply, "> %d", cfg.flood_advert_h);
+    else if (!strcmp(k, "flood.max"))             sprintf(reply, "> %d", cfg.flood_max);
+    else if (!strcmp(k, "flood.max.unscoped"))    sprintf(reply, "> %d", cfg.flood_max_unscoped);
+    else if (!strcmp(k, "flood.max.advert"))      sprintf(reply, "> %d", cfg.flood_max_advert);
+    else if (!strcmp(k, "txdelay"))        sprintf(reply, "> %s", fmt_fixed(a, cfg.txdelay_x100, 2));
+    else if (!strcmp(k, "direct.txdelay")) sprintf(reply, "> %s", fmt_fixed(a, cfg.direct_txdelay_x100, 2));
+    else if (!strcmp(k, "af"))             sprintf(reply, "> %s", fmt_fixed(a, cfg.af_x100, 2));
+    else if (!strcmp(k, "path.hash.mode")) sprintf(reply, "> %d", cfg.path_hash_mode);
+    else if (!strcmp(k, "loop.detect")) {
+        static const char* const ld[] = { "off", "minimal", "moderate", "strict" };
+        sprintf(reply, "> %s", ld[cfg.loop_detect & 3]);
+    }
+    else if (!strcmp(k, "public.key")) { strcpy(reply, "> "); to_hex(reply + 2, own_pubkey, 32); }
+    else if (!strcmp(k, "prv.key"))    { strcpy(reply, "> "); to_hex(reply + 2, cfg.privkey, 32); }
+    else if (!strcmp(k, "role"))       strcpy(reply, "> repeater");
+    else strcpy(reply, "??: unknown config");
+}
+
+static void handle_set(const char* cmd, char* reply) {
+    char k[24];
+    const char* v = cmd;
+    int n = 0;
+    while (*v && *v != ' ' && n < (int)sizeof(k) - 1) k[n++] = *v++;
+    k[n] = 0;
+    v = skip_ws(v);
+    int32_t x; bool ok;
+    int iv = atoi_u(v, &ok);
+    const char* done = "OK";
+
+    if (!strcmp(k, "name")) {
+        if (!valid_name(v) || strlen(v) >= sizeof(cfg.name)) { strcpy(reply, "Error, bad chars"); return; }
+        strcpy(cfg.name, v);
+    } else if (!strcmp(k, "lat") || !strcmp(k, "lon")) {
+        if (!parse_fixed(v, 6, &x) || x < -180000000 || x > 180000000) { strcpy(reply, "Error, bad value"); return; }
+        if (k[1] == 'a') cfg.lat_e6 = x; else cfg.lon_e6 = x;
+    } else if (!strcmp(k, "radio")) {
+        int32_t f, bw; int sf = 0, cr = 0;
+        const char* c1 = strchr(v, ','); const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        const char* c3 = c2 ? strchr(c2 + 1, ',') : NULL;
+        if (!c3 || !parse_fixed(v, 3, &f) || !parse_fixed(c1 + 1, 3, &bw)) { strcpy(reply, "Error, invalid radio params"); return; }
+        sf = atoi_s(c2 + 1); cr = atoi_s(c3 + 1);
+        if (f < 150000 || f > 960000 || sf < 5 || sf > 12 || cr < 5 || cr > 8 || bw < 7000 || bw > 500000) {
+            strcpy(reply, "Error, invalid radio params"); return;
+        }
+        cfg.freq_khz = f; cfg.bw_hz = bw; cfg.sf = sf; cfg.cr = cr;
+        done = "OK - reboot to apply";
+    } else if (!strcmp(k, "freq")) {
+        if (!parse_fixed(v, 3, &x) || x < 150000 || x > 960000) { strcpy(reply, "Error, bad value"); return; }
+        cfg.freq_khz = x;
+        done = "OK - reboot to apply";
+    } else if (!strcmp(k, "tx")) {
+        int t = atoi_s(v);
+        if (t < -9 || t > 22) { strcpy(reply, "Error, must be -9..22"); return; }
+        cfg.tx_dbm = t;
+        radio.setOutputPower(t);
+    } else if (!strcmp(k, "repeat")) {
+        cfg.repeat = !strncmp(v, "on", 2);
+        done = cfg.repeat ? "OK - repeat is now ON" : "OK - repeat is now OFF";
+    } else if (!strcmp(k, "advert.interval")) {
+        if (!ok || (iv > 0 && iv < 2) || iv > 240) { strcpy(reply, "Error: interval range is 2-240 minutes"); return; }
+        cfg.advert_interval_min = iv;
+        timers_dirty = true;
+    } else if (!strcmp(k, "flood.advert.interval")) {
+        if (!ok || (iv > 0 && iv < 3) || iv > 168) { strcpy(reply, "Error: interval range is 3-168 hours"); return; }
+        cfg.flood_advert_h = iv;
+        timers_dirty = true;
+    } else if (!strcmp(k, "flood.max") || !strcmp(k, "flood.max.unscoped") || !strcmp(k, "flood.max.advert")) {
+        if (!ok || iv > 64) { strcpy(reply, "Error, max 64"); return; }
+        if (k[9] == 0) cfg.flood_max = iv; else if (k[10] == 'u') cfg.flood_max_unscoped = iv; else cfg.flood_max_advert = iv;
+    } else if (!strcmp(k, "txdelay") || !strcmp(k, "direct.txdelay")) {
+        if (!parse_fixed(v, 2, &x) || x < 0 || x > 200) { strcpy(reply, "Error, must be 0-2"); return; }
+        if (k[0] == 't') cfg.txdelay_x100 = x; else cfg.direct_txdelay_x100 = x;
+    } else if (!strcmp(k, "af")) {
+        if (!parse_fixed(v, 2, &x) || x < 0 || x > 9900) { strcpy(reply, "Error, bad value"); return; }
+        cfg.af_x100 = x;
+    } else if (!strcmp(k, "path.hash.mode")) {
+        if (!ok || iv > 2) { strcpy(reply, "Error, must be 0,1, or 2"); return; }
+        cfg.path_hash_mode = iv;
+    } else if (!strcmp(k, "loop.detect")) {
+        static const char* const ld[] = { "off", "minimal", "moderate", "strict" };
+        int i = 0;
+        while (i < 4 && strcmp(v, ld[i])) i++;
+        if (i == 4) { strcpy(reply, "Error, must be off, minimal, moderate or strict"); return; }
+        cfg.loop_detect = i;
+    } else if (!strcmp(k, "prv.key")) {
+        uint8_t key[32];
+        if (strlen(v) != 64) { strcpy(reply, "Error, bad key"); return; }
+        for (int i = 0; i < 32; i++) {
+            int hi = hexval(v[2*i]), lo = hexval(v[2*i+1]);
+            if (hi < 0 || lo < 0) { strcpy(reply, "Error, bad key"); return; }
+            key[i] = (uint8_t)(hi << 4 | lo);
+        }
+        memcpy(cfg.privkey, key, 32);
+        done = "OK, reboot to apply!";
+    } else if (!strcmp(k, "password") || !strcmp(k, "guest.password")) {
+        strcpy(reply, "Error: remote admin not supported"); return;
+    } else {
+        sprintf(reply, "unknown config: %s", k); return;
+    }
+    cfg_save();
+    strcpy(reply, done);
+}
+
+static void handle_command(char* cmd, char* reply) {
+    while (*cmd == ' ') cmd++;
+    reply[0] = 0;
+    if (!strcmp(cmd, "reboot")) {
+        reboot_pending = true;
+    } else if (!strcmp(cmd, "advert")) {
+        send_advert(true);
+        strcpy(reply, "OK - Advert sent");
+    } else if (!strcmp(cmd, "advert.zerohop")) {
+        send_advert(false);
+        strcpy(reply, "OK - zerohop advert sent");
+    } else if (!strncmp(cmd, "time ", 5)) {
+        bool ok;
+        uint32_t t = 0; const char* s = skip_ws(cmd + 5);
+        while (*s >= '0' && *s <= '9') t = t * 10 + (*s++ - '0');
+        ok = t > 1600000000UL;
+        if (ok && clock_set_forward(t)) { strcpy(reply, "OK - clock set: "); fmt_clock(reply + 16, clock_now()); }
+        else strcpy(reply, "(ERR: clock cannot go backwards)");
+    } else if (!strcmp(cmd, "clock")) {
+        fmt_clock(reply, clock_now());
+    } else if (!strcmp(cmd, "ver")) {
+        strcpy(reply, FW_VERSION " (Build: " __DATE__ ")");
+    } else if (!strcmp(cmd, "board")) {
+        strcpy(reply, "DX-LR30 (STM32F103+SX1262)");
+    } else if (!strcmp(cmd, "erase")) {
+        HAL_FLASH_Unlock(); flash_erase(CONFIG_ADDR); HAL_FLASH_Lock();
+        strcpy(reply, "File system erase: OK (defaults + new identity after reboot)");
+    } else if (!strncmp(cmd, "get ", 4)) {
+        handle_get(skip_ws(cmd + 4), reply);
+    } else if (!strncmp(cmd, "set ", 4)) {
+        handle_set(skip_ws(cmd + 4), reply);
+    } else if (!strncmp(cmd, "region", 6) && (cmd[6] == 0 || cmd[6] == ' ')) {
+        handle_region(cmd + 6, reply);
+    } else if (!strcmp(cmd, "log start")) {
+        log_on = true;  strcpy(reply, "   logging on");
+    } else if (!strcmp(cmd, "log stop")) {
+        log_on = false; strcpy(reply, "   logging off");
+    } else if (!strcmp(cmd, "stats")) {
+        sprintf(reply, "up=%lus rx=%lu fwd=%lu drop=%lu tx=%lu lbt=%lu budget=%lums radio=%s",
+                (unsigned long)uptime_s(), (unsigned long)stat_rx, (unsigned long)stat_fwd,
+                (unsigned long)stat_drop, (unsigned long)stat_tx, (unsigned long)stat_lbt,
+                (unsigned long)budget_ms, radio_has_tcxo ? "tcxo" : "xtal");
+    } else if (!strncmp(cmd, "password", 8)) {
+        strcpy(reply, "Error: remote admin not supported");
+    } else if (*cmd) {
+        strcpy(reply, "Unknown command");
+    }
+}
+
+static char    cli_buf[160];
+static uint8_t cli_len = 0;
+static bool    cli_last_cr = false;
+
+static void cli_poll(void) {
+    while (Serial1.available()) {
+        char c = Serial1.read();
+        bool lf_after_cr = (c == '\n' && cli_last_cr);   // accept CR, LF or CRLF line endings
+        cli_last_cr = (c == '\r');
+        if (lf_after_cr) continue;
+        if (c == '\r' || c == '\n' || cli_len >= sizeof(cli_buf) - 1) {
+            Serial1.print('\n');
+            cli_buf[cli_len] = 0;
+            char reply[176];
+            handle_command(cli_buf, reply);
+            if (reply[0]) { Serial1.print("  -> "); Serial1.println(reply); }
+            cli_len = 0;
+            if (reboot_pending) { Serial1.flush(); delay(50); NVIC_SystemReset(); }
+            continue;
+        }
+        if (c == 8 || c == 127) { if (cli_len) { cli_len--; Serial1.print("\b \b"); } continue; }
+        cli_buf[cli_len++] = c;
+        Serial1.print(c);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Arduino entry points
 // ═════════════════════════════════════════════════════════════════════════════
-static uint32_t next_local_advert_s = 0;
-static uint32_t next_flood_advert_s = 0;
-static uint32_t next_persist_s = 0;
-static uint32_t next_beat_s = 0;
+static uint32_t next_local_advert_s = 0, next_flood_advert_s = 0, next_persist_s = 0, next_beat_s = 0;
 
 void setup(void) {
     pinMode(PIN_LED, OUTPUT);
@@ -969,109 +1270,112 @@ void setup(void) {
 
     Serial1.begin(115200);
     delay(200);
-    IWatchdog.begin(8000000);   // 8 s
+    IWatchdog.begin(8000000);
 
-    identity_init();
-    regions_init();
-    clock_init();
+    bool have_cfg = false;
+    memcpy(&cfg, (const void*)CONFIG_ADDR, sizeof(cfg));
+    if (cfg.magic == CFG_MAGIC && cfg.check == cfg_checksum(cfg)) have_cfg = true;
+    else cfg_defaults();
+    regions_rekey();
 
     Serial1.println();
-    Serial1.print("=== SPECTER MeshCore Repeater v" FW_VERSION " [");
-    Serial1.print(node_name); Serial1.println("] ===");
-    Serial1.print("Hash: 0x"); Serial1.println(own_pubkey[0], HEX);
-    Serial1.print("Clock: "); Serial1.println(clock_now());
-    Serial1.print("Radio: "); Serial1.print(LORA_FREQ, 3); Serial1.print(" MHz BW");
-    Serial1.print(LORA_BW, 1); Serial1.print(" SF"); Serial1.print(LORA_SF);
-    Serial1.print(" CR4/"); Serial1.print(LORA_CR); Serial1.print(" ");
-    Serial1.print(LORA_TX_POWER); Serial1.println(" dBm");
-    Serial1.print("Regions:");
-    if (num_regions == 0) Serial1.print(" (none - scoped floods are not forwarded)");
-    for (int i = 0; i < num_regions; i++) { Serial1.print(" #"); Serial1.print(region_names[i]); }
-    Serial1.println();
-    Serial1.print("Unscoped flood: "); Serial1.println(ALLOW_UNSCOPED_FLOOD ? "forward" : "drop");
-
-    Serial1.print("Radio init...");
+    Serial1.println("SPECTER MeshCore Repeater " FW_VERSION);
     if (!radio_init()) {
-        while (true) { led(true); delay(100); led(false); delay(100); }  // IWDG resets & retries
+        while (true) { led(true); delay(100); led(false); delay(100); }   // IWDG resets & retries
     }
-    Serial1.print(" OK (");
-    Serial1.print(tcxo_used > 0 ? "TCXO" : "crystal");
-    Serial1.println(")");
-
     for (int i = 0; i < 4; i++) rng_state ^= (uint32_t)radio.randomByte() << (i * 8);
     if (rng_state == 0) rng_state = 0x9E3779B9;
 
-    budget_ms = budget_max / 2;
+    if (!have_cfg) {
+        // First boot: draw the identity from the (now running) radio's noise.
+        SHA256 sha;
+        sha.reset();
+        sha.update(cfg.privkey, 32);
+        for (int i = 0; i < 64; i++) { uint8_t b = radio.randomByte(); uint32_t t = micros(); sha.update(&b, 1); sha.update(&t, 4); }
+        sha.finalize(cfg.privkey, 32);
+        cfg_save();
+        Serial1.println("First boot: new identity and default settings saved");
+    }
+    Ed25519::derivePublicKey(own_pubkey, cfg.privkey);
+    clock_init();
+
+    char a[16], b[16];
+    Serial1.print("Name: "); Serial1.println(cfg.name);
+    Serial1.print("Radio: "); Serial1.print(fmt_fixed(a, cfg.freq_khz, 3)); Serial1.print(",");
+    Serial1.print(fmt_fixed(b, cfg.bw_hz, 3)); Serial1.print(","); Serial1.print(cfg.sf); Serial1.print(",");
+    Serial1.print(cfg.cr); Serial1.print(" "); Serial1.print(cfg.tx_dbm); Serial1.print(" dBm ");
+    Serial1.println(radio_has_tcxo ? "(tcxo)" : "(xtal)");
+    Serial1.println("Type 'get name', 'set name <x>', 'region', 'log start' ...");
+
+    budget_ms = budget_max() / 2;
     budget_updated = millis();
     rx_start();
 
     uint32_t up = uptime_s();
-    next_local_advert_s = up + 16;                       // upstream: zero-hop at 16 s
+    next_local_advert_s = up + 16;
     uint32_t since_flood = clock_now() - j_last_flood_ts;
-    uint32_t flood_iv = FLOOD_ADVERT_INTERVAL_H * 3600UL;
-    next_flood_advert_s = (j_last_flood_ts == 0 || since_flood >= flood_iv)
-                              ? up + rnd_range(20, 60)    // overdue: flood soon after boot
-                              : up + (flood_iv - since_flood);
+    uint32_t flood_iv = cfg.flood_advert_h * 3600UL;
+    next_flood_advert_s = (!cfg.flood_advert_h) ? 0xFFFFFFFFUL
+                        : (j_last_flood_ts == 0 || since_flood >= flood_iv) ? up + rnd_range(20, 60)
+                        : up + (flood_iv - since_flood);
     next_persist_s = up + PERSIST_INTERVAL_MIN * 60UL;
-    next_beat_s = up + HEARTBEAT_S;
+    next_beat_s = up + 60;
     led(false);
 }
 
 void loop(void) {
     IWatchdog.reload();
     uint32_t up = uptime_s();
+    cli_poll();
 
-    // ── Receive ──────────────────────────────────────────────────────────────
     uint32_t irq = radio.getIrqFlags();
     if (irq & RADIOLIB_SX126X_IRQ_RX_DONE) {
         uint8_t rxbuf[MAX_PKT];
         int len = (int)radio.getPacketLength();
         int state = (len > 0 && len < MAX_PKT) ? radio.readData(rxbuf, len) : RADIOLIB_ERR_PACKET_TOO_LONG;
-        float snr = radio.getSNR();
-        int rssi = (int)radio.getRSSI();
+        uint32_t ps = radio.packetStatus();
+        int snr4 = (int8_t)((ps >> 8) & 0xFF);
+        int rssi = -(int)(ps & 0xFF) / 2;
         activity_at = 0; header_seen = false;
         rx_start();
         if (state == RADIOLIB_ERR_NONE) {
             stat_rx++;
-            Serial1.print("RX RSSI="); Serial1.print(rssi);
-            Serial1.print(" SNR="); Serial1.print(snr, 1);
-            Serial1.print(" len="); Serial1.println(len);
-            led_blink(1, 20);
-            on_receive(rxbuf, len, (int8_t)(snr * 4));
-        } else if (state != RADIOLIB_ERR_CRC_MISMATCH) {
-            Serial1.print("readData err: "); Serial1.println(state);
+            if (log_on) {
+                Serial1.print("RX rssi="); Serial1.print(rssi);
+                Serial1.print(" snr="); Serial1.print(snr4 / 4);
+                Serial1.print(" len="); Serial1.println(len);
+            }
+            on_receive(rxbuf, len, (int8_t)snr4);
         }
         return;
     }
 
-    // ── Adverts ──────────────────────────────────────────────────────────────
-    if ((int32_t)(up - next_flood_advert_s) >= 0) {
+    if (cfg.flood_advert_h && (int32_t)(up - next_flood_advert_s) >= 0) {
         send_advert(true);
-        next_flood_advert_s = up + FLOOD_ADVERT_INTERVAL_H * 3600UL;
-        if (ADVERT_INTERVAL_MIN) next_local_advert_s = up + ADVERT_INTERVAL_MIN * 60UL;
-    } else if (ADVERT_INTERVAL_MIN && (int32_t)(up - next_local_advert_s) >= 0) {
+        next_flood_advert_s = up + cfg.flood_advert_h * 3600UL;
+        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
+    } else if (cfg.advert_interval_min && (int32_t)(up - next_local_advert_s) >= 0) {
         send_advert(false);
-        next_local_advert_s = up + ADVERT_INTERVAL_MIN * 60UL;
+        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
     }
 
-    // ── Transmit queue ───────────────────────────────────────────────────────
     txq_service(irq);
 
-    // ── Housekeeping ─────────────────────────────────────────────────────────
     if ((int32_t)(up - next_persist_s) >= 0) {
         journal_write(clock_now(), j_last_flood_ts);
         next_persist_s = up + PERSIST_INTERVAL_MIN * 60UL;
     }
-    if ((int32_t)(up - next_beat_s) >= 0) {
-        next_beat_s = up + HEARTBEAT_S;
-        Serial1.print("ALIVE up="); Serial1.print(up);
-        Serial1.print("s rx="); Serial1.print(stat_rx);
-        Serial1.print(" fwd="); Serial1.print(stat_fwd);
-        Serial1.print(" drop="); Serial1.print(stat_drop);
-        Serial1.print(" tx="); Serial1.print(stat_tx);
-        Serial1.print(" lbt="); Serial1.print(stat_lbt);
-        Serial1.print(" budget="); Serial1.println(budget_ms);
+    if (log_on && (int32_t)(up - next_beat_s) >= 0) {
+        next_beat_s = up + 60;
+        char r[160];
+        handle_command((char*)"stats", r);
+        Serial1.println(r);
+    }
+    if (timers_dirty) {
+        timers_dirty = false;
+        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
+        next_flood_advert_s = cfg.flood_advert_h ? up + cfg.flood_advert_h * 3600UL : 0xFFFFFFFFUL;
     }
 
-    __WFI();   // sleep until the next SysTick (1 ms) or UART interrupt
+    __WFI();
 }

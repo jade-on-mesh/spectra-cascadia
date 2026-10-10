@@ -5,7 +5,7 @@
 
 ---
 
-## v2.0 (CascadiaMesh fork): what changed and why
+## v2.x (CascadiaMesh fork): what changed and why
 
 v1.1 relayed traffic but behaved in ways that hurt a shared regional mesh. v2.0
 rewrites the forwarding logic to follow upstream MeshCore
@@ -16,43 +16,79 @@ no-filesystem part allows.
 |---|---|
 | The 2-minute "local" advert was sent as `FLOOD`, so every repeater relayed it mesh-wide | Zero-hop adverts are `DIRECT` with an empty path (upstream `sendZeroHop`). Flood adverts every 47 h, as upstream |
 | `TRANSPORT_*` packets parsed without their 4 transport-code bytes → corrupted on relay | Parsed per `Packet::readFrom`; codes preserved |
-| Region scoping ignored | Scoped floods forwarded only for regions in `REGIONS` (same HMAC check as `RegionMap::findMatch`). Own flood adverts can be scoped with `ADVERT_SCOPE` |
+| Region scoping ignored | Scoped floods forwarded only for configured regions (same HMAC check as `RegionMap::findMatch`). Own flood adverts can be scoped with `region default` |
 | `DIRECT` relayed if our hash appeared *anywhere* in the path, unchanged, no dedup → broken DMs, possible ping-pong | Forwarded only when we are the next hop, self removed from path, deduplicated. ACK / multipart ACK / TRACE handled as upstream |
 | Every payload type flooded | Only types upstream floods; adverts signature-verified first; hop limits `flood.max`, `flood.max.unscoped`, `flood.max.advert` (8); loop detection |
 | Blind 300–800 ms `delay()` with the radio deaf | Listen-before-talk on SX1262 preamble/header IRQs, randomized `tx_delay_factor` delays, TX queue with RX running, airtime budget |
 | Advert timestamp = build time + uptime → goes backwards on every reboot (nodes ignore it as a replay); wraps at 49 days | Flash journal keeps time monotonic across reboots; clock pulled forward to the median of verified neighbour adverts |
-| EU frequency hard-coded, preamble 8 | US/Canada preset by default, everything a build flag; preamble 16 as upstream; TCXO/crystal auto-detected |
+| EU frequency hard-coded, preamble 8 | US/Canada preset by default, configurable over serial; preamble 16 as upstream; TCXO/crystal auto-detected |
 | Busy-polling at 72 MHz | MCU sleeps (`WFI`) between polls |
 
-Still **not** included (no room / no storage): CLI, remote admin login, telemetry,
-private (`$`) regions, path-return / neighbour tables. It is a dumb, well-behaved
-repeater: configure at build time, flash, deploy.
+v2.1 adds an upstream-style **USB serial CLI** with settings stored in flash (below).
+Still **not** included (no room): remote admin login, telemetry, private (`$`)
+regions, neighbour tables.
 
-**Status:** compiles (≈60 KB of the 63 KB budget) and passes the host-side tests in
+**Status (v2.1):** compiles (≈61 KB of the 62 KB budget) and passes the host-side tests in
 `test/host/` (forwarding rules, region codes cross-checked against a Python HMAC
-reference, journal wear/rollover). **Not yet RF-tested on hardware.** Test on the bench
+reference, journal wear/rollover, serial CLI, settings persistence). **Not yet RF-tested on hardware.** Test on the bench
 next to a known-good MeshCore repeater before deploying.
 
-### Configuring (platformio.ini `build_flags`)
+### Configuring over USB serial
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `LORA_FREQ` / `LORA_BW` / `LORA_SF` / `LORA_CR` | 910.525 / 62.5 / 7 / 5 | Radio preset (`env:specter_eu` has the old EU values) |
-| `LORA_TX_POWER` | 20 | dBm (DX-LR30 max 22) |
-| `NODE_NAME_STR` | `SPECTER-XXXX` | Callsign, ≤ 23 chars |
-| `NODE_LAT_I` / `NODE_LON_I` | — | Location × 1e6 |
-| `REGIONS` | `""` | Comma list of hashtag regions whose scoped floods we forward. **Empty = scoped floods are dropped**, same as an unconfigured upstream repeater |
-| `ADVERT_SCOPE` | — | Region to scope our own flood adverts to |
-| `ALLOW_UNSCOPED_FLOOD` | 1 | Forward plain `FLOOD` packets (0 = wildcard deny) |
-| `FLOOD_MAX` / `FLOOD_MAX_UNSCOPED` / `FLOOD_MAX_ADVERT` | 64 / 64 / 8 | Hop limits |
-| `ADVERT_INTERVAL_MIN` / `FLOOD_ADVERT_INTERVAL_H` | 2 / 47 | Advert timing (upstream defaults) |
-| `PATH_HASH_SIZE` | 1 | Path hash bytes for packets we originate |
-| `TX_DELAY_FACTOR` / `DIRECT_TX_DELAY_FACTOR` / `AIRTIME_FACTOR` | 0.5 / 0.3 / 1.0 | Upstream repeater defaults |
-| `IDENTITY_SALT` | old v1 salt | Secret mixed into the UID-derived key. The default keeps v1 identities but means anyone who learns a board's UID can derive its key; set a private salt for new deployments (changes the node's identity) |
-| `FIXED_PRIVKEY_HEX` | — | Use an explicit key instead (see `tools/gen_identity.py`) |
+Settings live in flash and are changed with the **same serial commands as an
+upstream MeshCore repeater**, so one `.bin` works for every node. Open any serial
+terminal at **115200 8N1** (Arduino IDE Serial Monitor, PuTTY, `pio device monitor`, …; any line ending) and type:
 
-The serial log prints the active preset, regions, and whether the radio came up in
-TCXO or plain-crystal mode.
+```
+set name CM-Woodway-1
+set lat 47.793
+set lon -122.383
+set tx 22
+region put se-wa
+region default se-wa
+region save
+advert
+```
+
+Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
+
+| Command | Notes |
+|---|---|
+| `get` / `set name` | Advert name (no `[ ] \ : , ? *`) |
+| `get` / `set lat`, `lon` | Decimal degrees; 0,0 = no location in adverts |
+| `get` / `set radio <freq>,<bw>,<sf>,<cr>` | e.g. `910.525,62.5,7,5`; **reboot to apply** |
+| `get` / `set freq` | MHz; reboot to apply |
+| `get` / `set tx` | dBm, -9..22, applies immediately |
+| `get` / `set repeat on\|off` | Stop/start forwarding |
+| `get` / `set advert.interval` | Zero-hop advert, minutes (0 = off, 2–240) |
+| `get` / `set flood.advert.interval` | Hours (0 = off, 3–168) |
+| `get` / `set flood.max`, `flood.max.unscoped`, `flood.max.advert` | Hop limits |
+| `get` / `set txdelay`, `direct.txdelay`, `af` | Same meaning as upstream |
+| `get` / `set path.hash.mode` | 0/1/2 → 1/2/3-byte hashes for our own floods |
+| `get` / `set loop.detect` | off / minimal / moderate / strict |
+| `get public.key`, `get prv.key`, `set prv.key <64 hex>` | 32-byte Ed25519 seed (not upstream's 64-byte format) |
+| `get role` | `repeater` |
+| `region` | List regions; `F` = flood allowed |
+| `region put` / `remove` / `allowf` / `denyf` / `get` `<name>` | `*` is the wildcard (un-scoped floods) |
+| `region default <name>\|<null>` | Scope for our own flood adverts (saved immediately) |
+| `region list allowed\|denied`, `region save` | Region edits are kept in RAM until `region save` |
+| `advert`, `advert.zerohop` | Send an advert now |
+| `clock`, `time <epoch>` | Clock can only move forward |
+| `ver`, `board`, `reboot` | |
+| `erase` | Factory reset: defaults and a **new identity** after reboot |
+| `log start` / `log stop` | Live packet log (off by default so tools see clean replies) |
+| `stats` | Uptime and packet counters |
+
+Not supported (no room): remote admin login / passwords, neighbours, telemetry,
+private `$` regions, region hierarchy (parent arguments are ignored).
+
+On first boot the node creates a **random identity** from radio noise and saves it,
+so the key no longer depends on the chip's UID (`IDENTITY_SALT` is gone). Build
+flags in `platformio.ini` (`NODE_NAME_STR`, `REGIONS`, `DEFAULT_SCOPE`,
+`LORA_FREQ_KHZ`, …) only set first-boot defaults.
+
+With no regions configured, scoped (`TRANSPORT_FLOOD`) traffic is dropped, the same
+as an unconfigured upstream repeater, so add your region tags with `region put`.
 
 ---
 
@@ -234,8 +270,8 @@ Bytes N..:  payload (ADVERT / MESSAGE / etc.)
 
 | Route type | Value | SPECTER action |
 |---|---|---|
-| `TRANSPORT_FLOOD` | `0x00` | Relay only if the transport code matches a region in `REGIONS`; codes kept, own hash appended |
-| `FLOOD` | `0x01` | Relay if `ALLOW_UNSCOPED_FLOOD`; own hash appended |
+| `TRANSPORT_FLOOD` | `0x00` | Relay only if the transport code matches a flood-allowed region; codes kept, own hash appended |
+| `FLOOD` | `0x01` | Relay if the `*` wildcard allows flood; own hash appended |
 | `DIRECT` | `0x02` | Relay only if own hash is the **first** (next-hop) entry; own hash removed |
 | `TRANSPORT_DIRECT` | `0x03` | Same as `DIRECT`, transport codes kept |
 
@@ -253,7 +289,7 @@ table above.
 | Coding Rate | 4/5 | |
 | Preamble | 16 symbols | Matches upstream MeshCore |
 | Sync Word | 0x12 | LoRa private network |
-| TX Power | 20 dBm | Override with `LORA_TX_POWER` |
+| TX Power | 20 dBm | `set tx` |
 | CRC | on | |
 
 `pio run -e specter_eu` builds the original EU/UK narrow settings (869.618 MHz, SF8, CR4/8, 14 dBm).
@@ -292,12 +328,22 @@ pio run -e specter
 ### Memory Usage
 
 ```
-RAM:   ███░░░░░░░  29.6%  (6068 / 20480 bytes)
-Flash: █████████░  92.9%  (59948 / 64512 bytes)
+RAM:   ███░░░░░░░  30.4%  (6216 / 20480 bytes)
+Flash: ██████████  96.0%  (60972 / 63488 bytes)
 ```
 
-The image is capped at 63 KB (`board_upload.maximum_size`) because the last 1 KB page
-of the first 64 KB holds the clock journal, so it works on genuine 64 KB C8 chips.
+The image is capped at 62 KB (`board_upload.maximum_size`) because the top two 1 KB
+pages of the first 64 KB hold the settings and the clock journal, so it works on
+genuine 64 KB C8 chips. Unused STM32 HAL modules are disabled in `platformio.ini`
+to make it fit; keep those flags if you build another way.
+
+### Building with the Arduino IDE instead
+
+Install "STM32 MCU based boards", RadioLib and Crypto (Rhys Weatherley). Make a sketch
+folder `specter/` with an empty `specter.ino`, a copy of `src/main.cpp`, and a
+`build_opt.h` containing every `-D …` line from `[specter_base]` in `platformio.ini`
+(one per line). Board: Generic STM32F1 series → Generic F103C8, Optimize: Smallest.
+Use Sketch → Export Compiled Binary and check the size stays under 63,488 bytes.
 
 ### Host tests
 

@@ -2,6 +2,20 @@
 
 All notable changes to SPECTER firmware are documented here.
 
+## [2.1.0-cascadia] - 2026-10-09
+
+### Added
+- USB serial CLI with upstream MeshCore repeater syntax and reply style: `get/set name, lat, lon, radio, freq, tx, repeat, advert.interval, flood.advert.interval, flood.max*, txdelay, direct.txdelay, af, path.hash.mode, loop.detect, public.key, prv.key, role`, `region …`, `advert`, `clock`, `time`, `ver`, `board`, `reboot`, `erase`, `log start/stop`, `stats`
+- Settings stored in a dedicated flash page; build flags are first-boot defaults only
+- Random identity generated from radio noise on first boot (replaces UID-derived key and `IDENTITY_SALT`)
+- Region allow/deny flood flags, `*` wildcard, default scope for own flood adverts
+
+### Changed
+- Packet logging is off by default (`log start`) so serial tools see clean replies
+- Image capped at 62 KB; unused HAL modules disabled to fit
+- SNR/RSSI read from raw packet status (drops double-precision math)
+- Build flag names: `LORA_FREQ_KHZ`, `LORA_BW_HZ`, `PATH_HASH_MODE`, `DEFAULT_SCOPE`
+
 ## [2.0.0-cascadia] - 2026-10-09
 
 Forwarding rewritten to follow upstream MeshCore (Mesh.cpp + simple_repeater).

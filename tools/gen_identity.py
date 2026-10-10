@@ -5,7 +5,7 @@ Usage:
   python3 gen_identity.py E5
   python3 gen_identity.py 30
   python3 gen_identity.py 2E
-Output: privkey hex (to use as FIXED_PRIVKEY_HEX in platformio.ini)
+Output: privkey hex — load it on a node with:  set prv.key <hex>  then reboot
 """
 import os
 import sys
@@ -30,11 +30,11 @@ def main():
     print(f"Searching for pubkey[0] == 0x{target:02X}...")
     seed, pub, n = find_key(target)
     print(f"Found after {n} attempts!\n")
-    print(f"  FIXED_PRIVKEY_HEX = {seed.hex()}")
+    print(f"  privkey (seed)    = {seed.hex()}")
     print(f"  pubkey            = {pub.hex()}")
     print(f"  pub[0]            = 0x{pub[0]:02X}")
-    print(f"\nAdd to platformio.ini build_flags:")
-    print(f'    -D FIXED_PRIVKEY_HEX=\\"{seed.hex()}\\"')
+    print(f"\nOn the node's serial console:")
+    print(f"    set prv.key {seed.hex()}\n    reboot")
 
 if __name__ == "__main__":
     main()

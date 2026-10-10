@@ -38,4 +38,8 @@ struct SX1262 {
   int readData(uint8_t*, size_t) { return 0; }
   float getSNR() { return 0; }
   float getRSSI() { return 0; }
+  int16_t setOutputPower(int) { return 0; }
+protected:
+  uint32_t getPacketStatus() { return 0; }
+public:
 };
