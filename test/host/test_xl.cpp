@@ -7,9 +7,11 @@
 
 static uint32_t fake_config[256];
 static uint32_t fake_journal[256];
+static uint32_t fake_acl[256];
 static uint32_t fake_uid[3] = { 0x11223344, 0x55667788, 0x99AABBCC };
 #define CONFIG_ADDR  ((uintptr_t)fake_config)
 #define JOURNAL_ADDR ((uintptr_t)fake_journal)
+#define ACL_ADDR     ((uintptr_t)fake_acl)
 #define UID_BASE     ((uintptr_t)fake_uid)
 #define SPECTER_XL 1
 extern "C" {
@@ -24,6 +26,8 @@ static uint32_t* page_for(uint32_t addr, uint32_t* idx) {
     uint32_t c = (uint32_t)(uintptr_t)fake_config, j = (uint32_t)(uintptr_t)fake_journal;
     if (addr - c < 1024) { *idx = (addr - c) / 4; return fake_config; }
     if (addr - j < 1024) { *idx = (addr - j) / 4; return fake_journal; }
+    uint32_t q = (uint32_t)(uintptr_t)fake_acl;
+    if (addr - q < 1024) { *idx = (addr - q) / 4; return fake_acl; }
     assert(!"flash address outside the two pages");
     return nullptr;
 }
@@ -50,6 +54,11 @@ uint16_t adc_read(uint8_t ch) { return fake_adc[ch]; }
 uint16_t bkp_read(void) { return fake_bkp; }
 void bkp_write(uint16_t v) { fake_bkp = v; }
 void enter_standby(void) { throw StandbyEntered(); }
+static uint16_t fake_bkp_dr[8];
+static uint32_t fake_csr = (1UL << 27) | (1UL << 26);     // power-on
+uint16_t bkp_get(int n) { return fake_bkp_dr[n]; }
+void bkp_set(int n, uint16_t v) { fake_bkp_dr[n] = v; }
+uint32_t reset_csr(void) { uint32_t c = fake_csr; fake_csr = 0; return c; }
 static void set_vdd(uint32_t mv) { fake_adc[17] = (uint16_t)(1200UL * 4095UL / mv); }
 static void set_pin_mv(uint8_t ch, uint32_t pin_mv, uint32_t vdd) { fake_adc[ch] = (uint16_t)(pin_mv * 4095UL / vdd); }
 
@@ -119,6 +128,7 @@ int main() {
     set_vdd(3300); fake_adc[16] = (uint16_t)(1430UL * 4095UL / 3300UL);
     memset(fake_config, 0xFF, sizeof(fake_config));
     memset(fake_journal, 0xFF, sizeof(fake_journal));
+    memset(fake_acl, 0xFF, sizeof(fake_acl));
     setup();
     printf("own hash %02x\n", own_pubkey[0]);
     CHECK(Serial1.out.find("App login: off") != std::string::npos, "fresh XL boot: app login off until a password is set");
@@ -249,7 +259,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.4.2") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.5.0") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -357,6 +367,100 @@ int main() {
       Pkt p; uint8_t d[200]; int m = open_reply(last_q(), s, p, d);
       d[m > 0 ? m : 0] = 0;
       CHECK(m > 8 && !strncmp((char*)d + 8, "Hilltop\nJade\nCascadiaMesh", 25), "anonymous owner query: name + owner info"); clearq(); }
+
+
+    // ── v2.5: admin list survives reboot (admins only, as upstream ClientACL)
+    { CHECK(xl_acl_dirty_at != 0 || xl_find(a.pub), "admin login marks the list for saving");
+      fake_ms += 6000; loop(); clearq();
+      CHECK(xl_acl_dirty_at == 0 && fake_acl[0] == ACL_MAGIC, "admin list written to its flash page after 5 s");
+      setup();
+      XlClient* c = xl_find(a.pub);
+      CHECK(c && c->perms == PERM_ACL_ADMIN, "admin still known after reboot");
+      Client g2; mk_client(g2, 9);
+      CHECK(!xl_find(g2.pub), "guests are not kept across reboot");
+      CHECK(rcli(a, "get name", 1) == "> Hilltop", "admin's CLI works after reboot without logging in again");
+      Client b; mk_client(b, 40);
+      char cmd[120]; char hx[65]; to_hex(hx, b.pub, 32); sprintf(cmd, "setperm %s 3", hx);
+      CHECK(cli(cmd) == "OK" && xl_find(b.pub) && xl_find(b.pub)->perms == PERM_ACL_ADMIN, "setperm adds an admin by key");
+      CHECK(rcli(b, "get name", 1) == "> Hilltop", "setperm admin can use the CLI without a password");
+      hx[8] = 0; sprintf(cmd, "setperm %s 0", hx);
+      CHECK(cli(cmd) == "OK" && !xl_find(b.pub), "setperm ... 0 removes (prefix ok)");
+      CHECK(rcli(a, "get acl", 1) == "Error: USB console only", "get acl is USB only");
+      Serial1.out.clear(); cli("get acl");
+      to_hex(hx, a.pub, 32);
+      CHECK(Serial1.out.find(std::string("03 ") + hx) != std::string::npos, "get acl lists the admin"); clearq(); }
+
+    // ── v2.5: 128 neighbours (8-byte prefixes)
+    { memset(xl_nb, 0, sizeof(xl_nb));
+      uint8_t pk[32];
+      for (int i = 0; i < 130; i++) { memset(pk, 0, 32); pk[0] = 0x10; pk[1] = (uint8_t)i; pk[2] = (uint8_t)(i >> 8); fake_ms += 1000; xl_note_neighbour(pk, (int8_t)(i & 63)); }
+      int n = 0; for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up) n++;
+      CHECK(n == 128 && sizeof(XlNeighbour) == 16, "128 neighbours, 16 bytes each");
+      bool oldest_gone = true; for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up && xl_nb[i].pfx[1] < 2 && !xl_nb[i].pfx[2]) oldest_gone = false;
+      CHECK(oldest_gone, "full table replaces the least recently heard");
+      uint8_t b[] = { REQ_TYPE_GET_NEIGHBOURS, 0, 26, 100, 0, 0, 4, 9, 9, 9, 9 };
+      req(a, ts_now++, b, sizeof(b), PT_REQ);
+      Pkt p; uint8_t d[200]; int m = open_reply(last_q(), a, p, d);
+      int16_t total, res; memcpy(&total, d + 4, 2); memcpy(&res, d + 6, 2);
+      CHECK(m > 0 && total == 128 && res == 14, "neighbours REQ pages past 100 (offset 100 of 128)");
+      std::string nl = rcli(a, "neighbors", 1);
+      CHECK(nl.compare(0, 9, "10810000:") == 0, "neighbors CLI newest first");
+      CHECK(rcli(a, "neighbor.remove 108100", 1) == "OK" && rcli(a, "neighbors", 1).compare(0, 9, "10800000:") == 0, "neighbor.remove by prefix");
+      clearq(); }
+
+    // ── v2.5: discover.neighbors (zero-hop CONTROL, upstream format)
+    { std::string r = rcli(a, "discover.neighbors", 1);
+      TxItem* t = nullptr; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used && (txq[i].buf[0] >> 2) == PT_CONTROL) t = &txq[i];
+      CHECK(r == "OK - Discover sent" && t && t->buf[0] == ((PT_CONTROL << 2) | ROUTE_DIRECT) && t->buf[1] == 0
+            && t->buf[2] == 0x80 && t->buf[3] == 4 && t->len == 12, "discover request: zero-hop CONTROL 0x80, repeaters filter");
+      uint32_t tag; memcpy(&tag, t->buf + 4, 4);
+      clearq();
+      uint8_t other[32]; for (int i = 0; i < 32; i++) other[i] = 0xC0 + i;
+      uint8_t pk[50]; pk[0] = (PT_CONTROL << 2) | ROUTE_DIRECT; pk[1] = 0; pk[2] = 0x92; pk[3] = 12; memcpy(pk + 4, &tag, 4); memcpy(pk + 8, other, 32);
+      on_receive(pk, 40, -9);
+      bool found = false; for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up && !memcmp(xl_nb[i].pfx, other, 8) && xl_nb[i].snr4 == -9) found = true;
+      CHECK(found, "discover response adds the neighbour");
+      memset(xl_nb, 0, sizeof(xl_nb)); pk[4] ^= 1; on_receive(pk, 40, -9);
+      found = false; for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up) found = true;
+      CHECK(!found, "response with a wrong tag ignored");
+      // answering someone else's discover
+      uint8_t rq[14] = { (PT_CONTROL << 2) | ROUTE_DIRECT, 0, 0x80, 4, 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0 };
+      clearq(); on_receive(rq, 12, 22);
+      TxItem* rs = last_q();
+      CHECK(rs && rs->buf[2] == (0x90 | 2) && (int8_t)rs->buf[3] == 22 && !memcmp(rs->buf + 4, rq + 4, 4)
+            && !memcmp(rs->buf + 8, own_pubkey, 32) && rs->len == 40, "answers a discover request with our key and the SNR");
+      rq[2] = 0x81; clearq(); on_receive(rq, 12, 22); rs = last_q();
+      CHECK(rs && rs->len == 2 + 14, "prefix_only request gets an 8-byte key");
+      for (int i = 0; i < 4; i++) { clearq(); on_receive(rq, 12, 22); }
+      CHECK(queued() == 0, "discover answers rate-limited (4 per 2 min)");
+      fake_ms += 121000; clearq(); rq[3] = 0x02; on_receive(rq, 12, 22);
+      CHECK(queued() == 0, "discover for other node types ignored"); clearq(); }
+
+    // ── v2.5: reset reason
+    { fake_csr = (1UL << 29); Serial1.out.clear(); setup();
+      bool shown = Serial1.out.find("Last reset: watchdog") != std::string::npos;
+      CHECK(cli("get reset.reason") == "> watchdog (watchdog resets since power-on: 1)" && shown, "watchdog reset reported");
+      fake_csr = (1UL << 29); setup();
+      CHECK(cli("get reset.reason").find("watchdog resets since power-on: 2") != std::string::npos, "watchdog resets counted");
+      cli("reboot"); fake_csr = (1UL << 28); setup();
+      CHECK(cli("get reset.reason") == "> reboot command (watchdog resets since power-on: 2)", "reboot command recognised");
+      fake_csr = (1UL << 27) | (1UL << 26); setup();
+      CHECK(cli("get reset.reason") == "> power-on / brownout (watchdog resets since power-on: 0)", "power-on resets the count");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
+
+    // ── region def / load (XL)
+    { while (cfg.num_regions) { char b[40]; sprintf(b, "region remove %s", cfg.regions[cfg.num_regions - 1]); cli(b); }
+      std::string d = cli("region def pnw or|pnw wa");
+      CHECK(cli("region get or") == " or (pnw) F" && cli("region get wa") == " wa (pnw) F", "region def: chain with |jump");
+      Serial1.out.clear();
+      cli("region load");
+      Serial1.in = std::string(" cascadia F\r  wa\r   tacoma F\r  or F\r\r"); cli_poll();
+      CHECK(Serial1.out.find("OK - loaded 4 regions") != std::string::npos, "region load: indented lines, blank line ends");
+      CHECK(cli("region get tacoma") == " tacoma (wa) F" && cli("region get wa") == " wa (cascadia) F"
+            && region_find("se-wa") < 0, "region load replaced the map (existing flags kept)");
+      cli("region allowf *"); cli("region save");
+      setup();
+      CHECK(cli("region get tacoma") == " tacoma (wa) F", "hierarchy survives reboot"); }
 
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);

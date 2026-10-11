@@ -2,6 +2,20 @@
 
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
+## [2.5.0] - 2026-10-11
+
+### Added
+- `discover.neighbors` (XL): one-time zero-hop "who's there?" sent to repeaters (upstream `sendNodeDiscoverReq`); answers are added to the neighbour list for 60 s. All builds now answer other nodes' discover requests (format, rate limit of 4 per 2 min and `since` filter as upstream)
+- 128-entry neighbour list (XL; upstream keeps 50), stored as 8-byte key prefixes, which is more than the app requests. `neighbor.remove <hex>`
+- Admin list kept across reboots (XL): admins and other non-guest roles go in the last 1 KB page of flash, saved 5 s after a change, as upstream `ClientACL`. 12 login slots (was 6). `setperm <pubkey> <perms>`, plus `get acl` over USB
+- Region hierarchy as upstream: `region put <name> [parent]`, tree export with `^` marking home and `F` marking flood-allowed, `region get` shows the parent, `region home`, `region remove` refuses regions that still have children. `region def` and `region load` (indented import, also from the app's command screen) are XL-only
+- Private `$` region names are accepted and listed but never match, as upstream, where their keys can't be set yet
+- `get reset.reason`: power-on/brownout, watchdog (with a count since power-on), reboot command, software, reset pin, low-power or low-battery standby. Also printed at boot
+
+### Changed
+- `region list allowed` includes `*` first when un-scoped flooding is allowed (upstream `exportNamesTo`)
+- Smaller `strcmp` (saves ~420 bytes, so the standard build still fits)
+
 ## [2.4.2] - 2026-10-11
 
 ### Fixed (XL)

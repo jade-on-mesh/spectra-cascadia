@@ -9,8 +9,9 @@
 //  timings follow upstream so the stock app and companion firmware work as-is.
 // ═════════════════════════════════════════════════════════════════════════════
 
-#define XL_MAX_CLIENTS   6
-#define XL_MAX_NEIGHB    8
+#define XL_MAX_CLIENTS   12
+#define XL_MAX_NEIGHB    128      // upstream: 50 full keys; we keep 8-byte prefixes (the app asks for 4)
+#define XL_NB_PFX        8
 #define PERM_ACL_GUEST   0
 #define PERM_ACL_ADMIN   3
 #define RESP_SERVER_LOGIN_OK 0
@@ -42,8 +43,43 @@ struct XlClient {
 };
 static XlClient xl_clients[XL_MAX_CLIENTS];
 
-struct XlNeighbour { uint8_t pub[32]; uint32_t heard_up; int8_t snr4; };
+struct XlNeighbour { uint8_t pfx[XL_NB_PFX]; uint32_t heard_up; int8_t snr4; };   // 16 bytes
 static XlNeighbour xl_nb[XL_MAX_NEIGHB];
+
+// ── admin list persistence (ClientACL::save): admins / non-guest roles only,
+//    in the last 1 KB page of the upper half (kept out of the image by specter_xl.ld)
+#ifndef ACL_ADDR
+#define ACL_ADDR 0x0801FC00UL
+#endif
+#define ACL_MAGIC 0x324C4341UL    // "ACL2"
+#define ACL_REC_WORDS 18          // pub 32 + secret 32 + last_ts 4 + perms 4
+static uint32_t xl_acl_dirty_at = 0;
+static uint32_t xl_disc_ts = 0;   // discovery "modified" time (region save), kept in the same page
+
+static uint32_t fnv_step(uint32_t h, uint32_t w) { h ^= w; return h * 16777619UL; }
+static void xl_acl_save(void) {
+    uint32_t words[ACL_REC_WORDS];
+    uint32_t n = 0;
+    for (int i = 0; i < XL_MAX_CLIENTS; i++) if (xl_clients[i].perms != 0xFF && xl_clients[i].perms != PERM_ACL_GUEST) n++;
+    HAL_FLASH_Unlock();
+    flash_erase(ACL_ADDR);
+    uint32_t a = ACL_ADDR, h = 0x811C9DC5UL;
+    uint32_t hdr[3] = { ACL_MAGIC, xl_disc_ts, n };
+    for (int k = 0; k < 3; k++) { HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, a, hdr[k]); a += 4; h = fnv_step(h, hdr[k]); }
+    for (int i = 0; i < XL_MAX_CLIENTS; i++) {
+        const XlClient& c = xl_clients[i];
+        if (c.perms == 0xFF || c.perms == PERM_ACL_GUEST) continue;
+        memcpy(words, c.pub, 32); memcpy(words + 8, c.secret, 32);
+        words[16] = c.last_ts; words[17] = c.perms;
+        for (int k = 0; k < ACL_REC_WORDS; k++) { HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, a, words[k]); a += 4; h = fnv_step(h, words[k]); }
+    }
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, a, h);
+    HAL_FLASH_Lock();
+    xl_acl_dirty_at = 0;
+}
+static void xl_acl_dirty(void) { xl_acl_dirty_at = (millis() + 5000) | 1; }   // LAZY_CONTACTS_WRITE_DELAY
+static void xl_acl_touch_regions(void) { xl_disc_ts = clock_now(); xl_acl_save(); }
+static uint32_t xl_disc_mod(void) { return xl_disc_ts; }
 
 static uint8_t  xl_reply[180];
 static uint32_t xl_last_unique = 0;
@@ -52,6 +88,22 @@ static uint32_t stat_logins = 0;
 
 static void xl_init(void) {
     for (int i = 0; i < XL_MAX_CLIENTS; i++) xl_clients[i].perms = 0xFF;
+    const volatile uint32_t* w = (const volatile uint32_t*)ACL_ADDR;
+    uint32_t n = w[2];
+    if (w[0] != ACL_MAGIC || n > XL_MAX_CLIENTS) return;
+    uint32_t h = 0x811C9DC5UL;
+    for (uint32_t k = 0; k < 3 + n * ACL_REC_WORDS; k++) h = fnv_step(h, w[k]);
+    if (h != w[3 + n * ACL_REC_WORDS]) return;
+    xl_disc_ts = w[1];
+    for (uint32_t i = 0; i < n; i++) {
+        const volatile uint32_t* r = w + 3 + i * ACL_REC_WORDS;
+        XlClient& c = xl_clients[i];
+        memset(&c, 0, sizeof(c));
+        for (int k = 0; k < 8; k++) { uint32_t v = r[k]; memcpy(c.pub + 4 * k, &v, 4); v = r[8 + k]; memcpy(c.secret + 4 * k, &v, 4); }
+        c.last_ts = r[16];
+        c.perms = (uint8_t)r[17];
+        c.out_len = OUT_PATH_UNKNOWN;
+    }
 }
 
 static uint32_t now_unique(void) {
@@ -215,12 +267,34 @@ static XlClient* xl_put(const uint8_t* pub) {
 static void xl_note_neighbour(const uint8_t* pub, int8_t snr4) {
     int s = 0;
     for (int i = 0; i < XL_MAX_NEIGHB; i++) {
-        if (!memcmp(xl_nb[i].pub, pub, 32)) { s = i; break; }
+        if (xl_nb[i].heard_up && !memcmp(xl_nb[i].pfx, pub, XL_NB_PFX)) { s = i; break; }
         if (xl_nb[i].heard_up < xl_nb[s].heard_up) s = i;
     }
-    memcpy(xl_nb[s].pub, pub, 32);
+    memcpy(xl_nb[s].pfx, pub, XL_NB_PFX);
     xl_nb[s].heard_up = uptime_s() | 1;
     xl_nb[s].snr4 = snr4;
+}
+
+
+// Indexes of known neighbours, sorted: order 0 newest, 1 oldest, 2 strongest, 3 weakest.
+static int xl_nb_sorted(uint8_t* idx, uint8_t order) {
+    int n = 0;
+    for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up) idx[n++] = i;
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0; j--) {
+            const XlNeighbour &a = xl_nb[idx[j-1]], &b = xl_nb[idx[j]];
+            bool swap = order == 1 ? a.heard_up > b.heard_up : order == 2 ? a.snr4 < b.snr4
+                      : order == 3 ? a.snr4 > b.snr4 : a.heard_up < b.heard_up;
+            if (!swap) break;
+            uint8_t t = idx[j]; idx[j] = idx[j-1]; idx[j-1] = t;
+        }
+    return n;
+}
+
+static void xl_remove_neighbour(const uint8_t* pfx, int len) {
+    if (len > XL_NB_PFX) len = XL_NB_PFX;
+    for (int i = 0; i < XL_MAX_NEIGHB; i++)
+        if (xl_nb[i].heard_up && !memcmp(xl_nb[i].pfx, pfx, len)) xl_nb[i].heard_up = 0;
 }
 
 // ── request handlers ────────────────────────────────────────────────────────
@@ -235,9 +309,11 @@ static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* se
         else { LOGLN("  login: bad password"); return 0; }
         c = xl_put(sender_pub);
         if (ts <= c->last_ts) { LOGLN("  login: replay"); return 0; }
+        bool changed = c->perms != perms;
         c->last_ts = ts;
         c->perms = perms;
         memcpy(c->secret, secret, 32);
+        if (changed && perms != PERM_ACL_GUEST) xl_acl_dirty();
     }
     c->last_active_up = uptime_s();
     if (flood) c->out_len = OUT_PATH_UNKNOWN;        // rediscover the route
@@ -293,21 +369,14 @@ static int xl_request(XlClient* c, uint32_t ts, const uint8_t* req, int len) {
             if (len < 7 || req[1] != 0) return 0;
             uint8_t count = req[2]; uint16_t offset; memcpy(&offset, req + 3, 2);
             uint8_t order = req[5], plen = req[6] > 32 ? 32 : req[6];
-            int idx[XL_MAX_NEIGHB], n = 0;
-            for (int i = 0; i < XL_MAX_NEIGHB; i++) if (xl_nb[i].heard_up) idx[n++] = i;
-            for (int i = 1; i < n; i++)                // order: 0 newest, 1 oldest, 2 strongest, 3 weakest
-                for (int j = i; j > 0; j--) {
-                    const XlNeighbour &a = xl_nb[idx[j-1]], &b = xl_nb[idx[j]];
-                    bool swap = order == 1 ? a.heard_up > b.heard_up : order == 2 ? a.snr4 < b.snr4
-                              : order == 3 ? a.snr4 > b.snr4 : a.heard_up < b.heard_up;
-                    if (!swap) break;
-                    int t = idx[j]; idx[j] = idx[j-1]; idx[j-1] = t;
-                }
+            uint8_t idx[XL_MAX_NEIGHB];
+            int n = xl_nb_sorted(idx, order);
             uint8_t* hdr = p; p += 4;
             int16_t total = n, results = 0;
             for (int k = 0; k < count && k + offset < n && (p - hdr) + plen + 5 <= 4 + 130; k++) {
                 const XlNeighbour& nb = xl_nb[idx[k + offset]];
-                memcpy(p, nb.pub, plen); p += plen;
+                memset(p, 0, plen);                    // we keep 8 bytes of each key
+                memcpy(p, nb.pfx, plen < XL_NB_PFX ? plen : XL_NB_PFX); p += plen;
                 put32(p, uptime_s() - nb.heard_up); *p++ = (uint8_t)nb.snr4;
                 results++;
             }

@@ -53,6 +53,9 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | Command line: every USB command, plus `clock sync` (sets time from the phone) | ✓ (admin only) |
 | Repeater settings screen (name, radio, power, location, adverts, flood max, delays, duty cycle, owner info, RX gain, interference threshold, AGC reset, …) | ✓ (v2.4.1) |
 | Access list, owner info, anonymous clock/owner/regions queries | ✓ |
+| Neighbours: 128 kept (upstream 50), `discover.neighbors`, `neighbor.remove` | ✓ (v2.5) |
+| Admins stay logged in across reboots; `setperm`, `get acl` (USB) | ✓ (v2.5) |
+| `region def`, `region load` (indented import) | ✓ (v2.5) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**
@@ -77,9 +80,9 @@ With STM32CubeProgrammer, open the `.hex` and click Download. Don't use Full chi
 If the programmer refuses addresses above 0x08010000 (it believes the 64 KB size register),
 use `pio run -e specter_xl -t upload`, which runs OpenOCD with the flash size forced to 128 KB.
 
-Layout (`specter_xl.ld`): 0x08000000 core (≈45 KB of 62 KB used) · 0x0800F800 settings ·
-0x0800FC00 clock journal · 0x08010000 RadioLib + Crypto (≈26 KB of 64 KB), with a marker
-word at the end. `tools/xl_hex.py` writes the `.hex` and fails the build if any global
+Layout (`specter_xl.ld`): 0x08000000 core (≈44 KB of 62 KB used) · 0x0800F800 settings ·
+0x0800FC00 clock journal · 0x08010000 RadioLib + Crypto (≈26 KB of 63 KB), with a marker
+word at the end · 0x0801FC00 saved admin list (not in the image). `tools/xl_hex.py` writes the `.hex` and fails the build if any global
 constructor ends up in the upper half, because constructors run before the check.
 Host tests (`test/host/test_xl.cpp`) check the key exchange against upstream
 MeshCore's own ed25519 code. They also run login, PATH learning, status, telemetry,

@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.4.2
+ * Version: 2.5.0
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -39,7 +39,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v2.4.2"
+#define FW_VERSION "v2.5.0"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -337,6 +337,14 @@ static int fmtx(char* out, const char* f, ...) {
 }
 #define sprintf fmtx
 
+#if defined(ARDUINO_ARCH_STM32)
+// newlib's word-at-a-time strcmp is 442 bytes; this one is ~20 and plenty fast here.
+extern "C" int strcmp(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+#endif
+
 // Parse "[-]123.456" into an integer scaled by 10^dec. Returns false on junk.
 static bool parse_fixed(const char* s, int dec, int32_t* out) {
     s = skip_ws(s);
@@ -467,7 +475,7 @@ static uint16_t transport_code(const uint8_t key[16], uint8_t ptype, const uint8
 // Index of the flood-allowed region this scoped packet belongs to, or -1.
 static int region_match(uint16_t code0, uint8_t ptype, const uint8_t* payload, int plen) {
     for (int i = 0; i < cfg.num_regions; i++) {
-        if (cfg.region_flags[i] & REGION_DENY_FLOOD) continue;
+        if ((cfg.region_flags[i] & REGION_DENY_FLOOD) || cfg.regions[i][0] == '$') continue;   // '$' private: no key (as upstream)
         if (transport_code(region_keys[i], ptype, payload, plen) == code0) return i;
     }
     return -1;
@@ -1145,6 +1153,54 @@ static uint32_t stat_for_us = 0;
 static bool xl_type(uint8_t t) { return t == PT_REQ || t == PT_TXT_MSG || t == PT_ANON_REQ || t == PT_PATH; }
 #endif
 
+// Node discovery (simple_repeater onControlDataRecv / sendNodeDiscoverReq), zero-hop CONTROL
+#define CTL_DISCOVER_REQ  0x80
+#define CTL_DISCOVER_RESP 0x90
+static uint32_t disc_tag = 0, disc_until = 0, disc_win = 0;
+static uint8_t  disc_count = 0;
+#ifdef SPECTER_XL
+static uint32_t xl_disc_mod(void);
+static void xl_acl_touch_regions(void);
+#endif
+
+static const char* handle_control(const Pkt& p, int8_t snr4) {
+    uint8_t type = p.payload[0] & 0xF0;
+    if (type == CTL_DISCOVER_REQ && p.payload_len >= 6 && cfg.repeat) {
+        uint32_t now = millis();
+        if (now - disc_win > 120000UL) { disc_win = now; disc_count = 0; }    // max 4 per 2 minutes
+        if (disc_count >= 4) return "discover limit";
+        uint32_t since = 0;
+        if (p.payload_len >= 10) memcpy(&since, p.payload + 6, 4);
+#ifdef SPECTER_XL
+        uint32_t mod = xl_disc_mod();
+#else
+        uint32_t mod = 0;
+#endif
+        if (!(p.payload[1] & (1 << ADV_TYPE_REPEATER)) || mod < since) return "discover filtered";
+        disc_count++;
+        uint8_t d[6 + 32];
+        d[0] = CTL_DISCOVER_RESP | ADV_TYPE_REPEATER;
+        d[1] = (uint8_t)snr4;                            // inbound SNR ×4
+        memcpy(d + 2, p.payload + 2, 4);                 // tag
+        memcpy(d + 6, own_pubkey, 32);
+        int len = (p.payload[0] & 1) ? 6 + 8 : 6 + 32;   // prefix_only
+        int n = build(out_buf, (PT_CONTROL << 2) | ROUTE_DIRECT, NULL, 0, NULL, 0, d, len);
+        uint32_t t = airtime_ms(n) * cfg.txdelay_x100 / 100;
+        if (n > 0) txq_push(out_buf, n, 0, rnd_range(0, 5 * t + 2) * 4);   // widened ×4: many may answer
+        return "discover answered";
+    }
+#ifdef SPECTER_XL
+    if (type == CTL_DISCOVER_RESP && p.payload_len >= 6 + 32 && (p.payload[0] & 0x0F) == ADV_TYPE_REPEATER) {
+        uint32_t tag; memcpy(&tag, p.payload + 2, 4);
+        if (!disc_tag || (int32_t)(millis() - disc_until) > 0 || tag != disc_tag) return "discover stale";
+        if (!memcmp(p.payload + 6, own_pubkey, 32)) return "discover self";
+        xl_note_neighbour(p.payload + 6, snr4);
+        return "discover reply";
+    }
+#endif
+    return "control";
+}
+
 static const char* handle_direct(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
 
@@ -1169,7 +1225,7 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         return NULL;
     }
 
-    if (p.ptype == PT_CONTROL && (p.payload[0] & 0x80)) return "zero-hop control";
+    if (p.ptype == PT_CONTROL && (p.payload[0] & 0x80)) return p.hash_count == 0 ? handle_control(p, snr4) : "zero-hop control";
     if (p.hash_count == 0) {
         if (p.ptype == PT_ADVERT) {                    // neighbour advert: verify, learn time
             packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
@@ -1429,6 +1485,9 @@ static void bkp_enable(void) {
 }
 static uint16_t bkp_read(void)        { bkp_enable(); return BKP->DR1; }
 static void     bkp_write(uint16_t v) { bkp_enable(); BKP->DR1 = v; }
+static uint16_t bkp_get(int n)        { bkp_enable(); return (&BKP->DR1)[n - 1]; }     // DR2, DR3 …
+static void     bkp_set(int n, uint16_t v) { bkp_enable(); (&BKP->DR1)[n - 1] = v; }
+static uint32_t reset_csr(void) { uint32_t c = RCC->CSR; RCC->CSR |= RCC_CSR_RMVF; return c; }
 static void enter_standby(void) {                 // woken only by the watchdog reset (~26 s)
     IWatchdog.set(26000000);
     IWatchdog.reload();
@@ -1442,8 +1501,33 @@ static void enter_standby(void) {                 // woken only by the watchdog 
 uint16_t adc_read(uint8_t ch);                    // host tests provide these
 uint16_t bkp_read(void);
 void     bkp_write(uint16_t v);
+uint16_t bkp_get(int n);
+void     bkp_set(int n, uint16_t v);
+uint32_t reset_csr(void);
 void     enter_standby(void);
 #endif
+
+// Why did we (re)start? RCC->CSR flags plus two backup registers: DR2 marks a
+// reboot we asked for, DR3 counts watchdog resets since power-on.
+#define BKP_REBOOT_MARK 0xB007
+static const char* reset_why = "?";
+static uint16_t    wdt_resets = 0;
+static void reset_reason_capture(bool cutoff_wake) {
+    uint32_t c = reset_csr();
+    uint16_t mark = bkp_get(2);
+    bkp_set(2, 0);
+    wdt_resets = bkp_get(3);
+    if (c & (1UL << 27)) wdt_resets = 0;           // PORRSTF: backup domain may hold junk
+    if (cutoff_wake)                reset_why = "low-battery standby";
+    else if (c & (1UL << 27))       reset_why = "power-on / brownout";
+    else if (c & (1UL << 29))       { reset_why = "watchdog"; wdt_resets++; }
+    else if (c & (1UL << 31))       reset_why = "low-power";
+    else if (mark == BKP_REBOOT_MARK) reset_why = "reboot command";
+    else if (c & (1UL << 28))       reset_why = "software";
+    else if (c & (1UL << 26))       reset_why = "reset pin";
+    bkp_set(3, wdt_resets);
+}
+static void reboot_now(void) { bkp_set(2, BKP_REBOOT_MARK); NVIC_SystemReset(); }
 
 // Put the SX1262 in cold sleep with raw SPI (works before/without radio.begin()).
 static void radio_cold_sleep(void) {
@@ -1623,64 +1707,210 @@ static const char* next_token(const char* s, char* out, int max) {
     return s;
 }
 
+// Region list for "region list allowed|denied" and the anonymous regions query
+// (RegionMap::exportNamesTo: the wildcard first, comma separated).
 static void region_list(char* reply, int mask_deny, bool want_deny) {
     char* p = reply;
+    if (!mask_deny || (bool)(cfg.wildcard_flags & REGION_DENY_FLOOD) == want_deny) { *p++ = '*'; *p++ = ','; }
     for (int i = 0; i < cfg.num_regions; i++) {
         bool deny = cfg.region_flags[i] & REGION_DENY_FLOOD;
         if (mask_deny && deny != want_deny) continue;
         if (p - reply > 120) break;
-        if (p != reply) *p++ = ',';
-        p += sprintf(p, "%s", cfg.regions[i]);
+        p += sprintf(p, "%s,", cfg.regions[i]);
     }
+    if (p > reply) p--;
+    *p = 0;
     if (p == reply) strcpy(reply, "-none-");
 }
 
-static void handle_region(const char* args, char* reply) {
-    char a1[16], a2[REGION_NAME + 2];
-    args = next_token(args, a1, sizeof(a1));
-    next_token(args, a2, sizeof(a2));
-    const char* nm = a2[0] == '#' ? a2 + 1 : a2;
-    int idx = region_find(nm);
+// Hierarchy (RegionMap parent ids): the upper 4 bits of region_flags hold the
+// parent's index + 1 (0 = the wildcard). ext.pad holds the home region + 1.
+#define RF_PARENT(i)  ((int)(cfg.region_flags[i] >> 4) - 1)
+static bool region_name_ok(const char* n) {        // RegionMap::is_name_char
+    if (!*n) return false;
+    for (; *n; n++) { uint8_t c = *n; if (!(c == '-' || c == '$' || c == '#' || (c >= '0' && c <= '9') || c >= 'A')) return false; }
+    return true;
+}
+// findByNamePrefix: exact match preferred, else the last partial match. -2 = "*".
+static int region_find_prefix(const char* nm) {
+    if (!strcmp(nm, "*")) return -2;
+    if (*nm == '#') nm++;
+    int partial = -1, len = strlen(nm);
+    for (int i = 0; i < cfg.num_regions; i++) {
+        if (!strcmp(cfg.regions[i], nm)) return i;
+        if (!strncmp(cfg.regions[i], nm, len)) partial = i;
+    }
+    return partial;
+}
+// putRegion: add under parent (-1 = wildcard), or re-parent an existing one. Returns index or -1.
+static int region_put(const char* nm, int parent) {
+    if (*nm == '#') nm++;
+    if (!region_name_ok(nm) || strlen(nm) >= REGION_NAME) return -1;
+    int i = region_find(nm);
+    if (i >= 0) {
+        if (i == parent) return -1;
+    } else {
+        if (cfg.num_regions >= MAX_REGIONS) return -1;
+        i = cfg.num_regions++;
+        strcpy(cfg.regions[i], nm);
+        cfg.region_flags[i] = REGION_DENY_FLOOD;          // deny by default (putRegion)
+        region_key_for(nm, region_keys[i]);
+    }
+    cfg.region_flags[i] = (uint8_t)(((parent + 1) << 4) | (cfg.region_flags[i] & REGION_DENY_FLOOD));
+    return i;
+}
+static void region_tree(char*& p, int idx, int depth, const char* end) {   // printChildRegions
+    if (p + REGION_NAME + 12 > end) return;
+    for (int k = 0; k < depth; k++) *p++ = ' ';
+    uint8_t f = idx < 0 ? cfg.wildcard_flags : cfg.region_flags[idx];
+    p += sprintf(p, "%s%s%s\n", idx < 0 ? "*" : cfg.regions[idx], ext.pad == (uint8_t)(idx + 1) ? "^" : "",
+                 (f & REGION_DENY_FLOOD) ? "" : " F");
+    for (int i = 0; i < cfg.num_regions; i++) if (RF_PARENT(i) == idx) region_tree(p, i, depth + 1, end);
+}
+static void region_export(char* reply) {
+    char* p = reply;
+    region_tree(p, -1, 0, reply + 160);
+    if (p > reply) p--;                               // drop the last newline
+    *p = 0;
+}
 
-    if (!a1[0]) {                                   // "region": list with flood flags
-        char* p = reply;
-        p += sprintf(p, "* %s", (cfg.wildcard_flags & REGION_DENY_FLOOD) ? "" : "F");
-        for (int i = 0; i < cfg.num_regions && p - reply < 130; i++)
-            p += sprintf(p, "\n %s %s%s", cfg.regions[i], (cfg.region_flags[i] & REGION_DENY_FLOOD) ? "" : "F",
-                         i == cfg.default_region ? " (default)" : "");
+static bool    rl_active = false;
+#ifdef SPECTER_XL
+// "region load": indented lines replace the map, a blank line ends (MyMesh::handleCommand)
+static uint8_t rl_n, rl_flags[MAX_REGIONS];
+static char    rl_names[MAX_REGIONS][REGION_NAME];
+static int8_t  rl_stack[8];                          // index per indent level; -1 wildcard, -2 unset
+static bool region_load_line(const char* line, char* reply) {
+    reply[0] = 0;
+    const char* np = line;
+    while (*np == ' ') np++;
+    if (!*np) {                                       // finish: swap the new map in
+        char def[REGION_NAME], home[REGION_NAME];
+        strcpy(def, cfg.default_region < cfg.num_regions ? cfg.regions[cfg.default_region] : "");
+        strcpy(home, ext.pad && ext.pad <= cfg.num_regions ? cfg.regions[ext.pad - 1] : "");
+        cfg.num_regions = rl_n;
+        memcpy(cfg.regions, rl_names, sizeof(rl_names));
+        memcpy(cfg.region_flags, rl_flags, sizeof(rl_flags));
+        regions_rekey();
+        int d = def[0] ? region_find(def) : -1, h = home[0] ? region_find(home) : -1;
+        cfg.default_region = d >= 0 ? d : 0xFF;
+        ext.pad = h >= 0 ? h + 1 : 0;
+        rl_active = false;
+        sprintf(reply, "OK - loaded %d regions", rl_n);
+        return true;
+    }
+    int indent = np - line;
+    char nm[REGION_NAME + 2]; int n = 0;
+    const char* ep = np;
+    while (*ep && *ep != ' ' && n < REGION_NAME + 1) nm[n++] = *ep++;
+    nm[n] = 0;
+    while (*ep && *ep != 'F') ep++;
+    const char* name = nm[0] == '#' ? nm + 1 : nm;
+    if (indent > 0 && indent < 8 && rl_stack[indent - 1] != -2 && region_name_ok(name) && strlen(name) < REGION_NAME) {
+        int i = 0;
+        while (i < rl_n && strcmp(rl_names[i], name)) i++;
+        if (i == rl_n && rl_n < MAX_REGIONS) {
+            int old = region_find(name);
+            strcpy(rl_names[i], name);
+            rl_flags[i] = old >= 0 ? (cfg.region_flags[old] & REGION_DENY_FLOOD) : (*ep == 'F' ? 0 : REGION_DENY_FLOOD);
+            rl_n++;
+        }
+        if (i < rl_n) {
+            rl_flags[i] = (uint8_t)(((rl_stack[indent - 1] + 1) << 4) | (rl_flags[i] & REGION_DENY_FLOOD));
+            rl_stack[indent] = i;
+            for (int k = indent + 1; k < 8; k++) rl_stack[k] = -2;
+        }
+    }
+    return true;
+}
+#endif
+
+static void handle_region(const char* args, char* reply) {
+    char a1[16], a2[REGION_NAME + 2], a3[REGION_NAME + 2];
+    const char* rest = next_token(args, a1, sizeof(a1));
+#ifdef SPECTER_XL
+    if (!strcmp(a1, "def")) {                        // region def a b|jump c,jump …
+        const char* q = skip_ws(rest);
+        if (!*q) { strcpy(reply, "Err - empty def"); return; }
+        int cur = -1;
+        while (*(q = skip_ws(q))) {
+            char tok[2 * REGION_NAME + 4]; int n = 0;
+            while (*q && *q != ' ') { if (n < (int)sizeof(tok) - 1) tok[n++] = *q; q++; }
+            tok[n] = 0;
+            char* jump = NULL;
+            for (char* c = tok; *c; c++) if (*c == '|' || *c == ',') { *c = 0; jump = c + 1; break; }
+            if (!tok[0]) { strcpy(reply, "Err - empty name"); return; }
+            if (jump && !*jump) { strcpy(reply, "Err - empty jump"); return; }
+            int r = region_put(tok, cur);
+            if (r < 0) { sprintf(reply, "Err - put failed: %s", tok); return; }
+            cfg.region_flags[r] &= ~REGION_DENY_FLOOD;
+            if (jump) {
+                int j = region_find_prefix(jump);
+                if (j == -1) { sprintf(reply, "Err - unknown jump: %s", jump); return; }
+                cur = j == -2 ? -1 : j;
+            } else cur = r;
+        }
+        region_export(reply);
+        return;
+    }
+#endif
+    rest = next_token(rest, a2, sizeof(a2));
+    next_token(rest, a3, sizeof(a3));
+    int idx = region_find_prefix(a2);
+
+    if (!a1[0]) {
+        region_export(reply);
+#ifdef SPECTER_XL
+    } else if (!strcmp(a1, "load")) {
+        rl_active = true; rl_n = 0;
+        memset(rl_names, 0, sizeof(rl_names)); memset(rl_flags, 0, sizeof(rl_flags));
+        memset(rl_stack, -2, sizeof(rl_stack)); rl_stack[0] = -1;
+        reply[0] = 0;
+#endif
     } else if (!strcmp(a1, "save")) {
         cfg_save();
+#ifdef SPECTER_XL
+        xl_acl_touch_regions();                     // discovery "modified since" time
+#endif
         strcpy(reply, "OK");
     } else if (!strcmp(a1, "put") && a2[0]) {
-        if (idx < 0) {
-            if (cfg.num_regions >= MAX_REGIONS) { strcpy(reply, "Err - unable to put"); return; }
-            if (strlen(nm) >= REGION_NAME) { strcpy(reply, "Err - name too long"); return; }
-            idx = cfg.num_regions++;
-            strcpy(cfg.regions[idx], nm);
-            region_key_for(nm, region_keys[idx]);
-        }
-        cfg.region_flags[idx] = 0;
+        int parent = -1;
+        if (a3[0]) { parent = region_find_prefix(a3); if (parent == -1) { strcpy(reply, "Err - unknown parent"); return; } if (parent == -2) parent = -1; }
+        int r = region_put(a2, parent);
+        if (r < 0) { strcpy(reply, "Err - unable to put"); return; }
+        cfg.region_flags[r] &= ~REGION_DENY_FLOOD;
         strcpy(reply, "OK - (flood allowed)");
     } else if (!strcmp(a1, "remove") && a2[0]) {
+        idx = region_find(a2);
         if (idx < 0) { strcpy(reply, "Err - not found"); return; }
+        for (int i = 0; i < cfg.num_regions; i++) if (RF_PARENT(i) == idx) { strcpy(reply, "Err - not empty"); return; }
         for (int i = idx; i + 1 < cfg.num_regions; i++) {
             strcpy(cfg.regions[i], cfg.regions[i + 1]);
             cfg.region_flags[i] = cfg.region_flags[i + 1];
             memcpy(region_keys[i], region_keys[i + 1], 16);
         }
         cfg.num_regions--;
+        for (int i = 0; i < cfg.num_regions; i++)
+            if (RF_PARENT(i) > idx) cfg.region_flags[i] -= 0x10;
         if (cfg.default_region == idx) cfg.default_region = 0xFF;
         else if (cfg.default_region != 0xFF && cfg.default_region > idx) cfg.default_region--;
+        if (ext.pad == idx + 1) ext.pad = 0; else if (ext.pad > idx + 1) ext.pad--;
         strcpy(reply, "OK");
     } else if ((!strcmp(a1, "allowf") || !strcmp(a1, "denyf")) && a2[0]) {
-        uint8_t* f = !strcmp(a2, "*") ? &cfg.wildcard_flags : (idx >= 0 ? &cfg.region_flags[idx] : NULL);
+        uint8_t* f = idx == -2 ? &cfg.wildcard_flags : (idx >= 0 ? &cfg.region_flags[idx] : NULL);
         if (!f) { strcpy(reply, "Err - unknown region"); return; }
         if (a1[0] == 'a') *f &= ~REGION_DENY_FLOOD; else *f |= REGION_DENY_FLOOD;
         strcpy(reply, "OK");
     } else if (!strcmp(a1, "get") && a2[0]) {
-        if (!strcmp(a2, "*")) sprintf(reply, " * %s", (cfg.wildcard_flags & REGION_DENY_FLOOD) ? "" : "F");
+        if (idx == -2) sprintf(reply, " * %s", (cfg.wildcard_flags & REGION_DENY_FLOOD) ? "" : "F");
         else if (idx < 0) strcpy(reply, "Err - unknown region");
+        else if (RF_PARENT(idx) >= 0) sprintf(reply, " %s (%s) %s", cfg.regions[idx], cfg.regions[RF_PARENT(idx)], (cfg.region_flags[idx] & REGION_DENY_FLOOD) ? "" : "F");
         else sprintf(reply, " %s %s", cfg.regions[idx], (cfg.region_flags[idx] & REGION_DENY_FLOOD) ? "" : "F");
+    } else if (!strcmp(a1, "home")) {
+        if (!a2[0]) { sprintf(reply, " home is %s", ext.pad && ext.pad <= cfg.num_regions ? cfg.regions[ext.pad - 1] : "*"); return; }
+        if (idx == -1) { strcpy(reply, "Err - unknown region"); return; }
+        ext.pad = idx == -2 ? 0 : idx + 1;
+        sprintf(reply, " home is now %s", idx == -2 ? "*" : cfg.regions[idx]);
     } else if (!strcmp(a1, "default")) {
         if (!a2[0]) {
             sprintf(reply, " default scope is %s", cfg.default_region < cfg.num_regions ? cfg.regions[cfg.default_region] : "<null>");
@@ -1689,13 +1919,10 @@ static void handle_region(const char* args, char* reply) {
         if (!strcmp(a2, "<null>")) {
             cfg.default_region = 0xFF;
         } else {
-            if (idx < 0) {                                // auto-create, as upstream
-                if (cfg.num_regions >= MAX_REGIONS || strlen(nm) >= REGION_NAME) { strcpy(reply, "Err - region table full"); return; }
-                idx = cfg.num_regions++;
-                strcpy(cfg.regions[idx], nm);
-                region_key_for(nm, region_keys[idx]);
-            }
-            cfg.region_flags[idx] = 0;
+            if (idx < 0) idx = region_put(a2, -1);            // auto-create, as upstream
+            if (idx < 0) { strcpy(reply, "Err - region table full"); return; }
+            if (cfg.regions[idx][0] == '$') { strcpy(reply, "Err - private region has no key"); return; }
+            cfg.region_flags[idx] &= ~REGION_DENY_FLOOD;
             cfg.default_region = idx;
         }
         cfg_save();
@@ -1856,6 +2083,7 @@ static void handle_get(const char* k, char* reply) {
         *p = 0;
     }
 #endif
+    else if (!strcmp(k, "reset.reason")) sprintf(reply, "> %s (watchdog resets since power-on: %u)", reset_why, wdt_resets);
     else if (!strcmp(k, "public.key")) { strcpy(reply, "> "); to_hex(reply + 2, own_pubkey, 32); }
     else if (!strcmp(k, "prv.key"))    { strcpy(reply, "> "); to_hex(reply + 2, cfg.privkey, 32); }
     else if (!strcmp(k, "role"))       strcpy(reply, "> repeater");
@@ -2007,6 +2235,9 @@ static void handle_set(const char* cmd, char* reply) {
 }
 
 static void handle_command(char* cmd, char* reply) {
+#ifdef SPECTER_XL
+    if (rl_active) { region_load_line(cmd, reply); return; }
+#endif
     while (*cmd == ' ') cmd++;
     reply[0] = 0;
     if (!strcmp(cmd, "reboot")) {
@@ -2052,18 +2283,61 @@ static void handle_command(char* cmd, char* reply) {
         if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
         else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
 #ifdef SPECTER_XL
+    } else if (!strncmp(cmd, "discover.neighbors", 18)) {
+        if (*skip_ws(cmd + 18)) { strcpy(reply, "Err - discover.neighbors has no options"); return; }
+        uint8_t d[10];
+        d[0] = CTL_DISCOVER_REQ;
+        d[1] = 1 << ADV_TYPE_REPEATER;
+        disc_tag = rnd() | 1; memcpy(d + 2, &disc_tag, 4);
+        memset(d + 6, 0, 4);                              // since = 0
+        disc_until = millis() + 60000;
+        int n = build(out_buf, (PT_CONTROL << 2) | ROUTE_DIRECT, NULL, 0, NULL, 0, d, 10);
+        if (n > 0) txq_push(out_buf, n, 0, 0);
+        strcpy(reply, "OK - Discover sent");
+    } else if (!strncmp(cmd, "neighbor.remove ", 16)) {
+        uint8_t k[XL_NB_PFX]; int n = 0;
+        const char* h = skip_ws(cmd + 16);
+        while (n < XL_NB_PFX && hexval(h[0]) >= 0 && hexval(h[1]) >= 0) { k[n++] = hexval(h[0]) << 4 | hexval(h[1]); h += 2; }
+        if (!n) { strcpy(reply, "ERR: bad pubkey"); return; }
+        xl_remove_neighbour(k, n);
+        strcpy(reply, "OK");
+    } else if (!strncmp(cmd, "setperm ", 8)) {          // setperm <pubkey hex> <perms>
+        uint8_t k[32]; int n = 0;
+        const char* h = skip_ws(cmd + 8);
+        while (n < 32 && hexval(h[0]) >= 0 && hexval(h[1]) >= 0) { k[n++] = hexval(h[0]) << 4 | hexval(h[1]); h += 2; }
+        if (*h != ' ') { strcpy(reply, n ? "Err - bad params" : "Err - bad pubkey"); return; }
+        if (!n) { strcpy(reply, "Err - bad pubkey"); return; }
+        uint8_t role = atoi_s(h) & 3;
+        XlClient* c = NULL;
+        for (int i = 0; i < XL_MAX_CLIENTS && !c; i++)
+            if (xl_clients[i].perms != 0xFF && !memcmp(xl_clients[i].pub, k, n)) c = &xl_clients[i];
+        if (role == PERM_ACL_GUEST) {                    // guest = remove from the list
+            if (!c) { strcpy(reply, "Err - invalid params"); return; }
+            c->perms = 0xFF;
+        } else {
+            if (n < 32) { strcpy(reply, "Err - invalid params"); return; }
+            c = xl_put(k);
+            c->perms = role;
+            ecdh(c->secret, k);
+        }
+        xl_acl_save();
+        strcpy(reply, "OK");
+    } else if (!strcmp(cmd, "get acl")) {                // USB only
+        Serial1.println("ACL:");
+        for (int i = 0; i < XL_MAX_CLIENTS; i++) {
+            if (xl_clients[i].perms == 0xFF || xl_clients[i].perms == PERM_ACL_GUEST) continue;
+            char hx[65]; to_hex(hx, xl_clients[i].pub, 32);
+            Serial1.print("0"); Serial1.print(xl_clients[i].perms); Serial1.print(" "); Serial1.println(hx);
+        }
     } else if (!strcmp(cmd, "neighbors")) {          // upstream format: key4hex:secs_ago:snr×4, newest first
+        uint8_t idx[XL_MAX_NEIGHB];
+        int n = xl_nb_sorted(idx, 0);
         char* p = reply;
-        uint32_t shown = 0, up = uptime_s();
-        while (p - reply < 134) {
-            int best = -1;
-            for (int i = 0; i < XL_MAX_NEIGHB; i++)
-                if (xl_nb[i].heard_up && !(shown & (1u << i)) && (best < 0 || xl_nb[i].heard_up > xl_nb[best].heard_up)) best = i;
-            if (best < 0) break;
-            shown |= 1u << best;
+        uint32_t up = uptime_s();
+        for (int k = 0; k < n && p - reply < 134; k++) {
             if (p != reply) *p++ = '\n';
-            to_hex(p, xl_nb[best].pub, 4); p += 8;
-            p += sprintf(p, ":%lu:%d", (unsigned long)(up - xl_nb[best].heard_up), xl_nb[best].snr4);
+            to_hex(p, xl_nb[idx[k]].pfx, 4); p += 8;
+            p += sprintf(p, ":%lu:%d", (unsigned long)(up - xl_nb[idx[k]].heard_up), xl_nb[idx[k]].snr4);
         }
         if (p == reply) strcpy(reply, "-none-");
 #endif
@@ -2111,6 +2385,7 @@ static void handle_command(char* cmd, char* reply) {
 // Over-the-air CLI (admin login): everything the USB console offers except the
 // identity/erase commands, plus upstream's "clock sync" (sets time from the app).
 static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
+    if (rl_active) { region_load_line(cmd, reply); return; }   // lines are consumed before tag stripping (upstream)
     while (*cmd == ' ') cmd++;
     reply[0] = 0;
     if (strlen(cmd) > 4 && cmd[2] == '|') {     // app's "XX|" tag: reflect it on the reply (as upstream)
@@ -2118,7 +2393,7 @@ static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
         reply += 3; cmd += 3;
         reply[0] = 0;
     }
-    if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4)) {
+    if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4) || !strcmp(cmd, "get acl")) {
         strcpy(reply, "Error: USB console only"); return;
     }
     if (!strcmp(cmd, "clock sync")) {
@@ -2155,7 +2430,7 @@ static void cli_poll(void) {
             handle_command(cli_buf, reply);
             if (reply[0]) { Serial1.print("  -> "); Serial1.println(reply); }
             cli_len = 0;
-            if (reboot_pending) { Serial1.flush(); delay(50); NVIC_SystemReset(); }
+            if (reboot_pending) { Serial1.flush(); delay(50); reboot_now(); }
             continue;
         }
         if (c == 8 || c == 127) { if (cli_len) { cli_len--; Serial1.print("\b \b"); } continue; }
@@ -2218,6 +2493,7 @@ void setup(void) {
     if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
 
     bool woke = bkp_read() == CUTOFF_FLAG;          // woke from low-battery standby?
+    reset_reason_capture(woke);
     if (woke) {
         uint32_t mv = battery_mv();
         if (ext.cut_mv && mv < resume_mv()) {        // keep this path short: it runs every ~26 s
@@ -2230,6 +2506,7 @@ void setup(void) {
     delay(200);
     Serial1.println();
     Serial1.println(FW_NAME " MeshCore Repeater " FW_VERSION);
+    Serial1.print("Last reset: "); Serial1.println(reset_why);
     if (woke) Serial1.println("Battery recovered: resuming");
     if (!radio_init()) {
         while (true) { led(true); delay(100); led(false); delay(100); }   // IWDG resets & retries
@@ -2347,11 +2624,12 @@ void loop(void) {
         Serial1.println(r);
     }
 #ifdef SPECTER_XL
+    if (xl_acl_dirty_at && (int32_t)(millis() - xl_acl_dirty_at) >= 0) xl_acl_save();
     if (xl_reboot_at && (int32_t)(millis() - xl_reboot_at) >= 0) {
         int q = 0; for (int i = 0; i < TXQ_SIZE; i++) q += txq[i].used;
         if (!q || (int32_t)(millis() - xl_reboot_at) > 15000) {
             journal_write(clock_now(), j_last_flood_ts);
-            NVIC_SystemReset();
+            reboot_now();
         }
     }
 #endif

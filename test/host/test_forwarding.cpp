@@ -46,6 +46,11 @@ uint16_t adc_read(uint8_t ch) { return fake_adc[ch]; }
 uint16_t bkp_read(void) { return fake_bkp; }
 void bkp_write(uint16_t v) { fake_bkp = v; }
 void enter_standby(void) { throw StandbyEntered(); }
+static uint16_t fake_bkp_dr[8];
+static uint32_t fake_csr = (1UL << 27) | (1UL << 26);     // power-on
+uint16_t bkp_get(int n) { return fake_bkp_dr[n]; }
+void bkp_set(int n, uint16_t v) { fake_bkp_dr[n] = v; }
+uint32_t reset_csr(void) { uint32_t c = fake_csr; fake_csr = 0; return c; }
 static void set_vdd(uint32_t mv) { fake_adc[17] = (uint16_t)(1200UL * 4095UL / mv); }
 static void set_pin_mv(uint8_t ch, uint32_t pin_mv, uint32_t vdd) { fake_adc[ch] = (uint16_t)(pin_mv * 4095UL / vdd); }
 
@@ -392,7 +397,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("Spectra-Cascadia v2.4.2") == 0, "ver");
+    CHECK(cli("ver").find("Spectra-Cascadia v2.5.0") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc").find("XL") != std::string::npos, "password needs the XL build");
@@ -405,7 +410,7 @@ int main() {
 
     CHECK(cli("region put tacoma") == "OK - (flood allowed)", "region put");
     CHECK(cli("region denyf seattle") == "OK", "region denyf");
-    CHECK(cli("region list allowed") == "se-wa,tacoma", "region list allowed");
+    CHECK(cli("region list allowed") == "*,se-wa,tacoma", "region list allowed (wildcard first, as upstream)");
     CHECK(cli("region list denied") == "seattle", "region list denied");
     CHECK(cli("region default se-wa") == " default scope is now se-wa", "region default");
     CHECK(cli("region remove tacoma") == "OK", "region remove");
@@ -423,6 +428,7 @@ int main() {
     { uint8_t pk[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x00, 8,8,8,8,8,8 };
       on_receive(pk, sizeof(pk), 0); CHECK(queued() == 0, "wildcard denied: un-scoped flood dropped"); clearq(); }
     CHECK(cli("region allowf *") == "OK", "region allowf *");
+
     cli("region save");
 
     // ── persistence across reboot ─────────────────────────────────────────
@@ -452,6 +458,30 @@ int main() {
     { memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();
       CHECK(Serial1.out.find("First boot") != std::string::npos && !strncmp(cfg.name, "Spectra-", 8), "erase -> defaults on next boot"); }
 
+    // ── region hierarchy, home, def, load, private names (upstream RegionMap/CommonCLI)
+    { cli("region default <null>");
+      while (cfg.num_regions) { char b[40]; sprintf(b, "region remove %s", cfg.regions[cfg.num_regions - 1]); cli(b); }
+      CHECK(cli("region put wa") == "OK - (flood allowed)" && cli("region put se-wa wa") == "OK - (flood allowed)"
+            && cli("region put seattle se-wa") == "OK - (flood allowed)", "region put with parents");
+      CHECK(cli("region put $club") == "OK - (flood allowed)", "region put $private name accepted");
+      cli("region denyf seattle");
+      std::string t = cli("region");
+      CHECK(t == "*^ F\n wa F\n  se-wa F\n   seattle\n $club F", "region tree export (indent per level, ^ home, F allowed)");
+      CHECK(cli("region get seattle") == " seattle (se-wa) ", "region get shows parent");
+      CHECK(cli("region remove se-wa") == "Err - not empty", "can't remove a region with children");
+      CHECK(cli("region home sea") == " home is now seattle" && cli("region home") == " home is seattle", "region home (prefix match)");
+      CHECK(cli("region").find("seattle^") != std::string::npos, "home marked ^");
+      CHECK(cli("region default $club") == "Err - private region has no key", "private region can't be the default scope");
+      { uint8_t pl[] = { 0xAA,0xBB,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x09 };
+        uint8_t key[16]; region_key_for("$club", key);
+        uint16_t tc = transport_code(key, PT_TXT_MSG, pl, sizeof(pl));
+        CHECK(region_match(tc, PT_TXT_MSG, pl, sizeof(pl)) < 0, "private $ region never matches (no key, as upstream)"); }
+      CHECK(cli("region remove $club") == "OK" && cli("region remove seattle") == "OK" && cli("region home") == " home is *",
+            "removing the home region resets home to *");
+      CHECK(cli("region load") == "Err - ??" && cli("region def a b") == "Err - ??", "region load/def are XL-only");
+      cli("region put pnw"); cli("region put wa pnw"); cli("region save");
+      setup();
+      CHECK(cli("region get wa") == " wa (pnw) F", "hierarchy survives reboot"); }
     printf("\n%d failure(s)\n", fails);
     return fails != 0;
 }

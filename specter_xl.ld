@@ -5,7 +5,8 @@
  *   0x08000000  62 KB  vectors, firmware core, settings code
  *   0x0800F800   1 KB  settings page (name, identity, regions, passwords) — not in the image
  *   0x0800FC00   1 KB  clock journal                                     — not in the image
- *   0x08010000  64 KB  RadioLib + Crypto, then the XL marker word
+ *   0x08010000  63 KB  RadioLib + Crypto, then the XL marker word
+ *   0x0801FC00   1 KB  saved admin list + discovery time         — not in the image
  *
  * Ship the .hex (not .bin) so flashing never touches the two settings pages.
  */
@@ -24,7 +25,7 @@ MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = LD_MAX_DATA_SIZE
   FLASH    (rx)    : ORIGIN = 0x08000000, LENGTH = 0xF800   /* 62 KB, then settings + clock journal pages */
-  FLASH_HI (rx)    : ORIGIN = 0x08010000, LENGTH = 0x10000  /* the "hidden" upper 64 KB */
+  FLASH_HI (rx)    : ORIGIN = 0x08010000, LENGTH = 0xFC00   /* the "hidden" upper 64 KB, minus the admin-list page */
 }
 
 /* Sections */
