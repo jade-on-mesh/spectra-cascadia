@@ -40,6 +40,9 @@ SECTIONS
     /* RNG.cpp has a global constructor, which runs before setup() can check
        the upper half, so it stays low. (tools/xl_hex.py checks all of them.) */
     EXCLUDE_FILE(*libCrypto.a:RNG.cpp.o) *libCrypto.a:*(.text .text* .rodata .rodata*)
+    /* libm (powf for rxdelay) is only used after setup(); libgcc and libc stay
+       low because startup code needs them before the upper half is checked. */
+    *libm.a:*(.text .text* .rodata .rodata*)
     . = ALIGN(4);
     KEEP(*(.xl_magic))   /* last word: present only if the whole upper half was written */
     . = ALIGN(4);

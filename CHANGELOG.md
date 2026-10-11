@@ -7,6 +7,17 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.17.1.2] - 2026-10-11
+
+### Added (XL)
+- `tempradio <freq>,<bw>,<sf>,<cr>,<minutes>` (upstream): try radio settings for N minutes, then switch back by itself. They're applied 2 s after the reply goes out. Saves made meanwhile keep the real settings, `get radio` shows both, and `set radio` cancels it
+- `cad on|off` (upstream): before transmitting, ask the SX1262 whether a LoRa preamble is on the air (Channel Activity Detection) and hold back if so. `get cad` shows how often it found the channel busy
+- `rxdelay <0-20>` (upstream, default 0 = off): weaker copies of a flood wait longer, so when the same packet arrives over several paths the copy received best is forwarded with its own path (Dispatcher::calcRxDelay, packetScoreInt). Instead of an inbound queue, a better duplicate replaces the queued forward. `get rxdelay` counts replacements
+- `radio.watchdog <1-48 h|off>` (default 6 h): if nothing has been received for that long, re-initialise the radio and send an alert (when alerts are set up)
+- Login attempt limits: 5 per minute (each costs a key exchange). After 3 wrong passwords in a row, logins are locked out for 1 min, doubling each time up to 16 min; a successful login resets it. Admins already logged in, or saved across reboots, are unaffected
+- Neighbour RSSI and how many times each was heard: `neighbors.detail [page]` → `key:secs_ago:snr×4:rssi:times_heard`. `neighbors` keeps the upstream format
+- libm (powf) linked into the upper half
+
 ## [1.17.1.1] - 2026-10-11
 
 ### Changed

@@ -43,7 +43,7 @@ struct XlClient {
 };
 static XlClient xl_clients[XL_MAX_CLIENTS];
 
-struct XlNeighbour { uint8_t pfx[XL_NB_PFX]; uint32_t heard_up; int8_t snr4; };   // 16 bytes
+struct XlNeighbour { uint8_t pfx[XL_NB_PFX]; uint32_t heard_up; int8_t snr4, rssi; uint16_t count; };   // 16 bytes
 static XlNeighbour xl_nb[XL_MAX_NEIGHB];
 
 // ── admin list persistence (ClientACL::save): admins / non-guest roles only,
@@ -270,9 +270,12 @@ static void xl_note_neighbour(const uint8_t* pub, int8_t snr4) {
         if (xl_nb[i].heard_up && !memcmp(xl_nb[i].pfx, pub, XL_NB_PFX)) { s = i; break; }
         if (xl_nb[i].heard_up < xl_nb[s].heard_up) s = i;
     }
+    if (!xl_nb[s].heard_up || memcmp(xl_nb[s].pfx, pub, XL_NB_PFX)) xl_nb[s].count = 0;   // new entry
     memcpy(xl_nb[s].pfx, pub, XL_NB_PFX);
     xl_nb[s].heard_up = uptime_s() | 1;
     xl_nb[s].snr4 = snr4;
+    xl_nb[s].rssi = (int8_t)(last_rssi < -128 ? -128 : last_rssi);
+    if (xl_nb[s].count < 0xFFFF) xl_nb[s].count++;
 }
 
 
@@ -299,6 +302,29 @@ static void xl_remove_neighbour(const uint8_t* pfx, int len) {
 
 // ── request handlers ────────────────────────────────────────────────────────
 
+// Login attempt limit: 5 per minute (each costs a key exchange), and after 3 wrong
+// passwords in a row a lockout of 1 min that doubles each time, up to 16 min.
+static uint32_t xl_lg_win = 0, xl_lock_until = 0;
+static uint8_t  xl_lg_n = 0, xl_bad = 0, xl_lock_level = 0;
+static uint32_t stat_login_limited = 0;
+static bool xl_login_allowed(void) {
+    uint32_t now = millis();
+    if (xl_lock_until && (int32_t)(now - xl_lock_until) < 0) { stat_login_limited++; return false; }
+    if (now - xl_lg_win > 60000UL) { xl_lg_win = now; xl_lg_n = 0; }
+    if (xl_lg_n >= 5) { stat_login_limited++; return false; }
+    xl_lg_n++;
+    return true;
+}
+static void xl_login_result(bool ok) {
+    if (ok) { xl_bad = 0; xl_lock_level = 0; return; }
+    if (++xl_bad >= 3) {
+        xl_bad = 0;
+        xl_lock_until = (millis() + (60000UL << xl_lock_level)) | 1;
+        if (xl_lock_level < 4) xl_lock_level++;
+        LOGLN("  login: locked out");
+    }
+}
+
 static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* secret, uint32_t ts, const char* pw, bool flood) {
     XlClient* c = NULL;
     if (!pw[0]) c = xl_find(sender_pub);             // blank password: already known?
@@ -306,7 +332,7 @@ static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* se
         uint8_t perms;
         if (auth.admin_pw[0] && !strcmp(pw, auth.admin_pw)) perms = PERM_ACL_ADMIN;
         else if (auth.guest_pw[0] && !strcmp(pw, auth.guest_pw)) perms = PERM_ACL_GUEST;
-        else { LOGLN("  login: bad password"); return 0; }
+        else { LOGLN("  login: bad password"); xl_login_result(false); return 0; }
         c = xl_put(sender_pub);
         if (ts <= c->last_ts) { LOGLN("  login: replay"); return 0; }
         bool changed = c->perms != perms;
@@ -316,6 +342,7 @@ static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* se
         if (changed && perms != PERM_ACL_GUEST) xl_acl_dirty();
     }
     c->last_active_up = uptime_s();
+    xl_login_result(true);
     if (flood) c->out_len = OUT_PATH_UNKNOWN;        // rediscover the route
     *out = c;
     stat_logins++;
@@ -417,6 +444,7 @@ static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
 
     if (p.ptype == PT_ANON_REQ) {
         if (p.payload_len < 1 + 32 + 3) return false;
+        if (!xl_login_allowed()) return false;           // too many attempts: don't even do the key exchange
         const uint8_t* sender = p.payload + 1;
         uint8_t secret[32];
         ecdh(secret, sender);

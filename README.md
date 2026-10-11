@@ -58,6 +58,7 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | `region def`, `region load` (indented import) | ✓ (v2.5) |
 | Alerts to a channel (low battery, shutdown, restarts): `set alert.channel #name`, `set alerts on/off`, `alert test` | ✓ (v2.6) |
 | `flood.ratelimit`: cap floods per minute from one source | ✓ (v2.6) |
+| `tempradio` (try radio settings for N minutes, then revert), `cad on/off`, `rxdelay`, `radio.watchdog`, login attempt limits, `neighbors.detail` (RSSI, times heard) | ✓ (1.17.1.2) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**

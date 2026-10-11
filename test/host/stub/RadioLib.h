@@ -2,6 +2,8 @@
 #include <Arduino.h>
 #define RADIOLIB_NC 0xFFFFFFFF
 #define RADIOLIB_ERR_NONE 0
+#define RADIOLIB_CHANNEL_FREE (-15)
+#define RADIOLIB_LORA_DETECTED (-702)
 #define RADIOLIB_ERR_SPI_CMD_FAILED -707
 #define RADIOLIB_ERR_SPI_CMD_INVALID -706
 #define RADIOLIB_ERR_TX_TIMEOUT -5
@@ -42,7 +44,8 @@ struct SX1262 {
   float getSNR() { return 0; }
   float getRSSI() { return 0; }
   int16_t setOutputPower(int) { return 0; }
-  bool boosted = false; int sleeps = 0;
+  bool boosted = false; int sleeps = 0; int scans = 0; int16_t scan_result = RADIOLIB_CHANNEL_FREE;
+  int16_t scanChannel() { scans++; return scan_result; }
   int16_t setRxBoostedGainMode(bool b, bool = true) { boosted = b; return 0; }
   int16_t sleep(bool = true) { sleeps++; return 0; }
   int last_cr = 5; int16_t setCodingRate(int c) { last_cr = c; return 0; }

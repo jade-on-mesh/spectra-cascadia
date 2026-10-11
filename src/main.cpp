@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 1.17.1.1 (official MeshCore 1.17.1 + Spectra-Cascadia release 1)
+ * Version: 1.17.1.2 (official MeshCore 1.17.1 + Spectra-Cascadia release 2)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -29,6 +29,7 @@
 #include <Ed25519.h>
 #include <IWatchdog.h>
 #ifdef SPECTER_XL
+#include <math.h>
 #include <AES.h>
 #include <SHA512.h>
 #include <BigNumberUtil.h>
@@ -39,7 +40,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.17.1.1"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.17.1.2"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -250,7 +251,7 @@ struct ConfigApp {
     uint8_t  allow_ro, multi_acks, rxgain;    // allow.read.only (stored; room servers only upstream) / multi.acks / radio.rxgain
     int8_t   int_thresh;                      // int.thresh dB above noise floor = channel busy (0 = off)
     uint16_t agc_s;                           // agc.reset.interval seconds (0 = off)
-    uint16_t pad;
+    uint16_t radio_wd_h;                      // radio.watchdog hours (0 = default 6, 0xFFFF = off)
     uint32_t check;
 };
 static ConfigApp app;
@@ -268,9 +269,9 @@ struct ConfigMore {
     uint8_t  key_len;                         // 0 = no alert channel
     uint8_t  alerts;                          // alerts on/off
     uint8_t  flood_rl;                        // flood.ratelimit: floods per minute per source (0 = off)
-    uint8_t  pad;
+    uint8_t  cad;                             // cad on/off: channel activity detection before TX
     uint16_t alert_mv;                        // alert.battery (0 = auto: cutoff + 150 mV)
-    uint16_t pad2;
+    uint16_t rxdelay_x10;                     // rxdelay base × 10 (0 = off, as upstream default)
     uint32_t check;
 };
 static ConfigMore more;
@@ -417,7 +418,21 @@ static void flash_erase(uint32_t addr) {
     HAL_FLASHEx_Erase(&er, &err);
 }
 
+#ifdef SPECTER_XL
+// tempradio: while temporary radio params are live, cfg holds them; saves write the real ones.
+static bool     tr_active = false;
+static uint32_t tr_apply_at = 0, tr_revert_at = 0;
+static uint32_t tr_freq, tr_bw; static uint8_t tr_sf, tr_cr;      // the other set (pending or original)
+static void tr_swap(void) {
+    uint32_t f = cfg.freq_khz, b = cfg.bw_hz; uint8_t s = cfg.sf, c = cfg.cr;
+    cfg.freq_khz = tr_freq; cfg.bw_hz = tr_bw; cfg.sf = tr_sf; cfg.cr = tr_cr;
+    tr_freq = f; tr_bw = b; tr_sf = s; tr_cr = c;
+}
+#endif
 static void cfg_save(void) {
+#ifdef SPECTER_XL
+    if (tr_active) tr_swap();
+#endif
     cfg.check = cfg_checksum(cfg);
     ext.check = ext_checksum(ext);
     HAL_FLASH_Unlock();
@@ -443,6 +458,9 @@ static void cfg_save(void) {
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, MORE_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
+#ifdef SPECTER_XL
+    if (tr_active) tr_swap();
+#endif
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -798,6 +816,9 @@ static void rx_start(void) {
 }
 
 static int      last_rssi = 0, last_snr4 = 0, noise_floor = 0;
+#ifdef SPECTER_XL
+static uint32_t stat_cad_busy = 0, stat_better = 0, stat_radio_wd = 0, last_rx_ms = 0;
+#endif
 
 // Listen-before-talk: upstream CustomSX1262::isReceiving()
 static uint32_t activity_at = 0;
@@ -810,6 +831,12 @@ static bool channel_busy(uint32_t irq) {
 #ifdef SPECTER_XL
     // int.thresh: RSSI above the noise floor counts as busy (RadioLibWrapper::isChannelActive)
     if (app.int_thresh && noise_floor && radio.rssiInst() > noise_floor + app.int_thresh) return true;
+    // cad: ask the SX1262 whether a LoRa preamble is on the air right now (only when idle)
+    if (more.cad && !(irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID))) {
+        int16_t r = radio.scanChannel();
+        rx_start();
+        if (r == RADIOLIB_LORA_DETECTED) { stat_cad_busy++; return true; }
+    }
 #endif
     if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
         radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
@@ -872,6 +899,7 @@ struct TxItem {
     bool     used;
     uint8_t  pri, len, cr;
     int8_t   rslot;            // retry slot to arm after this TX, or -1
+    uint8_t  score;            // XL rxdelay: reception score ×100 of the copy queued
     uint32_t due, busy_since;
     uint8_t  buf[MAX_PKT];
 };
@@ -887,7 +915,7 @@ static int txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms)
         if (slot < 0) { LOGLN("  txq full"); return -1; }
     }
     TxItem& t = txq[slot];
-    t.used = true; t.pri = pri; t.len = (uint8_t)len; t.cr = 0; t.rslot = -1;
+    t.used = true; t.pri = pri; t.len = (uint8_t)len; t.cr = 0; t.rslot = -1; t.score = 0;
     t.due = millis() + delay_ms; t.busy_since = 0;
     memcpy(t.buf, buf, len);
     return slot;
@@ -1405,11 +1433,59 @@ static bool flood_rate_ok(const Pkt& p) {
 }
 #endif
 
+#ifdef SPECTER_XL
+// rxdelay (Dispatcher::calcRxDelay with simple_repeater's base): weaker copies wait
+// longer, so when the same flood arrives over several paths the strongest copy is
+// the one we forward. Score: RadioLibWrapper::packetScoreInt.
+static uint32_t rx_delay_ms(const Pkt& p, int8_t snr4, uint8_t* score_out) {
+    int raw = 2 + (p.route == ROUTE_TRANSPORT_FLOOD ? 4 : 0) + p.hash_count * p.hash_size + p.payload_len;
+    float sc = 0;
+    if (cfg.sf >= 7 && snr4 >= snr_floor4()) {
+        sc = (snr4 - snr_floor4()) / 40.0f * (1.0f - raw / 256.0f);
+        if (sc > 1) sc = 1;
+    }
+    *score_out = (uint8_t)(sc * 100);
+    if (!more.rxdelay_x10) return 0;
+    float d = (powf(more.rxdelay_x10 / 10.0f, 0.85f - sc) - 1.0f) * airtime_ms(raw);
+    if (d < 50) return 0;
+    return d > 32000 ? 32000 : (uint32_t)d;
+}
+// A duplicate of a flood still waiting in our queue: if this copy was received
+// better, forward it instead (its path), at its own, shorter delay.
+static bool better_copy(const Pkt& p, int8_t snr4) {
+    for (int i = 0; i < TXQ_SIZE; i++) {
+        TxItem& t = txq[i];
+        if (!t.used || t.len < p.payload_len || (t.buf[0] & 3) != p.route || ((t.buf[0] >> 2) & 15) != p.ptype) continue;
+        if (memcmp(t.buf + t.len - p.payload_len, p.payload, p.payload_len)) continue;
+        uint8_t score;
+        uint32_t d = rx_delay_ms(p, snr4, &score);
+        if (score <= t.score || p.hash_count + 1 >= cfg.flood_max) return false;
+        int pbytes = p.hash_count * p.hash_size;
+        if (pbytes + p.hash_size > MAX_PATH_SIZE) return false;
+        for (int k = 0; k < p.hash_count; k++) if (is_own_hash(p.path + k * p.hash_size, p.hash_size)) return false;
+        uint8_t newpath[MAX_PATH_SIZE];
+        memcpy(newpath, p.path, pbytes);
+        memcpy(newpath + pbytes, own_pubkey, p.hash_size);
+        int n = build(out_buf, p.header, p.tc, (p.path_len & 0xC0) | ((p.hash_count + 1) & 0x3F), newpath, pbytes + p.hash_size, p.payload, p.payload_len);
+        if (n < 0) return false;
+        memcpy(t.buf, out_buf, n); t.len = (uint8_t)n; t.score = score;
+        uint32_t due = millis() + delay_for(p, cfg.txdelay_x100) + d;
+        if ((int32_t)(due - t.due) < 0) t.due = due;
+        stat_better++;
+        return true;
+    }
+    return false;
+}
+#endif
+
 static const char* handle_flood(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
     packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
     if (p.hash_count) rr_note(p.path + (p.hash_count - 1) * p.hash_size, p.hash_size, snr4);
     if (was_seen(h)) {
+#ifdef SPECTER_XL
+        if (more.rxdelay_x10 && better_copy(p, snr4)) return "better copy";
+#endif
         if (p.ptype == PT_ADVERT) ag_echo(h, p.hash_count);
         return rt_echo(h, false, p.hash_count) ? "echo" : "dedup";
     }
@@ -1458,7 +1534,14 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
     uint8_t new_len = (p.path_len & 0xC0) | ((p.hash_count + 1) & 0x3F);
     int n = build(out_buf, p.header, p.tc, new_len, newpath, pbytes + p.hash_size, p.payload, p.payload_len);
     if (n < 0) return "too big";
+#ifdef SPECTER_XL
+    uint8_t score = 0;
+    uint32_t rxd = rx_delay_ms(p, snr4, &score);
+    int q = txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100) + rxd);
+    if (q >= 0) txq[q].score = score;
+#else
     int q = txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100));
+#endif
     if (p.ptype == PT_ADVERT) { uint32_t ts; memcpy(&ts, p.payload + 32, 4); ag_add(h, p.hash_count + 1, ts); }
     rt_create(h, q, false, p.hash_count + 1, flood_retry_count(p), 0);
     return NULL;
@@ -2129,8 +2212,14 @@ static void handle_get(const char* k, char* reply) {
     if      (!strcmp(k, "name"))   sprintf(reply, "> %s", cfg.name);
     else if (!strcmp(k, "lat"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lat_e6, 6));
     else if (!strcmp(k, "lon"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lon_e6, 6));
-    else if (!strcmp(k, "radio"))  sprintf(reply, "> %s,%s,%d,%d", fmt_fixed(a, cfg.freq_khz, 3),
-                                           fmt_fixed(b, cfg.bw_hz, 3), cfg.sf, cfg.cr);
+    else if (!strcmp(k, "radio")) {
+#ifdef SPECTER_XL
+        if (tr_active) { sprintf(reply, "> %s,%s,%d,%d (temp: ", fmt_fixed(a, tr_freq, 3), fmt_fixed(b, tr_bw, 3), tr_sf, tr_cr);
+                         sprintf(reply + strlen(reply), "%s,%s,%d,%d)", fmt_fixed(a, cfg.freq_khz, 3), fmt_fixed(b, cfg.bw_hz, 3), cfg.sf, cfg.cr); }
+        else
+#endif
+        sprintf(reply, "> %s,%s,%d,%d", fmt_fixed(a, cfg.freq_khz, 3), fmt_fixed(b, cfg.bw_hz, 3), cfg.sf, cfg.cr);
+    }
     else if (!strcmp(k, "freq"))   sprintf(reply, "> %s", fmt_fixed(a, cfg.freq_khz, 3));
     else if (!strcmp(k, "tx"))     sprintf(reply, "> %d", cfg.tx_dbm);
     else if (!strcmp(k, "repeat")) sprintf(reply, "> %s", cfg.repeat ? "on" : "off");
@@ -2166,6 +2255,14 @@ static void handle_get(const char* k, char* reply) {
         else if (more.alert_mv) sprintf(reply, "> %u", th);
         else if (th) sprintf(reply, "> auto (%u)", th);
         else strcpy(reply, "> auto (off until battery.cutoff is set)");
+    }
+    else if (!strcmp(k, "cad"))     sprintf(reply, "> %s (busy %lu)", more.cad ? "on" : "off", (unsigned long)stat_cad_busy);
+    else if (!strcmp(k, "rxdelay")) {
+        char a2[12]; sprintf(reply, "> %s (better copies %lu)", fmt_fixed(a2, more.rxdelay_x10, 1), (unsigned long)stat_better);
+    }
+    else if (!strcmp(k, "radio.watchdog")) {
+        if (app.radio_wd_h == 0xFFFF) strcpy(reply, "> off");
+        else sprintf(reply, "> %u h (fired %lu)", app.radio_wd_h ? app.radio_wd_h : 6, (unsigned long)stat_radio_wd);
     }
     else if (!strcmp(k, "flood.ratelimit")) {
         if (more.flood_rl) sprintf(reply, "> %u (dropped %lu)", more.flood_rl, (unsigned long)stat_rl_drop);
@@ -2225,6 +2322,12 @@ static void handle_set(const char* cmd, char* reply) {
         if (!parse_fixed(v, 6, &x) || x < -180000000 || x > 180000000) { strcpy(reply, "Error, bad value"); return; }
         if (k[1] == 'a') cfg.lat_e6 = x; else cfg.lon_e6 = x;
     } else if (!strcmp(k, "radio")) {
+#ifdef SPECTER_XL
+        if (tr_active || tr_apply_at) {                   // a real change cancels tempradio
+            if (tr_active) { tr_swap(); radio_init(); rx_start(); }
+            tr_active = false; tr_apply_at = 0;
+        }
+#endif
         int32_t f, bw; int sf = 0, cr = 0;
         const char* c1 = strchr(v, ','); const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
         const char* c3 = c2 ? strchr(c2 + 1, ',') : NULL;
@@ -2319,6 +2422,16 @@ static void handle_set(const char* cmd, char* reply) {
         else if (!strcmp(v, "off")) more.alert_mv = 1;
         else if (ok && iv >= 2000 && iv <= 4500) more.alert_mv = iv;
         else { strcpy(reply, "Error: 2000-4500 mV, auto or off"); return; }
+    } else if (!strcmp(k, "cad")) {
+        if (strcmp(v, "on") && strcmp(v, "off")) { strcpy(reply, "Error: on or off"); return; }
+        more.cad = v[1] == 'n';
+    } else if (!strcmp(k, "rxdelay")) {
+        if (!parse_fixed(v, 1, &x) || x < 0 || x > 200) { strcpy(reply, "Error, must be 0-20"); return; }
+        more.rxdelay_x10 = x;
+    } else if (!strcmp(k, "radio.watchdog")) {
+        if (!strcmp(v, "off")) app.radio_wd_h = 0xFFFF;
+        else if (ok && iv >= 1 && iv <= 48) app.radio_wd_h = iv;
+        else { strcpy(reply, "Error: 1-48 hours, or off"); return; }
     } else if (!strcmp(k, "flood.ratelimit")) {
         if (!strcmp(v, "off")) more.flood_rl = 0;
         else if (ok && iv >= 1 && iv <= 60) more.flood_rl = iv;
@@ -2392,6 +2505,22 @@ static void handle_command(char* cmd, char* reply) {
         if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
         else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
 #ifdef SPECTER_XL
+    } else if (!strncmp(cmd, "tempradio ", 10)) {         // tempradio freq,bw,sf,cr,minutes (upstream)
+        const char* v = skip_ws(cmd + 10);
+        int32_t f, bw; int sf, cr, mins;
+        const char* c1 = strchr(v, ','); const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        const char* c3 = c2 ? strchr(c2 + 1, ',') : NULL; const char* c4 = c3 ? strchr(c3 + 1, ',') : NULL;
+        if (!c4 || !parse_fixed(v, 3, &f) || !parse_fixed(c1 + 1, 3, &bw)) { strcpy(reply, "Error, invalid params"); return; }
+        sf = atoi_s(c2 + 1); cr = atoi_s(c3 + 1); mins = atoi_s(c4 + 1);
+        if (f < 150000 || f > 960000 || sf < 5 || sf > 12 || cr < 5 || cr > 8 || bw < 7000 || bw > 500000 || mins <= 0) {
+            strcpy(reply, "Error, invalid params"); return;
+        }
+        if (tr_active) tr_swap();                         // back to the real set first
+        tr_active = false;
+        tr_freq = f; tr_bw = bw; tr_sf = sf; tr_cr = cr;   // pending
+        tr_apply_at = (millis() + 2000) | 1;              // let the reply go out first
+        tr_revert_at = millis() + 2000 + (uint32_t)mins * 60000UL;
+        sprintf(reply, "OK - temp params for %d mins", mins);
     } else if (!strcmp(cmd, "alert test")) {
         if (!more.key_len) strcpy(reply, "Error: no alert.channel set");
         else if (!more.alerts) strcpy(reply, "Error: alerts are off");
@@ -2441,6 +2570,19 @@ static void handle_command(char* cmd, char* reply) {
             if (xl_clients[i].perms == 0xFF || xl_clients[i].perms == PERM_ACL_GUEST) continue;
             char hx[65]; to_hex(hx, xl_clients[i].pub, 32);
             Serial1.print("0"); Serial1.print(xl_clients[i].perms); Serial1.print(" "); Serial1.println(hx);
+        }
+    } else if (!strncmp(cmd, "neighbors.detail", 16)) {  // key4:secs_ago:snr:rssi:times_heard, 5 per page
+        uint8_t idx[XL_MAX_NEIGHB];
+        int n = xl_nb_sorted(idx, 0), page = atoi_s(cmd + 16), pages = (n + 4) / 5;
+        if (page < 1) page = 1;
+        if (!n) { strcpy(reply, "-none-"); return; }
+        if (page > pages) { strcpy(reply, "Error, no such page"); return; }
+        char* p = reply + sprintf(reply, "p%d/%d", page, pages);
+        uint32_t up = uptime_s();
+        for (int k = (page - 1) * 5; k < n && k < page * 5; k++) {
+            const XlNeighbour& nb = xl_nb[idx[k]];
+            *p++ = '\n'; to_hex(p, nb.pfx, 4); p += 8;
+            p += sprintf(p, ":%lu:%d:%d:%u", (unsigned long)(up - nb.heard_up), nb.snr4, nb.rssi, nb.count);
         }
     } else if (!strcmp(cmd, "neighbors")) {          // upstream format: key4hex:secs_ago:snr×4, newest first
         uint8_t idx[XL_MAX_NEIGHB];
@@ -2695,6 +2837,9 @@ void loop(void) {
         if (state == RADIOLIB_ERR_NONE) {
             stat_rx++;
             last_rssi = rssi; last_snr4 = snr4;
+#ifdef SPECTER_XL
+            last_rx_ms = millis();
+#endif
             stat_rx_air_ms += airtime_ms(len);
             if (log_on) {
                 Serial1.print("RX rssi="); Serial1.print(rssi);
@@ -2730,6 +2875,20 @@ void loop(void) {
         }
     }
 #endif
+#ifdef SPECTER_XL
+    // radio.watchdog: nothing received for N hours → the SX1262 may be wedged; re-init it
+    if (app.radio_wd_h != 0xFFFF) {
+        uint32_t wd_ms = (app.radio_wd_h ? app.radio_wd_h : 6) * 3600000UL;
+        if (millis() - last_rx_ms > wd_ms) {
+            last_rx_ms = millis();
+            stat_radio_wd++;
+            LOGLN("radio watchdog: re-initialising the radio");
+            if (!radio_init()) NVIC_SystemReset();
+            rx_start();
+            xl_alert("radio watchdog: nothing heard for hours, radio re-initialised", false);
+        }
+    }
+#endif
     battery_monitor(up);
     if ((int32_t)(up - next_tele_s) >= 0) { next_tele_s = up + TELE_IV_S; tele_sample(); }
 
@@ -2744,6 +2903,16 @@ void loop(void) {
         Serial1.println(r);
     }
 #ifdef SPECTER_XL
+    if (tr_apply_at && (int32_t)(millis() - tr_apply_at) >= 0) {
+        tr_apply_at = 0; tr_swap(); tr_active = true;     // cfg now holds the temporary params
+        if (!radio_init()) NVIC_SystemReset();
+        rx_start();
+    }
+    if (tr_active && (int32_t)(millis() - tr_revert_at) >= 0) {
+        tr_swap(); tr_active = false;                     // back to the saved params
+        if (!radio_init()) NVIC_SystemReset();
+        rx_start();
+    }
     if (!xl_boot_alert_done && up >= 60) xl_alert_boot();
     if (xl_acl_dirty_at && (int32_t)(millis() - xl_acl_dirty_at) >= 0) xl_acl_save();
     if (xl_reboot_at && (int32_t)(millis() - xl_reboot_at) >= 0) {

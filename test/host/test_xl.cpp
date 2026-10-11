@@ -147,7 +147,9 @@ int main() {
 
     Client a; mk_client(a, 1);
     uint8_t hop = 0x77;
+    bool limiter_on = false;                                       // the login limiter has its own test
     auto login = [&](const Client& c, const char* pw, uint32_t ts, bool flood) {
+        if (!limiter_on) { xl_lg_n = 0; xl_lock_until = 0; xl_bad = 0; }
         uint8_t data[32]; memcpy(data, &ts, 4); strcpy((char*)data + 4, pw);
         uint8_t pl[120]; pl[0] = own_pubkey[0]; memcpy(pl + 1, c.pub, 32);
         int pn = 33 + c_enc(c.ss, pl + 33, data, 4 + strlen(pw));
@@ -259,7 +261,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.1") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.2") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -535,6 +537,93 @@ int main() {
       int ok = 0; for (int i = 0; i < 5; i++) { ack[2] = i; clearq(); on_receive(ack, sizeof(ack), 0); ok += queued(); }
       CHECK(ok == 5, "ACKs are never rate limited");
       cli("set flood.ratelimit off"); clearq(); }
+
+
+    // ── 1.17.1.2: CAD before transmitting
+    { CHECK(cli("get cad") == "> off (busy 0)" && cli("set cad on") == "OK", "cad on");
+      clearq(); cli("advert.zerohop");
+      radio.scan_result = RADIOLIB_LORA_DETECTED;
+      int tx0 = radio.tx_count, sc0 = radio.scans;
+      fake_ms += 2000; txq_service(0);
+      CHECK(radio.scans == sc0 + 1 && radio.tx_count == tx0 && queued() == 1, "LoRa detected by CAD: transmission held back");
+      radio.scan_result = RADIOLIB_CHANNEL_FREE;
+      fake_ms += 2000; txq_service(0);
+      CHECK(radio.tx_count == tx0 + 1 && queued() == 0, "channel free: sent");
+      CHECK(cli("get cad") == "> on (busy 1)", "cad busy count");
+      cli("set cad off"); clearq(); }
+
+    // ── 1.17.1.2: rxdelay — the strongest copy of a flood is the one forwarded
+    { CHECK(cli("get rxdelay").find("> 0") == 0 && cli("set rxdelay 10") == "OK", "rxdelay 10");
+      uint8_t pl[30]; for (int i = 0; i < 30; i++) pl[i] = (uint8_t)(0x90 + i);
+      uint8_t weak[40], strong[40]; int n = 0;
+      weak[n++] = (PT_GRP_TXT << 2) | ROUTE_FLOOD; weak[n++] = 2; weak[n++] = 0x51; weak[n++] = 0x52; memcpy(weak + n, pl, 30); n += 30;
+      int m = 0; strong[m++] = (PT_GRP_TXT << 2) | ROUTE_FLOOD; strong[m++] = 1; strong[m++] = 0x61; memcpy(strong + m, pl, 30); m += 30;
+      clearq(); on_receive(weak, n, -28);                          // barely decodable: long wait
+      TxItem* t = last_q();
+      uint32_t due_weak = t ? t->due - fake_ms : 0;
+      CHECK(t && due_weak > 300, "weak copy waits (rx delay)");
+      on_receive(strong, m, 40);                                   // strong copy over another path
+      t = last_q();
+      CHECK(queued() == 1 && t->buf[1] == 2 && t->buf[2] == 0x61 && t->buf[3] == own_pubkey[0] && t->due - fake_ms < due_weak,
+            "stronger copy replaces the queued weak one, sooner, with its own path");
+      on_receive(weak, n, -28);
+      CHECK(last_q()->buf[2] == 0x61, "a weaker repeat doesn't replace it back");
+      CHECK(cli("get rxdelay") == "> 10 (better copies 1)", "better-copy count");
+      cli("set rxdelay 0"); clearq();
+      on_receive(strong, m, 40);
+      CHECK(queued() == 0, "rxdelay off: duplicates dropped as before"); clearq(); }
+
+    // ── 1.17.1.2: radio watchdog
+    { CHECK(cli("get radio.watchdog").find("> 6 h") == 0, "radio.watchdog default 6 h");
+      uint32_t f0 = stat_radio_wd;
+      last_rx_ms = fake_ms; fake_ms += 5UL * 3600000UL; loop();
+      CHECK(stat_radio_wd == f0, "5 h of silence: nothing yet");
+      fake_ms += 3600000UL + 1000; loop();
+      CHECK(stat_radio_wd == f0 + 1, "6 h of silence: radio re-initialised");
+      CHECK(cli("set radio.watchdog off") == "OK" && cli("get radio.watchdog") == "> off", "radio.watchdog off");
+      fake_ms += 7UL * 3600000UL; loop();
+      CHECK(stat_radio_wd == f0 + 1, "off: never fires");
+      cli("set radio.watchdog 6"); last_rx_ms = fake_ms; clearq(); }
+
+    // ── 1.17.1.2: login attempt limits
+    { limiter_on = true; xl_lg_n = 0; xl_lock_until = 0; xl_bad = 0; xl_lock_level = 0;
+      Client z; mk_client(z, 77);
+      login(z, "x1", ts_now++, false); login(z, "x2", ts_now++, false);
+      CHECK(xl_lock_until == 0, "two wrong passwords: no lockout yet");
+      login(z, "x3", ts_now++, false);
+      CHECK(xl_lock_until != 0, "third wrong password in a row: locked out");
+      login(a, "swordfish", ts_now++, false);
+      CHECK(queued() == 0, "locked out: even the right password is ignored for a minute");
+      fake_ms += 61000;
+      login(a, "swordfish", ts_now++, false);
+      CHECK(queued() == 1, "after the lockout, the right password works");
+      fake_ms += 61000; xl_lg_n = 0;
+      for (int i = 0; i < 5; i++) login(a, "swordfish", ts_now++, false);
+      login(a, "swordfish", ts_now++, false);
+      CHECK(queued() == 0, "more than 5 attempts a minute: ignored");
+      limiter_on = false; fake_ms += 61000; login(a, "swordfish", ts_now++, false); clearq(); }
+
+    // ── 1.17.1.2: neighbour RSSI and times heard
+    { memset(xl_nb, 0, sizeof(xl_nb));
+      uint8_t k1[32]; memset(k1, 0x2A, 32);
+      last_rssi = -97; xl_note_neighbour(k1, 12); fake_ms += 5000; last_rssi = -95; xl_note_neighbour(k1, 14); fake_ms += 5000;
+      CHECK(cli("neighbors.detail") == "p1/1\n2A2A2A2A:5:14:-95:2", "neighbors.detail: key:secs:snr:rssi:times heard");
+      CHECK(cli("neighbors") == "2A2A2A2A:5:14", "neighbors keeps the upstream format"); clearq(); }
+
+
+    // ── 1.17.1.2: tempradio
+    { std::string before = cli("get radio");
+      reboot_pending = false;                                     // left set by the stubbed reboot earlier
+      CHECK(rcli(a, "tempradio 915.000,250,10,5,30", 1) == "OK - temp params for 30 mins", "tempradio accepted");
+      CHECK(cfg.freq_khz == 910525, "not applied until the reply has gone out");
+      fake_ms += 2100; loop();
+      CHECK(cfg.freq_khz == 915000 && cfg.sf == 10 && cli("get radio") == "> 910.525,62.5,7,5 (temp: 915,250,10,5)", "applied after 2 s");
+      cli("set name Hilltop");                                    // a save while temp is live
+      CHECK(((Config*)CONFIG_ADDR)->freq_khz == 910525, "saves keep the real radio params");
+      fake_ms += 30UL * 60000UL; loop();
+      CHECK(cfg.freq_khz == 910525 && cfg.sf == 7 && cli("get radio") == "> 910.525,62.5,7,5", "reverts after the timeout");
+      CHECK(cli("tempradio 915,250,10,5,0") == "Error, invalid params", "minutes required");
+      clearq(); }
 
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);
