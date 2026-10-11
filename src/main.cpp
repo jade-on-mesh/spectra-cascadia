@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.4.1
+ * Version: 2.4.2
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -39,7 +39,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v2.4.1"
+#define FW_VERSION "v2.4.2"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -247,7 +247,7 @@ static uint32_t auth_checksum(const ConfigAuth& a) { return fnv_words(&a, offset
 struct ConfigApp {
     uint32_t magic;
     char     owner_info[120];                 // owner.info ('|' on the wire = newline)
-    uint8_t  allow_ro, multi_acks, rxgain;    // allow.read.only / multi.acks (stored, as upstream repeaters) / radio.rxgain
+    uint8_t  allow_ro, multi_acks, rxgain;    // allow.read.only (stored; room servers only upstream) / multi.acks / radio.rxgain
     int8_t   int_thresh;                      // int.thresh dB above noise floor = channel busy (0 = off)
     uint16_t agc_s;                           // agc.reset.interval seconds (0 = off)
     uint16_t pad;
@@ -1224,6 +1224,20 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
     }
     if (was_seen(h)) return "dedup";
     mark_seen(h);
+#ifdef SPECTER_XL
+    // multi.acks (Mesh::routeDirectRecvAcks): send N extra copies as multipart ACKs
+    // 300 ms apart, counting down, then the plain ACK last.
+    if (header == hdr_ack && app.multi_acks && plen <= 16) {
+        for (uint8_t extra = app.multi_acks; extra > 0; extra--) {
+            uint8_t mp[17];
+            mp[0] = (uint8_t)((extra << 4) | PT_ACK);
+            memcpy(mp + 1, pl, plen);
+            delay += 300;
+            int m = build(out_buf, (PT_MULTIPART << 2) | ROUTE_DIRECT, p.tc, new_path_len, rest, rest_bytes, mp, plen + 1);
+            if (m > 0) txq_push(out_buf, m, pri, delay);
+        }
+    }
+#endif
     int n = build(out_buf, header, p.tc, new_path_len, rest, rest_bytes, pl, plen);
     if (n < 0) return "too big";
     int q = txq_push(out_buf, n, pri, delay);

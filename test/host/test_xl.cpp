@@ -249,7 +249,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.4.1") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.4.2") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -327,6 +327,22 @@ int main() {
             "app settings survive reboot (rx gain re-applied)");
       xl_init();
       login(a, "swordfish", ts_now++, false); clearq(); }
+
+
+    // multi.acks 1: a forwarded direct ACK goes out as a multipart ACK, then the plain ACK 300 ms later
+    { clearq();
+      uint8_t pk[] = { (PT_ACK<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x66, 0x11,0x22,0x33,0x44 };
+      on_receive(pk, sizeof(pk), 0);
+      TxItem *mp = nullptr, *ack = nullptr;
+      for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) { if ((txq[i].buf[0] >> 2) == PT_MULTIPART) mp = &txq[i]; else ack = &txq[i]; }
+      CHECK(queued() == 2 && mp && ack && mp->buf[1] == 1 && mp->buf[2] == 0x66 && mp->buf[3] == ((1 << 4) | PT_ACK)
+            && !memcmp(mp->buf + 4, pk + 4, 4) && ack->buf[0] == ((PT_ACK<<2)|ROUTE_DIRECT) && !memcmp(ack->buf + 3, pk + 4, 4)
+            && (int32_t)(ack->due - mp->due) >= 0,
+            "multi.acks 1: multipart ACK (remaining=1) then the plain ACK");
+      app.multi_acks = 0; clearq();
+      uint8_t pk2[] = { (PT_ACK<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x66, 0x55,0x66,0x77,0x88 };
+      on_receive(pk2, sizeof(pk2), 0);
+      CHECK(queued() == 1, "multi.acks 0: just the plain ACK"); clearq(); }
 
     // AGC reset fires on schedule
     { int s0 = radio.sleeps; fake_ms += 29000; loop(); CHECK(radio.sleeps == s0 + 1, "agc.reset.interval: radio warm-reset on schedule"); clearq(); }

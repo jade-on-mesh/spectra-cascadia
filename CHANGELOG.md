@@ -2,13 +2,19 @@
 
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
+## [2.4.2] - 2026-10-11
+
+### Fixed (XL)
+- `multi.acks` now does what it does on upstream repeaters (`Mesh::routeDirectRecvAcks`): a forwarded direct ACK is sent as N extra multipart ACKs, 300 ms apart and counting down, then the plain ACK. v2.4.1 only stored the setting
+- `allow.read.only` stays stored-only: upstream uses it only in room servers
+
 ## [2.4.1] - 2026-10-11
 
 ### Fixed
 - The app's repeater settings screen: command tags (`XX|get name`) are now echoed on the reply as upstream does. The tag is removed before the USB-only check, so it can't be used to get around it
 
 ### Added (XL)
-- Settings the app's screen reads and writes: `owner.info` (also in owner queries), `radio.rxgain` (SX1262 boosted RX gain), `int.thresh` (RSSI above the noise floor counts as a busy channel), `agc.reset.interval` (periodic warm reset of the radio front end), plus `allow.read.only` and `multi.acks`, which are stored and reported but, as on upstream repeaters, change nothing
+- Settings the app's screen reads and writes: `owner.info` (also in owner queries), `radio.rxgain` (SX1262 boosted RX gain), `int.thresh` (RSSI above the noise floor counts as a busy channel), `agc.reset.interval` (periodic warm reset of the radio front end), plus `allow.read.only` and `multi.acks` (stored only; fixed in 2.4.2)
 - `neighbors` CLI command (upstream text format)
 - `get/set dutycycle` (both builds), which maps to `af` as upstream does
 
