@@ -33,6 +33,14 @@ regions, neighbour tables.
 reference, journal wear/rollover, serial CLI, settings persistence). **Not yet RF-tested on hardware.** Test on the bench
 next to a known-good MeshCore repeater before deploying.
 
+### v2.3.1: quieter adverts
+
+Defaults are now **no periodic zero-hop adverts** and **a flood advert every 83 hours**,
+following CascadiaMesh's airtime policy. Upgrading a node that still has the old defaults
+(2 min / 47 h) switches it to the new ones; values you set yourself are kept. On any version
+you can also run `set advert.interval 0` and `set flood.advert.interval 83`. `advert` and
+`advert.zerohop` still send one on demand.
+
 ### v2.3: power saving, battery telemetry and cutoff, advert echo guard, radio stats
 
 **Power saving.** `powersaving on`, then `reboot`, runs the processor at 16 MHz instead of
@@ -166,8 +174,8 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `get` / `set freq` | MHz; reboot to apply |
 | `get` / `set tx` | dBm, -9..22, applies immediately |
 | `get` / `set repeat on\|off` | Stop/start forwarding |
-| `get` / `set advert.interval` | Zero-hop advert, minutes (0 = off, 2–240) |
-| `get` / `set flood.advert.interval` | Hours (0 = off, 3–168) |
+| `get` / `set advert.interval` | Zero-hop advert, minutes (0 = off, the default; 2–240) |
+| `get` / `set flood.advert.interval` | Hours (default 83; 0 = off, 3–168) |
 | `get` / `set flood.max`, `flood.max.unscoped`, `flood.max.advert` | Hop limits |
 | `get` / `set txdelay`, `direct.txdelay`, `af` | Same meaning as upstream |
 | `get` / `set path.hash.mode` | 0/1/2 → 1/2/3-byte hashes for our own floods |

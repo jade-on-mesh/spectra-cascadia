@@ -2,6 +2,12 @@
 
 All notable changes to SPECTER firmware are documented here.
 
+## [2.3.1-cascadia] - 2026-10-11
+
+### Changed
+- Default advert timing: periodic zero-hop adverts off (was 2 min), flood advert every 83 h (was 47 h)
+- Upgrades from older versions migrate the old defaults (2 min / 47 h) to the new ones; custom values are kept
+
 ## [2.3.0-cascadia] - 2026-10-11
 
 ### Added

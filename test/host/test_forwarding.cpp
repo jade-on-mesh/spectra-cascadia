@@ -76,6 +76,7 @@ int main() {
     CHECK(Serial1.out.find("First boot") != std::string::npos, "first boot creates and saves config");
     CHECK(cfg.num_regions == 2 && !strcmp(cfg.regions[0], "se-wa") && !strcmp(cfg.regions[1], "seattle"),
           "REGIONS build flag seeds the region list");
+    CHECK(cfg.advert_interval_min == 0 && cfg.flood_advert_h == 83, "defaults: no periodic zero-hop adverts, flood every 83 h");
 
     // ── transport code vs independent reference (Python HMAC: 0x1403) ──────
     uint8_t pl[] = { 0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
@@ -391,7 +392,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("2.3.0-cascadia") == 0, "ver");
+    CHECK(cli("ver").find("2.3.1-cascadia") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc") == "Error: remote admin not supported", "password not supported");
@@ -439,11 +440,13 @@ int main() {
       for (int i = 0; i < 200; i++) journal_write(clock_now() + i, j_last_flood_ts);
       uint32_t ts = 0, fl = 0; journal_read(&ts, &fl);
       CHECK(ts >= clock_now() + 199, "journal wraps and keeps newest record");
+      cfg.advert_interval_min = 2; cfg.flood_advert_h = 47; cfg_save();   // old v2.1 defaults
       fake_config[sizeof(Config) / 4] = 0;               // simulate v2.1 flash: no extended settings
       memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();
       CHECK(Serial1.out.find("First boot") == std::string::npos && !strcmp(cfg.name, "CM-Woodway-1")
             && !memcmp(pub_before, own_pubkey, 32) && ext.magic == EXT_MAGIC && ext.preset == 1,
-            "upgrade from v2.1 keeps name/identity, adds retry/clock defaults"); }
+            "upgrade from v2.1 keeps name/identity, adds retry/clock defaults");
+      CHECK(cfg.advert_interval_min == 0 && cfg.flood_advert_h == 83, "upgrade migrates old advert defaults (2 min / 47 h → off / 83 h)"); }
 
     CHECK(cli("erase").find("OK") != std::string::npos, "erase");
     { memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();

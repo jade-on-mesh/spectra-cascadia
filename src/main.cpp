@@ -1,6 +1,6 @@
 /*
  * SPECTER — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.3.0-cascadia
+ * Version: 2.3.1-cascadia
  *
  * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). Forwarding follows upstream
  * MeshCore (src/Mesh.cpp + examples/simple_repeater) as closely as a 20 KB-RAM,
@@ -26,7 +26,7 @@
 #include <Ed25519.h>
 #include <IWatchdog.h>
 
-#define FW_VERSION "2.3.0-cascadia"
+#define FW_VERSION "2.3.1-cascadia"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -57,10 +57,10 @@
 #define LORA_TCXO_VOLTAGE 1.6f    // retried at 0.0 (plain crystal) if init fails
 #endif
 #ifndef ADVERT_INTERVAL_MIN
-#define ADVERT_INTERVAL_MIN 2     // zero-hop advert interval (upstream new-install default)
+#define ADVERT_INTERVAL_MIN 0     // periodic zero-hop adverts off (CascadiaMesh airtime policy)
 #endif
 #ifndef FLOOD_ADVERT_INTERVAL_H
-#define FLOOD_ADVERT_INTERVAL_H 47
+#define FLOOD_ADVERT_INTERVAL_H 83
 #endif
 #ifndef PATH_HASH_MODE
 #define PATH_HASH_MODE 0          // 0..2 → 1..3 byte path hashes for packets we originate
@@ -1956,7 +1956,11 @@ void setup(void) {
     memcpy(&ext, (const void*)(CONFIG_ADDR + sizeof(Config)), sizeof(ext));
     if (ext.magic != EXT_MAGIC || ext.check != ext_checksum(ext)) {
         ext_defaults();
-        if (have_cfg) cfg_save();      // upgrade from v2.1: keep settings, add new defaults
+        if (have_cfg) {                // upgrade from an older version: keep settings, add new defaults
+            if (cfg.advert_interval_min == 2) cfg.advert_interval_min = ADVERT_INTERVAL_MIN;   // old defaults →
+            if (cfg.flood_advert_h == 47) cfg.flood_advert_h = FLOOD_ADVERT_INTERVAL_H;        // new defaults
+            cfg_save();
+        }
     }
     regions_rekey();
     if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
