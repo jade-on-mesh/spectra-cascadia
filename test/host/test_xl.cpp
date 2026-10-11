@@ -259,7 +259,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.5.0") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.6.0") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -461,6 +461,80 @@ int main() {
       cli("region allowf *"); cli("region save");
       setup();
       CHECK(cli("region get tacoma") == " tacoma (wa) F", "hierarchy survives reboot"); }
+
+
+    // ── v2.6: alerts to a channel
+    { auto chan_key = [](const char* name, uint8_t key[32]) {        // as the app derives a hashtag channel
+          uint8_t h[32]; SHA256 sha; sha.reset(); sha.update(name, strlen(name)); sha.finalize(h, 32);
+          memset(key, 0, 32); memcpy(key, h, 16); };
+      auto read_alert = [&](const uint8_t* buf, int len, const uint8_t key[32], std::string& text) -> bool {
+          Pkt p; if (!parse(buf, len, p) || p.ptype != PT_GRP_TXT) return false;
+          uint8_t h[32]; SHA256 sha; sha.reset(); sha.update(key, 16); sha.finalize(h, 32);
+          if (p.payload[0] != h[0]) return false;
+          uint8_t d[200]; int n = c_dec(key, d, p.payload + 1, p.payload_len - 1);
+          if (n < 6 || d[4] != 0) return false;
+          d[n] = 0; text = (char*)d + 5; return true; };
+      auto find_alert = [&](const uint8_t key[32], std::string& text) -> bool {
+          for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used && read_alert(txq[i].buf, txq[i].len, key, text)) return true;
+          return false; };
+      uint8_t key[32]; chan_key("#cascadia-ops", key);
+      std::string txt;
+      clearq();
+      CHECK(cli("get alert.channel") == "> off" && cli("get alerts") == "> on (no alert.channel set)", "defaults: alerts on, no channel");
+      CHECK(cli("alert test") == "Error: no alert.channel set" && queued() == 0, "no channel: nothing sent");
+      CHECK(cli("set alert.channel #cascadia-ops") == "OK" && cli("get alert.channel") == "> #cascadia-ops", "set alert.channel #name");
+      CHECK(cli("alert test") == "OK - alert sent" && find_alert(key, txt) && txt == "Hilltop: test alert",
+            "test alert decrypts with the app's #channel key, 'name: text'");
+      clearq();
+      CHECK(cli("set alerts off") == "OK" && cli("alert test") == "Error: alerts are off" && queued() == 0, "alerts off: nothing sent");
+      cli("set alerts on");
+      CHECK(cli("set alert.channel nope") != "OK" && cli("get alert.channel") == "> off", "bad channel rejected (and cleared)");
+      CHECK(cli("set alert.channel public") == "OK" && cli("get alert.channel") == "> Public", "public channel");
+      { uint8_t pk[32] = { 0x8b,0x33,0x87,0xe9,0xc5,0xcd,0xea,0x6a,0xc9,0xe5,0xed,0xba,0xa1,0x15,0xcd,0x72 };
+        clearq(); cli("alert test"); CHECK(find_alert(pk, txt), "public channel uses the standard Public key"); }
+      CHECK(cli("set alert.channel 00112233445566778899aabbccddeeff") == "OK" && cli("get alert.channel") == "> private 00112233...", "private channel by hex key");
+      cli("set alert.channel #cascadia-ops"); clearq();
+      // battery warning: auto threshold = cutoff + 150
+      cli("set battery.pin pb0"); cli("set battery.divider 2.00"); cli("set battery.cutoff 3300");
+      CHECK(cli("get alert.battery") == "> auto (3450)", "alert.battery auto = cutoff + 150 mV");
+      set_pin_mv(8, 1700, 3300);                                  // 3.40 V
+      fake_ms += 400000; next_batt_s = 0; battery_monitor(uptime_s());
+      CHECK(find_alert(key, txt) && txt.find("Hilltop: battery low: 3") == 0, "low-battery warning");
+      clearq(); next_batt_s = 0; fake_ms += 400000; battery_monitor(uptime_s());
+      CHECK(queued() == 0, "warned once (until it recovers)");
+      // cutoff: alert goes out before standby
+      set_pin_mv(8, 1600, 3300);
+      int tx0 = radio.tx_count; bool slept = false;
+      try { for (int i = 0; i < 4; i++) { fake_ms += 31000; battery_monitor(uptime_s()); } } catch (StandbyEntered&) { slept = true; }
+      std::string last;
+      CHECK(slept && radio.tx_count > tx0 && read_alert(radio.last_tx, radio.last_tx_len, key, last)
+            && last.find("shutting down until 3500 mV") != std::string::npos, "cutoff alert transmitted before standby");
+      fake_bkp = 0; cli("set battery.cutoff off"); set_pin_mv(8, 1950, 3300);
+      // boot alert a minute after an unplanned restart
+      fake_csr = (1UL << 29); setup(); clearq();
+      fake_ms += 61000; loop();
+      CHECK(find_alert(key, txt) && txt.find("restarted (watchdog") != std::string::npos, "boot alert after a watchdog reset");
+      clearq(); cli("reboot"); fake_csr = (1UL << 28); setup(); fake_ms += 61000; loop();
+      CHECK(!find_alert(key, txt), "no boot alert after a reboot command");
+      cli("set alert.channel off"); xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
+
+    // ── v2.6: flood.ratelimit
+    { CHECK(cli("get flood.ratelimit") == "> off", "flood.ratelimit off by default");
+      CHECK(cli("set flood.ratelimit 2") == "OK", "set flood.ratelimit 2");
+      auto grp = [&](uint8_t first_hop, uint8_t seq) {
+          uint8_t pk[40]; int n = 0; pk[n++] = (PT_GRP_TXT << 2) | ROUTE_FLOOD; pk[n++] = 1; pk[n++] = first_hop;
+          pk[n++] = 0x33; for (int i = 0; i < 18; i++) pk[n++] = (uint8_t)(seq * 7 + i);
+          clearq(); on_receive(pk, n, 0); return queued(); };
+      int a1 = grp(0x41, 1), a2 = grp(0x41, 2), a3 = grp(0x41, 3);
+      CHECK(a1 == 1 && a2 == 1 && a3 == 0, "third channel flood from the same entry point in a minute is dropped");
+      CHECK(grp(0x42, 4) == 1, "another entry point is not affected");
+      fake_ms += 31000;
+      CHECK(grp(0x41, 5) == 1 && grp(0x41, 6) == 0, "refills at 2 per minute");
+      CHECK(cli("get flood.ratelimit") == "> 2 (dropped 2)", "dropped count shown");
+      uint8_t ack[] = { (PT_ACK << 2) | ROUTE_FLOOD, 0, 1, 2, 3, 4 };
+      int ok = 0; for (int i = 0; i < 5; i++) { ack[2] = i; clearq(); on_receive(ack, sizeof(ack), 0); ok += queued(); }
+      CHECK(ok == 5, "ACKs are never rate limited");
+      cli("set flood.ratelimit off"); clearq(); }
 
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);

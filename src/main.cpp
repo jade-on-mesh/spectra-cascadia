@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.5.0
+ * Version: 2.6.0
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -39,7 +39,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v2.5.0"
+#define FW_VERSION "v2.6.0"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -258,6 +258,26 @@ static ConfigApp app;
 static_assert(sizeof(ConfigApp) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t app_checksum(const ConfigApp& a) { return fnv_words(&a, offsetof(ConfigApp, check) / 4); }
+
+// XL: alert channel and flood rate limit.
+#define MORE_MAGIC 0x334D5053UL  // "SPM3"
+struct ConfigMore {
+    uint32_t magic;
+    uint8_t  secret[32];                      // channel key (16 or 32 bytes used)
+    char     label[24];                       // what "get alert.channel" shows
+    uint8_t  key_len;                         // 0 = no alert channel
+    uint8_t  alerts;                          // alerts on/off
+    uint8_t  flood_rl;                        // flood.ratelimit: floods per minute per source (0 = off)
+    uint8_t  pad;
+    uint16_t alert_mv;                        // alert.battery (0 = auto: cutoff + 150 mV)
+    uint16_t pad2;
+    uint32_t check;
+};
+static ConfigMore more;
+#define MORE_ADDR (APP_ADDR + sizeof(ConfigApp))
+static_assert(sizeof(ConfigMore) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t more_checksum(const ConfigMore& m) { return fnv_words(&m, offsetof(ConfigMore, check) / 4); }
 #endif
 
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
@@ -417,6 +437,10 @@ static void cfg_save(void) {
     w = (const uint32_t*)&app;
     for (unsigned i = 0; i < sizeof(ConfigApp) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, APP_ADDR + i * 4, w[i]);
+    more.check = more_checksum(more);
+    w = (const uint32_t*)&more;
+    for (unsigned i = 0; i < sizeof(ConfigMore) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, MORE_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
 }
@@ -1341,6 +1365,46 @@ static uint8_t flood_retry_count(const Pkt& p) {
     }
 }
 
+#ifdef SPECTER_XL
+// flood.ratelimit: token bucket per source, so one noisy node can't monopolise
+// the channel. The source is the best identity a repeater can see: the sender's
+// hash for DMs/requests/paths, the key prefix for anonymous requests, and the
+// channel + first hop for channel messages (their sender is encrypted).
+#define RL_SLOTS 32
+struct RlSlot { uint32_t key; uint16_t last_s; uint8_t tokens, used; };
+static RlSlot rl[RL_SLOTS];
+static uint32_t stat_rl_drop = 0;
+static bool flood_rate_ok(const Pkt& p) {
+    uint8_t n = more.flood_rl;
+    if (!n) return true;
+    uint32_t key;
+    switch (p.ptype) {
+        case PT_TXT_MSG: case PT_REQ: case PT_RESPONSE: case PT_PATH:
+            key = p.payload[1] | (uint32_t)p.payload[0] << 8; break;              // src, dest
+        case PT_ANON_REQ:
+            key = p.payload[1] | (uint32_t)p.payload[2] << 8 | (uint32_t)p.payload[3] << 16; break;
+        case PT_GRP_TXT: case PT_GRP_DATA:
+            key = p.payload[0] | (uint32_t)(p.hash_count ? p.path[0] : 0) << 8 | 0x10000UL; break;
+        default:
+            return true;                                                         // adverts (own guard), ACKs …
+    }
+    key |= (uint32_t)p.ptype << 24;
+    uint16_t now = (uint16_t)uptime_s();
+    int s = -1, old = 0;
+    for (int i = 0; i < RL_SLOTS; i++) {
+        if (rl[i].used && rl[i].key == key) { s = i; break; }
+        if (!rl[i].used || (rl[old].used && (uint16_t)(now - rl[i].last_s) > (uint16_t)(now - rl[old].last_s))) old = i;
+    }
+    if (s < 0) { s = old; rl[s].key = key; rl[s].used = 1; rl[s].tokens = n; rl[s].last_s = now; }
+    RlSlot& r = rl[s];
+    uint32_t refill = (uint32_t)(uint16_t)(now - r.last_s) * n / 60;              // n per minute
+    if (refill) { r.tokens = (uint8_t)(r.tokens + refill > n ? n : r.tokens + refill); r.last_s = now; }
+    if (!r.tokens) { stat_rl_drop++; return false; }
+    r.tokens--;
+    return true;
+}
+#endif
+
 static const char* handle_flood(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
     packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
@@ -1380,6 +1444,9 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
     if (!flood_type_ok(p)) return "type";
     mark_seen(h);
     if (p.ptype == PT_ADVERT && ag_blocked(h)) { stat_adv_guard++; return "advert guard"; }
+#ifdef SPECTER_XL
+    if (!flood_rate_ok(p)) return "rate limit";
+#endif
 
     if (p.ptype == PT_ADVERT && !advert_verify(p.payload, p.payload_len, p.hash_count)) return "advert sig";
 
@@ -1575,8 +1642,19 @@ static void tele_sample(void) {
 
 static uint16_t resume_mv(void) { return ext.resume_mv ? ext.resume_mv : ext.cut_mv + 200; }
 
+#ifdef SPECTER_XL
+static bool xl_alert(const char* text, bool urgent);
+static void xl_alert_battery(uint32_t mv);
+#endif
 static void cutoff_shutdown(uint32_t mv) {
     Serial1.print("Battery low ("); Serial1.print(mv); Serial1.println(" mV): sleeping until it recovers");
+#ifdef SPECTER_XL
+    char t[64];
+    sprintf(t, "battery %lu mV: shutting down until %u mV", (unsigned long)mv, resume_mv());
+    if (xl_alert(t, true)) {                           // get it on the air before we sleep
+        for (int i = 0; i < 20; i++) { delay(200); IWatchdog.reload(); txq_service(radio.getIrqFlags()); }
+    }
+#endif
     journal_write(clock_now(), j_last_flood_ts);
     bkp_write(CUTOFF_FLAG);
     radio_cold_sleep();
@@ -1589,6 +1667,9 @@ static void battery_monitor(uint32_t up) {
     if ((int32_t)(up - next_batt_s) < 0) return;
     next_batt_s = up + 30;
     last_batt_mv = battery_mv();
+#ifdef SPECTER_XL
+    xl_alert_battery(last_batt_mv);
+#endif
     if (!ext.cut_mv || !last_batt_mv) { low_count = 0; return; }
     if (last_batt_mv < ext.cut_mv) { if (++low_count >= 3) cutoff_shutdown(last_batt_mv); }
     else low_count = 0;
@@ -2077,6 +2158,19 @@ static void handle_get(const char* k, char* reply) {
     else if (!strcmp(k, "multi.acks"))         sprintf(reply, "> %d", app.multi_acks);
     else if (!strcmp(k, "int.thresh"))         sprintf(reply, "> %d", app.int_thresh);
     else if (!strcmp(k, "agc.reset.interval")) sprintf(reply, "> %u", app.agc_s);
+    else if (!strcmp(k, "alert.channel"))      sprintf(reply, "> %s", more.key_len ? more.label : "off");
+    else if (!strcmp(k, "alerts"))             sprintf(reply, "> %s%s", more.alerts ? "on" : "off", more.key_len ? "" : " (no alert.channel set)");
+    else if (!strcmp(k, "alert.battery")) {
+        uint16_t th = xl_alert_threshold();
+        if (more.alert_mv == 1) strcpy(reply, "> off");
+        else if (more.alert_mv) sprintf(reply, "> %u", th);
+        else if (th) sprintf(reply, "> auto (%u)", th);
+        else strcpy(reply, "> auto (off until battery.cutoff is set)");
+    }
+    else if (!strcmp(k, "flood.ratelimit")) {
+        if (more.flood_rl) sprintf(reply, "> %u (dropped %lu)", more.flood_rl, (unsigned long)stat_rl_drop);
+        else strcpy(reply, "> off");
+    }
     else if (!strcmp(k, "owner.info")) {
         char* p = reply; *p++ = '>'; *p++ = ' ';
         for (const char* q = app.owner_info; *q; q++) *p++ = (*q == '\n') ? '|' : *q;
@@ -2215,6 +2309,21 @@ static void handle_set(const char* cmd, char* reply) {
         cfg_save();
         sprintf(reply, "OK - interval rounded to %u", app.agc_s);
         return;
+    } else if (!strcmp(k, "alert.channel")) {
+        if (!xl_set_alert_channel(v)) { strcpy(reply, "Error: use #name, public, a 32/64-hex key, or off"); return; }
+    } else if (!strcmp(k, "alerts")) {
+        if (strcmp(v, "on") && strcmp(v, "off")) { strcpy(reply, "Error: on or off"); return; }
+        more.alerts = v[1] == 'n';
+    } else if (!strcmp(k, "alert.battery")) {
+        if (!strcmp(v, "auto")) more.alert_mv = 0;
+        else if (!strcmp(v, "off")) more.alert_mv = 1;
+        else if (ok && iv >= 2000 && iv <= 4500) more.alert_mv = iv;
+        else { strcpy(reply, "Error: 2000-4500 mV, auto or off"); return; }
+    } else if (!strcmp(k, "flood.ratelimit")) {
+        if (!strcmp(v, "off")) more.flood_rl = 0;
+        else if (ok && iv >= 1 && iv <= 60) more.flood_rl = iv;
+        else { strcpy(reply, "Error: 1-60 per minute, or off"); return; }
+        memset(rl, 0, sizeof(rl));
     } else if (!strcmp(k, "owner.info")) {
         char* d = app.owner_info;
         for (; *v && d - app.owner_info < (int)sizeof(app.owner_info) - 1; v++) *d++ = (*v == '|') ? '\n' : *v;
@@ -2283,6 +2392,10 @@ static void handle_command(char* cmd, char* reply) {
         if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
         else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
 #ifdef SPECTER_XL
+    } else if (!strcmp(cmd, "alert test")) {
+        if (!more.key_len) strcpy(reply, "Error: no alert.channel set");
+        else if (!more.alerts) strcpy(reply, "Error: alerts are off");
+        else { xl_alert("test alert", true); strcpy(reply, "OK - alert sent"); }
     } else if (!strncmp(cmd, "discover.neighbors", 18)) {
         if (*skip_ws(cmd + 18)) { strcpy(reply, "Err - discover.neighbors has no options"); return; }
         uint8_t d[10];
@@ -2487,6 +2600,13 @@ void setup(void) {
         app.magic = APP_MAGIC;
     }
     app.owner_info[sizeof(app.owner_info) - 1] = 0;
+    memcpy(&more, (const void*)MORE_ADDR, sizeof(more));
+    if (more.magic != MORE_MAGIC || more.check != more_checksum(more)) {
+        memset(&more, 0, sizeof(more));
+        more.magic = MORE_MAGIC;
+        more.alerts = 1;                              // on, but nothing is sent until a channel is set
+    }
+    more.label[sizeof(more.label) - 1] = 0;
     xl_init();
 #endif
     regions_rekey();
@@ -2624,6 +2744,7 @@ void loop(void) {
         Serial1.println(r);
     }
 #ifdef SPECTER_XL
+    if (!xl_boot_alert_done && up >= 60) xl_alert_boot();
     if (xl_acl_dirty_at && (int32_t)(millis() - xl_acl_dirty_at) >= 0) xl_acl_save();
     if (xl_reboot_at && (int32_t)(millis() - xl_reboot_at) >= 0) {
         int q = 0; for (int i = 0; i < TXQ_SIZE; i++) q += txq[i].used;

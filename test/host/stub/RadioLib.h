@@ -33,7 +33,8 @@ struct SX1262 {
   uint32_t getIrqFlags() { return irq | RADIOLIB_SX126X_IRQ_TX_DONE; }
   int clearIrqFlags(uint32_t f) { irq &= ~f; return 0; }
   int standby() { return 0; }
-  int startTransmit(const uint8_t*, size_t) { return 0; }
+  uint8_t last_tx[256]; size_t last_tx_len = 0; int tx_count = 0;
+  int startTransmit(const uint8_t* b, size_t n) { memcpy(last_tx, b, n); last_tx_len = n; tx_count++; return 0; }
   int finishTransmit() { return 0; }
   uint8_t randomByte() { return 0x5A; }
   size_t getPacketLength() { return 0; }

@@ -2,6 +2,16 @@
 
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
+## [2.6.0] - 2026-10-11
+
+### Added (XL)
+- Alerts to a channel you choose: `set alert.channel #name | public | <32/64-hex key> | off`, `set alerts on|off`, `alert test`. Nothing is sent until a channel is set. Messages use the standard channel-message format (`<node name>: <text>`), are sent as floods scoped to the default region, and are limited to one every 5 minutes:
+  - low battery (`alert.battery <mV>|auto|off`; auto = cutoff + 150 mV), once until it recovers by 100 mV
+  - low-battery shutdown, sent before going to standby
+  - restart a minute after boot, with the reason and watchdog count (skipped after a `reboot` command)
+  - back on after a low-battery shutdown
+- `flood.ratelimit <1-60|off>` (default off): floods forwarded per minute from one source. The source is the sender hash for DMs, requests and paths, the key prefix for anonymous requests, and channel + first hop for channel messages. Adverts and ACKs are never limited. `get flood.ratelimit` shows how many were dropped
+
 ## [2.5.0] - 2026-10-11
 
 ### Added

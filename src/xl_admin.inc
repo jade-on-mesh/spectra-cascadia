@@ -520,3 +520,82 @@ static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
     }
     return false;
 }
+
+// ── alerts to a channel (upstream BaseChatMesh::sendGroupMessage format) ────
+// Nothing is sent until "set alert.channel" names a channel; "set alerts off" mutes.
+static uint32_t xl_alert_last_ms = 0;
+static bool xl_alert_any = false, xl_batt_warned = false, xl_boot_alert_done = false;
+
+static bool xl_alert(const char* text, bool urgent) {
+    if (!more.alerts || !more.key_len) return false;
+    if (!urgent && xl_alert_any && millis() - xl_alert_last_ms < 300000UL) return false;   // ≤ 1 per 5 min
+    xl_alert_last_ms = millis(); xl_alert_any = true;
+    uint8_t data[5 + 160];
+    uint32_t t = now_unique();
+    memcpy(data, &t, 4);
+    data[4] = TXT_TYPE_PLAIN << 2;
+    char* m = (char*)data + 5;
+    strcpy(m, cfg.name); strcat(m, ": ");
+    strncat(m, text, 150 - strlen(m));
+    uint8_t h[32];
+    SHA256 sha; sha.reset(); sha.update(more.secret, more.key_len); sha.finalize(h, 32);
+    uint8_t pl[MAX_PKT];
+    pl[0] = h[0];                                    // channel hash
+    int n = 1 + encrypt_then_mac(more.secret, pl + 1, data, 5 + strlen(m));
+    xl_send_flood(PT_GRP_TXT, pl, n, (uint8_t)(cfg.path_hash_mode + 1), -1, 0);
+    LOG("  alert: "); LOGLN(m);
+    return true;
+}
+
+static uint16_t xl_alert_threshold(void) {          // alert.battery: 0 auto (cutoff + 150), 1 off
+    if (more.alert_mv == 1) return 0;
+    return more.alert_mv ? more.alert_mv : (ext.cut_mv ? ext.cut_mv + 150 : 0);
+}
+static void xl_alert_battery(uint32_t mv) {
+    uint16_t th = xl_alert_threshold();
+    if (!th || !mv) return;
+    if (!xl_batt_warned && mv < th) {
+        char t[48]; sprintf(t, "battery low: %lu mV", (unsigned long)mv);
+        if (xl_alert(t, false)) xl_batt_warned = true;
+    } else if (xl_batt_warned && mv > th + 100UL) xl_batt_warned = false;
+}
+static void xl_alert_boot(void) {                   // once, a minute after start-up
+    xl_boot_alert_done = true;
+    if (!strcmp(reset_why, "reboot command")) return;
+    char t[96];
+    if (!strcmp(reset_why, "low-battery standby"))
+        sprintf(t, "back on after low-battery shutdown, battery %lu mV", (unsigned long)battery_mv());
+    else
+        sprintf(t, "restarted (%s, %u watchdog resets since power-on), battery %lu mV", reset_why, wdt_resets, (unsigned long)battery_mv());
+    xl_alert(t, true);
+}
+
+// "set alert.channel": #hashtag, public, a 32/64-hex key, or off
+static bool xl_set_alert_channel(const char* v) {
+    static const uint8_t pub_psk[16] = { 0x8b,0x33,0x87,0xe9,0xc5,0xcd,0xea,0x6a,0xc9,0xe5,0xed,0xba,0xa1,0x15,0xcd,0x72 };
+    memset(more.secret, 0, 32);
+    more.label[0] = 0;
+    if (!strcmp(v, "off") || !strcmp(v, "none")) { more.key_len = 0; return true; }
+    if (!strcmp(v, "public") || !strcmp(v, "Public")) {
+        memcpy(more.secret, pub_psk, 16); more.key_len = 16; strcpy(more.label, "Public"); return true;
+    }
+    if (v[0] == '#' && v[1] && strlen(v) < sizeof(more.label)) {
+        uint8_t h[32];
+        SHA256 sha; sha.reset(); sha.update(v, strlen(v)); sha.finalize(h, 32);
+        memcpy(more.secret, h, 16); more.key_len = 16; strcpy(more.label, v); return true;
+    }
+    int n = strlen(v);
+    if (n == 32 || n == 64) {
+        for (int i = 0; i < n / 2; i++) {
+            int a = hexval(v[2 * i]), b = hexval(v[2 * i + 1]);
+            if (a < 0 || b < 0) { more.key_len = 0; return false; }
+            more.secret[i] = (uint8_t)(a << 4 | b);
+        }
+        more.key_len = n / 2;
+        strcpy(more.label, "private "); memcpy(more.label + 8, v, 8); strcpy(more.label + 16, "...");
+        return true;
+    }
+    more.key_len = 0;
+    return false;
+}
+

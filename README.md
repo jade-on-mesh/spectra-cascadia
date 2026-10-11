@@ -56,6 +56,8 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | Neighbours: 128 kept (upstream 50), `discover.neighbors`, `neighbor.remove` | ✓ (v2.5) |
 | Admins stay logged in across reboots; `setperm`, `get acl` (USB) | ✓ (v2.5) |
 | `region def`, `region load` (indented import) | ✓ (v2.5) |
+| Alerts to a channel (low battery, shutdown, restarts): `set alert.channel #name`, `set alerts on/off`, `alert test` | ✓ (v2.6) |
+| `flood.ratelimit`: cap floods per minute from one source | ✓ (v2.6) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**
