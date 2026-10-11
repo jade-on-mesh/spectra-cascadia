@@ -315,7 +315,7 @@ static int xl_request(XlClient* c, uint32_t ts, const uint8_t* req, int len) {
             return p - xl_reply;
         }
         case REQ_TYPE_GET_OWNER_INFO:
-            return 4 + sprintf((char*)p, "%s\n%s\n", FW_VERSION, cfg.name);
+            return 4 + sprintf((char*)p, "%s\n%s\n%s", FW_VERSION, cfg.name, app.owner_info);
         case REQ_TYPE_KEEP_ALIVE:
         default:
             return 0;
@@ -328,7 +328,7 @@ static int xl_anon_query(uint8_t type, uint32_t ts, const uint8_t* data) {
     memcpy(xl_reply + 4, &now, 4);
     char* t = (char*)xl_reply + 8;
     if (type == ANON_REQ_TYPE_BASIC) { xl_reply[8] = cfg.repeat ? 0 : 0x80; return 9; }
-    if (type == ANON_REQ_TYPE_OWNER) return 8 + sprintf(t, "%s\n", cfg.name);
+    if (type == ANON_REQ_TYPE_OWNER) return 8 + sprintf(t, "%s\n%s", cfg.name, app.owner_info);
     if (type == ANON_REQ_TYPE_REGIONS) {
         region_list(t, 1, false);
         if (!strcmp(t, "-none-")) *t = 0;

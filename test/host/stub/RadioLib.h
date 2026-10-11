@@ -41,6 +41,9 @@ struct SX1262 {
   float getSNR() { return 0; }
   float getRSSI() { return 0; }
   int16_t setOutputPower(int) { return 0; }
+  bool boosted = false; int sleeps = 0;
+  int16_t setRxBoostedGainMode(bool b, bool = true) { boosted = b; return 0; }
+  int16_t sleep(bool = true) { sleeps++; return 0; }
   int last_cr = 5; int16_t setCodingRate(int c) { last_cr = c; return 0; }
 protected:
   uint32_t getPacketStatus() { return 0; }

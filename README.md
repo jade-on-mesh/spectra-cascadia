@@ -37,7 +37,7 @@ next to a known-good MeshCore repeater before deploying.
 
 ### v2.4: Spectra-Cascadia, and the XL build (log in from the MeshCore app)
 
-The firmware is now called **Spectra-Cascadia** (`ver` → `Spectra-Cascadia v2.4.0`; new
+The firmware is now called **Spectra-Cascadia** (`ver` → `Spectra-Cascadia v2.4.x`; new
 nodes default to the name `Spectra-XXXX`). Saved names are not changed.
 
 Most STM32F103**C8** chips have 128 KB of flash, although they report 64 KB. The **XL build**
@@ -51,6 +51,7 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | Telemetry (voltage + MCU temperature, Cayenne LPP) | ✓ |
 | Neighbours (zero-hop repeater adverts heard: key, last heard, SNR) | ✓ (last 8) |
 | Command line: every USB command, plus `clock sync` (sets time from the phone) | ✓ (admin only) |
+| Repeater settings screen (name, radio, power, location, adverts, flood max, delays, duty cycle, owner info, RX gain, interference threshold, AGC reset, …) | ✓ (v2.4.1) |
 | Access list, owner info, anonymous clock/owner/regions queries | ✓ |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 

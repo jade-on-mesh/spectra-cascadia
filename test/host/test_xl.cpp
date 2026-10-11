@@ -249,7 +249,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.4.0") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.4.1") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -296,6 +296,51 @@ int main() {
       Pkt p; uint8_t d[64]; int m = open_reply(last_q(), s, p, d);
       uint32_t tag, now; memcpy(&tag, d, 4); memcpy(&now, d + 4, 4);
       CHECK(m >= 9 && p.route == ROUTE_DIRECT && p.path[0] == 0x42 && tag == ts && now == clock_now(), "anonymous clock query"); }
+
+
+    // ── the app's settings screen: "XX|" tags reflected, every key it reads answers
+    { auto app_cmd = [&](const char* c) { std::string t = std::string("3F|") + c; std::string r = rcli(a, t.c_str(), 1);
+                                          return r.compare(0, 3, "3F|") == 0 ? r.substr(3) : std::string("<no tag> ") + r; };
+      CHECK(app_cmd("get name") == "> Hilltop", "app tag: '3F|get name' -> '3F|> Hilltop'");
+      CHECK(app_cmd("erase") == "Error: USB console only", "app tag can't smuggle erase past the USB-only check");
+      CHECK(app_cmd("get prv.key") == "Error: USB console only", "app tag can't read the private key");
+      const char* keys[] = { "name", "radio", "tx", "repeat", "allow.read.only", "radio.rxgain", "multi.acks", "owner.info",
+                             "lat", "lon", "loop.detect", "dutycycle", "advert.interval", "flood.advert.interval", "flood.max",
+                             "path.hash.mode", "txdelay", "direct.txdelay", "int.thresh", "agc.reset.interval" };
+      int good = 0;
+      for (const char* k : keys) { std::string r = app_cmd((std::string("get ") + k).c_str()); if (r.compare(0, 1, ">") == 0) good++; else printf("      get %s -> %s\n", k, r.c_str()); }
+      CHECK(good == 20, "all 20 settings-screen keys answer '> value'");
+      CHECK(app_cmd("get dutycycle") == "> 50.0%", "dutycycle derived from af (af 1.0 = 50%)");
+      CHECK(app_cmd("set dutycycle 25").find("OK - 25.0%") == 0 && cli("get af") == "> 3", "set dutycycle 25 -> af 3");
+      CHECK(app_cmd("set owner.info Jade|CascadiaMesh") == "OK" && app_cmd("get owner.info") == "> Jade|CascadiaMesh",
+            "owner.info round trip ('|' = newline)");
+      CHECK(!strcmp(app.owner_info, "Jade\nCascadiaMesh"), "owner.info stored with a newline");
+      CHECK(app_cmd("set radio.rxgain on") == "OK" && radio.boosted && app_cmd("get radio.rxgain") == "> on", "radio.rxgain on applies boosted gain");
+      CHECK(app_cmd("set int.thresh 14") == "OK" && app.int_thresh == 14, "int.thresh");
+      CHECK(app_cmd("set agc.reset.interval 30") == "OK - interval rounded to 28", "agc.reset.interval rounds to 4 s like upstream");
+      CHECK(app_cmd("set allow.read.only on") == "OK" && app_cmd("set multi.acks 1") == "OK", "allow.read.only / multi.acks stored");
+      CHECK(app_cmd("set lat 47.6062") == "OK" && app_cmd("get lat") == "> 47.6062", "lat round trip");
+      CHECK(app_cmd("set radio 910.525,62.5,7,5").find("OK") == 0, "set radio in the app's format");
+      CHECK(app_cmd("neighbors").find(":") == 8, "neighbors CLI: key:secs:snr");
+      setup();
+      CHECK(!strcmp(app.owner_info, "Jade\nCascadiaMesh") && app.rxgain && radio.boosted && app.agc_s == 28 && app.int_thresh == 14,
+            "app settings survive reboot (rx gain re-applied)");
+      xl_init();
+      login(a, "swordfish", ts_now++, false); clearq(); }
+
+    // AGC reset fires on schedule
+    { int s0 = radio.sleeps; fake_ms += 29000; loop(); CHECK(radio.sleeps == s0 + 1, "agc.reset.interval: radio warm-reset on schedule"); clearq(); }
+
+    // owner info in the anonymous owner query
+    { Client s; mk_client(s, 23);
+      uint32_t ts = ts_now++; uint8_t data[16]; memcpy(data, &ts, 4); data[4] = ANON_REQ_TYPE_OWNER; data[5] = 0;
+      uint8_t pl[120]; pl[0] = own_pubkey[0]; memcpy(pl + 1, s.pub, 32);
+      int pn = 33 + c_enc(s.ss, pl + 33, data, 6);
+      uint8_t pk[200]; int n = mk_pkt(pk, (PT_ANON_REQ << 2) | ROUTE_DIRECT, NULL, 0, pl, pn);
+      clearq(); on_receive(pk, n, 20);
+      Pkt p; uint8_t d[200]; int m = open_reply(last_q(), s, p, d);
+      d[m > 0 ? m : 0] = 0;
+      CHECK(m > 8 && !strncmp((char*)d + 8, "Hilltop\nJade\nCascadiaMesh", 25), "anonymous owner query: name + owner info"); clearq(); }
 
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);

@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.4.0
+ * Version: 2.4.1
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -39,7 +39,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v2.4.0"
+#define FW_VERSION "v2.4.1"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -241,6 +241,23 @@ static ConfigAuth auth;
 static_assert(sizeof(ConfigAuth) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t auth_checksum(const ConfigAuth& a) { return fnv_words(&a, offsetof(ConfigAuth, check) / 4); }
+
+// XL: the remaining settings the app's repeater settings screen reads and writes.
+#define APP_MAGIC 0x324F5053UL   // "SPO2"
+struct ConfigApp {
+    uint32_t magic;
+    char     owner_info[120];                 // owner.info ('|' on the wire = newline)
+    uint8_t  allow_ro, multi_acks, rxgain;    // allow.read.only / multi.acks (stored, as upstream repeaters) / radio.rxgain
+    int8_t   int_thresh;                      // int.thresh dB above noise floor = channel busy (0 = off)
+    uint16_t agc_s;                           // agc.reset.interval seconds (0 = off)
+    uint16_t pad;
+    uint32_t check;
+};
+static ConfigApp app;
+#define APP_ADDR (AUTH_ADDR + sizeof(ConfigAuth))
+static_assert(sizeof(ConfigApp) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t app_checksum(const ConfigApp& a) { return fnv_words(&a, offsetof(ConfigApp, check) / 4); }
 #endif
 
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
@@ -286,7 +303,7 @@ static void led(bool on) { digitalWrite(PIN_LED, on ? HIGH : LOW); }
 static const char* skip_ws(const char* s) { while (*s == ' ') s++; return s; }
 
 // Tiny sprintf replacement (newlib's printf costs ~1.8 KB of the 62 KB budget).
-// Supports %s %c %d %u %ld %lu and a zero-pad width digit (%02d). Returns length.
+// Supports %s %c %d %u %ld %lu %% and a zero-pad width digit (%02d). Returns length.
 #include <stdarg.h>
 static int fmtx(char* out, const char* f, ...) {
     va_list ap;
@@ -295,6 +312,7 @@ static int fmtx(char* out, const char* f, ...) {
     while (*f) {
         if (*f != '%') { *o++ = *f++; continue; }
         f++;
+        if (*f == '%') { *o++ = *f++; continue; }
         int width = 0;
         if (*f == '0') f++;
         while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0');
@@ -387,6 +405,10 @@ static void cfg_save(void) {
     w = (const uint32_t*)&auth;
     for (unsigned i = 0; i < sizeof(ConfigAuth) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, AUTH_ADDR + i * 4, w[i]);
+    app.check = app_checksum(app);
+    w = (const uint32_t*)&app;
+    for (unsigned i = 0; i < sizeof(ConfigApp) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, APP_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
 }
@@ -731,6 +753,9 @@ static bool radio_init(void) {
     uint32_t sym_us = (1000000UL << cfg.sf) / cfg.bw_hz;
     preamble_ms = (uint32_t)((LORA_PREAMBLE * 4 + 17) * sym_us * 3 / 8000) + 5;   // ×1.5 margin
     max_pkt_ms  = airtime_ms(255) + 50;
+#ifdef SPECTER_XL
+    if (app.rxgain) radio.setRxBoostedGainMode(true);
+#endif
     return true;
 }
 
@@ -740,6 +765,8 @@ static void rx_start(void) {
                        RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
 }
 
+static int      last_rssi = 0, last_snr4 = 0, noise_floor = 0;
+
 // Listen-before-talk: upstream CustomSX1262::isReceiving()
 static uint32_t activity_at = 0;
 static bool     header_seen = false;
@@ -748,6 +775,10 @@ static bool     header_seen = false;
 
 static bool channel_busy(uint32_t irq) {
     uint32_t now = millis();
+#ifdef SPECTER_XL
+    // int.thresh: RSSI above the noise floor counts as busy (RadioLibWrapper::isChannelActive)
+    if (app.int_thresh && noise_floor && radio.rssiInst() > noise_floor + app.int_thresh) return true;
+#endif
     if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
         radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
     } else if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
@@ -767,7 +798,6 @@ static bool channel_busy(uint32_t irq) {
 static uint32_t budget_ms = 0, budget_updated = 0;
 static uint32_t stat_tx_air_ms = 0, stat_rx_air_ms = 0, stat_rx_err = 0;
 static uint32_t stat_flood_tx = 0, stat_direct_tx = 0, stat_flood_rx = 0, stat_direct_rx = 0;
-static int      last_rssi = 0, last_snr4 = 0, noise_floor = 0;
 static uint32_t budget_max(void) { return (uint32_t)(3600000ULL * 100 / (100 + cfg.af_x100)); }
 
 static void budget_refill(void) {
@@ -1725,6 +1755,11 @@ static void clock_status(char* reply) {
                             (unsigned long)(uptime_s() - cs_last_up));
 }
 
+#ifdef SPECTER_XL
+static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts);
+#include "xl_admin.inc"
+#endif
+
 static void handle_get(const char* k, char* reply) {
     char a[16], b[16];
     const ExtKey* e = ext_find(k);
@@ -1790,8 +1825,22 @@ static void handle_get(const char* k, char* reply) {
         static const char* const ld[] = { "off", "minimal", "moderate", "strict" };
         sprintf(reply, "> %s", ld[cfg.loop_detect & 3]);
     }
+    else if (!strcmp(k, "dutycycle")) {
+        uint32_t d = (100000UL + (100UL + cfg.af_x100) / 2) / (100UL + cfg.af_x100);   // percent x10
+        sprintf(reply, "> %lu.%lu%%", (unsigned long)(d / 10), (unsigned long)(d % 10));
+    }
 #ifdef SPECTER_XL
-    else if (!strcmp(k, "guest.password")) sprintf(reply, "> %s", auth.guest_pw);
+    else if (!strcmp(k, "guest.password"))     sprintf(reply, "> %s", auth.guest_pw);
+    else if (!strcmp(k, "allow.read.only"))    sprintf(reply, "> %s", app.allow_ro ? "on" : "off");
+    else if (!strcmp(k, "radio.rxgain"))       sprintf(reply, "> %s", app.rxgain ? "on" : "off");
+    else if (!strcmp(k, "multi.acks"))         sprintf(reply, "> %d", app.multi_acks);
+    else if (!strcmp(k, "int.thresh"))         sprintf(reply, "> %d", app.int_thresh);
+    else if (!strcmp(k, "agc.reset.interval")) sprintf(reply, "> %u", app.agc_s);
+    else if (!strcmp(k, "owner.info")) {
+        char* p = reply; *p++ = '>'; *p++ = ' ';
+        for (const char* q = app.owner_info; *q; q++) *p++ = (*q == '\n') ? '|' : *q;
+        *p = 0;
+    }
 #endif
     else if (!strcmp(k, "public.key")) { strcpy(reply, "> "); to_hex(reply + 2, own_pubkey, 32); }
     else if (!strcmp(k, "prv.key"))    { strcpy(reply, "> "); to_hex(reply + 2, cfg.privkey, 32); }
@@ -1898,6 +1947,37 @@ static void handle_set(const char* cmd, char* reply) {
         }
         memcpy(cfg.privkey, key, 32);
         done = "OK, reboot to apply!";
+    } else if (!strcmp(k, "dutycycle")) {
+        if (!parse_fixed(v, 1, &x) || x < 10 || x > 1000) { strcpy(reply, "ERROR: dutycycle must be 1-100"); return; }
+        cfg.af_x100 = (uint16_t)(100000L / x - 100);
+        cfg_save();
+        uint32_t d = (100000UL + (100UL + cfg.af_x100) / 2) / (100UL + cfg.af_x100);
+        sprintf(reply, "OK - %lu.%lu%%", (unsigned long)(d / 10), (unsigned long)(d % 10));
+        return;
+#ifdef SPECTER_XL
+    } else if (!strcmp(k, "allow.read.only")) {
+        app.allow_ro = !strncmp(v, "on", 2);
+    } else if (!strcmp(k, "multi.acks")) {
+        if (!ok || iv > 1) { strcpy(reply, "Error, must be 0 or 1"); return; }
+        app.multi_acks = iv;
+    } else if (!strcmp(k, "radio.rxgain")) {
+        app.rxgain = !strncmp(v, "on", 2);
+        radio.setRxBoostedGainMode(app.rxgain);
+        rx_start();
+    } else if (!strcmp(k, "int.thresh")) {
+        if (!ok || iv > 60) { strcpy(reply, "Error, range 0-60 dB (0 = off)"); return; }
+        app.int_thresh = iv;
+    } else if (!strcmp(k, "agc.reset.interval")) {
+        if (!ok || iv > 1020) { strcpy(reply, "Error, range 0-1020 seconds"); return; }
+        app.agc_s = iv / 4 * 4;
+        cfg_save();
+        sprintf(reply, "OK - interval rounded to %u", app.agc_s);
+        return;
+    } else if (!strcmp(k, "owner.info")) {
+        char* d = app.owner_info;
+        for (; *v && d - app.owner_info < (int)sizeof(app.owner_info) - 1; v++) *d++ = (*v == '|') ? '\n' : *v;
+        *d = 0;
+#endif
     } else if (!strcmp(k, "password") || !strcmp(k, "guest.password")) {
 #ifdef SPECTER_XL
         if (strlen(v) > 15) { strcpy(reply, "Error, max 15 characters"); return; }
@@ -1957,6 +2037,22 @@ static void handle_command(char* cmd, char* reply) {
     } else if (!strcmp(cmd, "clock.sync.mesh now")) {
         if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
         else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
+#ifdef SPECTER_XL
+    } else if (!strcmp(cmd, "neighbors")) {          // upstream format: key4hex:secs_ago:snr×4, newest first
+        char* p = reply;
+        uint32_t shown = 0, up = uptime_s();
+        while (p - reply < 134) {
+            int best = -1;
+            for (int i = 0; i < XL_MAX_NEIGHB; i++)
+                if (xl_nb[i].heard_up && !(shown & (1u << i)) && (best < 0 || xl_nb[i].heard_up > xl_nb[best].heard_up)) best = i;
+            if (best < 0) break;
+            shown |= 1u << best;
+            if (p != reply) *p++ = '\n';
+            to_hex(p, xl_nb[best].pub, 4); p += 8;
+            p += sprintf(p, ":%lu:%d", (unsigned long)(up - xl_nb[best].heard_up), xl_nb[best].snr4);
+        }
+        if (p == reply) strcpy(reply, "-none-");
+#endif
     } else if (!strcmp(cmd, "clock")) {
         fmt_clock(reply, clock_now());
     } else if (!strcmp(cmd, "ver")) {
@@ -1997,14 +2093,17 @@ static void handle_command(char* cmd, char* reply) {
 }
 
 #ifdef SPECTER_XL
-static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts);
-#include "xl_admin.inc"
 
 // Over-the-air CLI (admin login): everything the USB console offers except the
 // identity/erase commands, plus upstream's "clock sync" (sets time from the app).
 static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
     while (*cmd == ' ') cmd++;
     reply[0] = 0;
+    if (strlen(cmd) > 4 && cmd[2] == '|') {     // app's "XX|" tag: reflect it on the reply (as upstream)
+        memcpy(reply, cmd, 3);
+        reply += 3; cmd += 3;
+        reply[0] = 0;
+    }
     if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4)) {
         strcpy(reply, "Error: USB console only"); return;
     }
@@ -2093,6 +2192,12 @@ void setup(void) {
         auth.magic = AUTH_MAGIC;
     }
     auth.admin_pw[15] = auth.guest_pw[15] = 0;
+    memcpy(&app, (const void*)APP_ADDR, sizeof(app));
+    if (app.magic != APP_MAGIC || app.check != app_checksum(app)) {
+        memset(&app, 0, sizeof(app));
+        app.magic = APP_MAGIC;
+    }
+    app.owner_info[sizeof(app.owner_info) - 1] = 0;
     xl_init();
 #endif
     regions_rekey();
@@ -2202,6 +2307,18 @@ void loop(void) {
     rt_service();
     txq_service(irq);
     noise_floor_sample(irq);
+#ifdef SPECTER_XL
+    // agc.reset.interval: warm-sleep the radio to reset its front end (RadioLibWrapper::resetAGC)
+    static uint32_t agc_next_ms = 0;
+    if (app.agc_s && (int32_t)(millis() - agc_next_ms) >= 0) {
+        agc_next_ms = millis() + app.agc_s * 1000UL;
+        if (!header_seen && !activity_at && !(irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID))) {
+            radio.sleep(true);
+            rx_start();
+            noise_floor = 0; nf_n = 0; nf_sum = 0;
+        }
+    }
+#endif
     battery_monitor(up);
     if ((int32_t)(up - next_tele_s) >= 0) { next_tele_s = up + TELE_IV_S; tele_sample(); }
 
