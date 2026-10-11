@@ -2,6 +2,20 @@
 
 All notable changes to SPECTER firmware are documented here.
 
+## [2.3.0-cascadia] - 2026-10-11
+
+### Added
+- `powersaving on|off`: 16 MHz core clock chosen at boot (SystemClock_Config reads the saved flag)
+- Battery voltage: VDD via VREFINT, or a PB0/PB1 divider (`battery.pin`, `battery.divider`); `get battery`
+- 7-day, 30-minute battery and temperature history: `get telemetry.volt|temp [page]`
+- Low-voltage cutoff with standby and automatic resume: `battery.cutoff`, `battery.resume`
+- Advert echo guard (6 h), counted as `advguard` in `stats`
+- Upstream-format `stats-core`, `stats-radio` (noise floor, last RSSI/SNR, airtime), `stats-packets`
+
+### Changed
+- sprintf replaced by a minimal formatter; `-fsingle-precision-constant` added (~4 KB freed)
+- Extended settings block v2 (`SPX2`): retry and clock settings reset to defaults on upgrade from v2.2
+
 ## [2.2.0-cascadia] - 2026-10-10
 
 ### Added (after mikecarper/MeshCore Halo/Keymind)

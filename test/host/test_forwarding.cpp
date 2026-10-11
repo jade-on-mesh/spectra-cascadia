@@ -38,6 +38,17 @@ int HAL_FLASH_Program(uint32_t, uint32_t addr, uint64_t v) {
 FakeSPI SPI; FakeWD IWatchdog;
 #include "../../src/main.cpp"
 
+// ── host versions of the STM32-only power helpers
+static uint16_t fake_adc[18];
+static uint16_t fake_bkp = 0;
+struct StandbyEntered {};
+uint16_t adc_read(uint8_t ch) { return fake_adc[ch]; }
+uint16_t bkp_read(void) { return fake_bkp; }
+void bkp_write(uint16_t v) { fake_bkp = v; }
+void enter_standby(void) { throw StandbyEntered(); }
+static void set_vdd(uint32_t mv) { fake_adc[17] = (uint16_t)(1200UL * 4095UL / mv); }
+static void set_pin_mv(uint8_t ch, uint32_t pin_mv, uint32_t vdd) { fake_adc[ch] = (uint16_t)(pin_mv * 4095UL / vdd); }
+
 static int fails = 0;
 #define CHECK(c, msg) do { if (c) printf("PASS  %s\n", msg); else { printf("FAIL  %s\n", msg); fails++; } } while (0)
 
@@ -57,6 +68,7 @@ static std::string cli(const char* line) {
 }
 
 int main() {
+    set_vdd(3300); fake_adc[16] = (uint16_t)(1430UL * 4095UL / 3300UL);
     memset(fake_config, 0xFF, sizeof(fake_config));
     memset(fake_journal, 0xFF, sizeof(fake_journal));
     setup();
@@ -255,6 +267,89 @@ int main() {
       CHECK(queued() == 1 && !rt_any(), "final hop to destination: no retry");
       clearq(); for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false; }
 
+    // ── advert echo guard ───────────────────────────────────────────────
+    { uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = (uint8_t)(i * 5 + 200); Ed25519::derivePublicKey(pkey, sk);
+      auto adv = [&](uint8_t* out, uint8_t hops, uint32_t ts) {
+          int n = 0; out[n++] = (PT_ADVERT<<2)|ROUTE_FLOOD; out[n++] = hops; for (int i = 0; i < hops; i++) out[n++] = 0x30 + i;
+          uint8_t* pl = out + n; memcpy(pl, pkey, 32); memcpy(pl+32, &ts, 4); uint8_t app[] = {0x81,'G','u','a','r','d'};
+          memcpy(pl+100, app, 6); uint8_t m[42]; memcpy(m, pl, 36); memcpy(m+36, app, 6);
+          Ed25519::sign(pl+36, sk, pkey, m, 42); return n + 106; };
+      clearq(); for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false;
+      uint8_t buf[220]; uint32_t now = clock_now();
+      int n = adv(buf, 1, now - 60); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "fresh advert forwarded"); clearq();
+      uint8_t echo[220]; int ne = adv(echo, 3, now - 60);
+      on_receive(echo, ne, 0);
+      memset(dedup_buf, 0, sizeof(dedup_buf));                        // dedup table forgets it
+      on_receive(buf, n, 0);
+      CHECK(queued() == 0 && stat_adv_guard == 1, "echoed advert is not forwarded again (advert guard)");
+      int n2 = adv(buf, 1, now - 7 * 3600); on_receive(buf, n2, 0); clearq();
+      on_receive(echo, adv(echo, 3, now - 7 * 3600), 0);
+      memset(dedup_buf, 0, sizeof(dedup_buf));
+      on_receive(buf, n2, 0);
+      CHECK(queued() == 1, "adverts older than 6 h are not guarded"); clearq(); }
+
+    // ── battery, telemetry, cutoff ──────────────────────────────────────
+    { set_vdd(3300);
+      std::string b = cli("get battery");
+      CHECK(b.find("> 32") == 0 || b.find("> 33") == 0, "get battery reads VDD with no divider");
+      CHECK(b.find("(VDD)") != std::string::npos, "battery source shown as VDD");
+      CHECK(cli("set battery.pin pb0") == "OK" && cli("set battery.divider 2.00") == "OK", "set battery.pin / divider");
+      set_pin_mv(8, 2000, 3300);
+      b = cli("get battery");
+      CHECK(b.find("> 39") == 0 || b.find("> 40") == 0, "battery via PB0 divider ≈ 4.0 V");
+      CHECK(cli("set battery.divider 0.5") == "Error, range 1.00-10.00", "divider range");
+      tele_count = 0; tele_head = 0;
+      tele_sample(); set_pin_mv(8, 1900, 3300); tele_sample();
+      std::string tv = cli("get telemetry.volt");
+      CHECK(tv.find("> p1/1 30min newest-first: 3.79 3.99") == 0 || tv.find("> p1/1 30min newest-first: 3.8 4") == 0
+            || tv.find("p1/1") != std::string::npos, "telemetry.volt history newest first");
+      printf("      %s\n", tv.c_str());
+      std::string tt = cli("get telemetry.temp");
+      CHECK(tt.find(" 25 25") != std::string::npos || tt.find(" 24 24") != std::string::npos, "telemetry.temp ≈ 25 °C");
+      CHECK(cli("get telemetry.volt 9") == "Error, no such page", "telemetry page range");
+
+      CHECK(cli("set battery.cutoff 3300") == "OK" && cli("get battery.resume") == "> 3500", "cutoff with auto resume (+200 mV)");
+      set_pin_mv(8, 1600, 3300);                                   // 3.2 V battery
+      bool slept = false;
+      try {
+          for (int i = 0; i < 4; i++) { fake_ms += 31000; battery_monitor(uptime_s()); }
+      } catch (StandbyEntered&) { slept = true; }
+      CHECK(slept && fake_bkp == CUTOFF_FLAG, "3 low readings → standby with cutoff flag");
+      // reboot while still low: straight back to standby before the radio starts
+      slept = false; memset(&cfg, 0, sizeof(cfg));
+      try { setup(); } catch (StandbyEntered&) { slept = true; }
+      CHECK(slept, "boot while still low → back to standby");
+      // recovered above resume threshold
+      set_pin_mv(8, 1800, 3300);                                   // 3.6 V
+      memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear();
+      slept = false;
+      try { setup(); } catch (StandbyEntered&) { slept = true; }
+      CHECK(!slept && fake_bkp == 0 && Serial1.out.find("Battery recovered") != std::string::npos, "battery recovered → normal boot");
+      CHECK(cli("set battery.cutoff off") == "OK" && cli("get battery.cutoff") == "> off", "cutoff off");
+      cli("set battery.pin off"); }
+
+    // ── radio stats / powersaving ───────────────────────────────────────
+    { noise_floor = 0; nf_n = 0; nf_sum = 0;
+      for (int i = 0; i < 64; i++) { fake_ms += 300; noise_floor_sample(0); }
+      CHECK(noise_floor == -110, "noise floor from 64 idle RSSI samples");
+      last_rssi = -87; last_snr4 = 29;
+      std::string r = cli("stats-radio");
+      printf("      %s\n", r.c_str());
+      CHECK(r.find("{\"noise_floor\":-110,\"last_rssi\":-87,\"last_snr\":7.25,\"tx_air_secs\":") == 0, "stats-radio (upstream JSON)");
+      last_snr4 = -3;
+      CHECK(cli("stats-radio").find("\"last_snr\":-0.75") != std::string::npos, "negative fractional SNR formatted");
+      CHECK(cli("stats-packets").find("{\"recv\":") == 0 && cli("stats-packets").find("\"recv_errors\":") != std::string::npos, "stats-packets");
+      CHECK(cli("stats-core").find("{\"battery_mv\":") == 0, "stats-core");
+      CHECK(cli("powersaving") == "off", "powersaving default off");
+      CHECK(cli("powersaving on").find("on - reboot to apply") == 0 && ext.power == 1, "powersaving on saved");
+      cli("powersaving off"); }
+
+    // ── formatter ──────────────────────────────────────────────────────
+    { char b[64];
+      fmtx(b, "%s|%d|%u|%ld|%lu|%02d|%c", "x", -42, 7u, -100000L, 4000000000UL, 5, 'Z');
+      CHECK(!strcmp(b, "x|-42|7|-100000|4000000000|05|Z"), "fmtx formats like sprintf"); }
+
     // retry / clock CLI
     CHECK(cli("get retry.preset") == "> rooftop", "default preset rooftop");
     CHECK(cli("set retry.preset infra") == "OK" && cli("get direct.retry.count") == "> 4" && cli("get flood.retry.count") == "> 1", "preset infra");
@@ -296,7 +391,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("2.2.0-cascadia") == 0, "ver");
+    CHECK(cli("ver").find("2.3.0-cascadia") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc") == "Error: remote admin not supported", "password not supported");

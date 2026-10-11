@@ -19,9 +19,11 @@
 #define RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED 0x4
 #define RADIOLIB_SX126X_IRQ_RX_DONE 0x2
 #define RADIOLIB_SX126X_IRQ_TX_DONE 0x1
-struct Module { Module(uint32_t,uint32_t,uint32_t,uint32_t,FakeSPI&) {} };
+#define RADIOLIB_SX126X_CMD_GET_RSSI_INST 0x15
+struct Module { Module(uint32_t,uint32_t,uint32_t,uint32_t,FakeSPI&) {} int16_t SPIreadStream(uint16_t, uint8_t* d, size_t) { *d = 220; return 0; } };
 struct SX1262 {
-  SX1262(Module*) {}
+  Module* m;
+  SX1262(Module* mm) : m(mm) {}
   int begin(float,float,int,int,int,int,int,float,bool) { return 0; }
   void setRfSwitchPins(int,int) {}
   void setCRC(int) {}
@@ -42,5 +44,6 @@ struct SX1262 {
   int last_cr = 5; int16_t setCodingRate(int c) { last_cr = c; return 0; }
 protected:
   uint32_t getPacketStatus() { return 0; }
+  Module* getMod() { return m; }
 public:
 };

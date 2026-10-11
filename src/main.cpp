@@ -1,6 +1,6 @@
 /*
  * SPECTER — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.2.0-cascadia
+ * Version: 2.3.0-cascadia
  *
  * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). Forwarding follows upstream
  * MeshCore (src/Mesh.cpp + examples/simple_repeater) as closely as a 20 KB-RAM,
@@ -26,7 +26,7 @@
 #include <Ed25519.h>
 #include <IWatchdog.h>
 
-#define FW_VERSION "2.2.0-cascadia"
+#define FW_VERSION "2.3.0-cascadia"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -192,7 +192,7 @@ static uint32_t cfg_checksum(const Config& c) { return fnv_words(&c, offsetof(Co
 
 // v2.2 settings live right after Config in the same flash page, with their own
 // magic/checksum, so upgrading keeps the saved name, regions and identity.
-#define EXT_MAGIC 0x31585053UL   // "SPX1"
+#define EXT_MAGIC 0x32585053UL   // "SPX2"
 struct ConfigExt {
     uint32_t magic;
     uint32_t clk_drift_s;                     // clock.sync.drift
@@ -201,7 +201,11 @@ struct ConfigExt {
     uint8_t  preset;                          // retry.preset (0 infra, 1 rooftop, 2 mobile, 255 custom)
     uint8_t  d_count, d_margin, d_heard, d_cr; // direct.retry.count / margin / heard / cr (adaptive on)
     uint8_t  f_count, f_path, f_gpath, f_advert;
-    uint8_t  pad[3];
+    uint8_t  power;                           // powersaving (16 MHz core), applied at boot
+    uint8_t  bat_pin;                         // 0 = none (use VDD), 1 = PB0, 2 = PB1
+    uint8_t  pad;
+    uint16_t bat_div_x100;                    // battery.divider × 100
+    uint16_t cut_mv, resume_mv;               // battery.cutoff / battery.resume (0 = off / auto)
     uint32_t check;
 };
 static ConfigExt ext;
@@ -225,6 +229,7 @@ static void ext_defaults(void) {
     ext.magic = EXT_MAGIC;
     ext.clk_on = 1; ext.clk_samples = 9; ext.clk_drift_s = 600;
     ext.d_heard = 1; ext.d_cr = 1; ext.f_advert = 0;
+    ext.bat_div_x100 = 200;
     ext_apply_preset(1);                      // rooftop
 }
 
@@ -249,6 +254,40 @@ static uint32_t rnd_range(uint32_t lo, uint32_t hi) {
 static void led(bool on) { digitalWrite(PIN_LED, on ? HIGH : LOW); }
 
 static const char* skip_ws(const char* s) { while (*s == ' ') s++; return s; }
+
+// Tiny sprintf replacement (newlib's printf costs ~1.8 KB of the 62 KB budget).
+// Supports %s %c %d %u %ld %lu and a zero-pad width digit (%02d). Returns length.
+#include <stdarg.h>
+static int fmtx(char* out, const char* f, ...) {
+    va_list ap;
+    va_start(ap, f);
+    char* o = out;
+    while (*f) {
+        if (*f != '%') { *o++ = *f++; continue; }
+        f++;
+        int width = 0;
+        if (*f == '0') f++;
+        while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0');
+        bool lng = (*f == 'l');
+        if (lng) f++;
+        char c = *f++;
+        if (c == 's') { const char* str = va_arg(ap, const char*); while (*str) *o++ = *str++; continue; }
+        if (c == 'c') { *o++ = (char)va_arg(ap, int); continue; }
+        unsigned long v;
+        if (c == 'd') {
+            long sv = lng ? va_arg(ap, long) : va_arg(ap, int);
+            if (sv < 0) { *o++ = '-'; v = (unsigned long)(-sv); } else v = (unsigned long)sv;
+        } else v = lng ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int);
+        char tmp[11]; int n = 0;
+        do { tmp[n++] = '0' + v % 10; v /= 10; } while (v);
+        while (n < width) tmp[n++] = '0';
+        while (n) *o++ = tmp[--n];
+    }
+    *o = 0;
+    va_end(ap);
+    return (int)(o - out);
+}
+#define sprintf fmtx
 
 // Parse "[-]123.456" into an integer scaled by 10^dec. Returns false on junk.
 static bool parse_fixed(const char* s, int dec, int32_t* out) {
@@ -586,10 +625,34 @@ class Radio : public SX1262 {
 public:
     Radio(Module* m) : SX1262(m) {}
     uint32_t packetStatus() { return getPacketStatus(); }
+    int rssiInst() { uint8_t r = 0; getMod()->SPIreadStream(RADIOLIB_SX126X_CMD_GET_RSSI_INST, &r, 1); return -(int)r / 2; }
 };
 Radio radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
 
 #if defined(ARDUINO_ARCH_STM32)
+// Core clock is chosen before setup() runs, from the saved powersaving flag:
+//   off → 64 MHz (HSI/2 × 16, stock)   on → 16 MHz (HSI/2 × 4)
+// Sleeping between polls at 16 MHz draws roughly a quarter of what it does at 64 MHz.
+extern "C" void SystemClock_Config(void) {
+    const ConfigExt* e = (const ConfigExt*)(CONFIG_ADDR + sizeof(Config));
+    bool low = e->magic == EXT_MAGIC && e->check == fnv_words(e, offsetof(ConfigExt, check) / 4) && e->power;
+    RCC_OscInitTypeDef osc = {};
+    RCC_ClkInitTypeDef clk = {};
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+    osc.PLL.PLLMUL = low ? RCC_PLL_MUL4 : RCC_PLL_MUL16;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = low ? RCC_HCLK_DIV1 : RCC_HCLK_DIV2;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, low ? FLASH_LATENCY_0 : FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+}
+
 // We never use the LR-FHSS modem. Defining these members here keeps the linker
 // from pulling RadioLib's SX126x_LR_FHSS object (~1.8 KB) into the 62 KB image.
 int16_t SX126x::buildLRFHSSPacket(const uint8_t*, size_t, uint8_t*, size_t*, size_t*, size_t*) { return RADIOLIB_ERR_UNSUPPORTED; }
@@ -656,6 +719,9 @@ static bool channel_busy(uint32_t irq) {
 
 // Airtime budget (Dispatcher::updateTxBudget, 1-hour window); duty = 1/(1+af)
 static uint32_t budget_ms = 0, budget_updated = 0;
+static uint32_t stat_tx_air_ms = 0, stat_rx_air_ms = 0, stat_rx_err = 0;
+static uint32_t stat_flood_tx = 0, stat_direct_tx = 0, stat_flood_rx = 0, stat_direct_rx = 0;
+static int      last_rssi = 0, last_snr4 = 0, noise_floor = 0;
 static uint32_t budget_max(void) { return (uint32_t)(3600000ULL * 100 / (100 + cfg.af_x100)); }
 
 static void budget_refill(void) {
@@ -683,6 +749,7 @@ static bool transmit(const uint8_t* buf, int len, uint8_t cr) {
     if (cr && cr != cfg.cr) radio.setCodingRate(cfg.cr);
     led(false);
     budget_ms = (budget_ms > toa) ? budget_ms - toa : 0;
+    stat_tx_air_ms += toa;
     activity_at = 0; header_seen = false;
     rx_start();
     if (state != RADIOLIB_ERR_NONE) { LOG("TX err: "); LOGLN(state); }
@@ -866,7 +933,10 @@ static void txq_service(uint32_t irq) {
         t.due = now + (toa / 2 - budget_ms) * (100 + cfg.af_x100) / 100 + 1;
         return;
     }
-    if (transmit(t.buf, t.len, t.cr)) stat_tx++;
+    if (transmit(t.buf, t.len, t.cr)) {
+        stat_tx++;
+        if ((t.buf[0] & 3) == ROUTE_FLOOD || (t.buf[0] & 3) == ROUTE_TRANSPORT_FLOOD) stat_flood_tx++; else stat_direct_tx++;
+    }
     t.used = false;
     if (t.rslot >= 0 && rt[t.rslot].used) {          // start this retry slot's echo window
         rt[t.rslot].armed = true;
@@ -952,6 +1022,40 @@ static bool advert_verify(const uint8_t* payload, int plen, uint8_t hops) {
 //  Forwarding (Mesh::onRecvPacket + simple_repeater::allowPacketForward)
 // ═════════════════════════════════════════════════════════════════════════════
 static uint8_t out_buf[MAX_PKT];
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Advert echo guard (after mikecarper/MeshCore): once a downstream echo shows an
+//  advert we forwarded went further, never forward that exact advert again while
+//  its signed timestamp is under 6 h old — even after the dedup table forgets it.
+// ═════════════════════════════════════════════════════════════════════════════
+#define AG_SLOTS 32
+#define AG_WINDOW_S (6UL * 3600UL)
+struct AdvGuard { uint8_t h[8]; uint8_t hops, echoed; uint32_t up; };
+static AdvGuard ag[AG_SLOTS];
+static uint32_t stat_adv_guard = 0;
+
+static AdvGuard* ag_find(const uint8_t h[8]) {
+    for (int i = 0; i < AG_SLOTS; i++) if (ag[i].hops && !memcmp(ag[i].h, h, 8)) return &ag[i];   // hops ≥ 1 marks a used slot
+    return NULL;
+}
+static void ag_add(const uint8_t h[8], uint8_t hops, uint32_t adv_ts) {
+    uint32_t now = clock_now();
+    if (adv_ts + AG_WINDOW_S < now || ag_find(h)) return;
+    int s = 0;                                   // replace: empty, else oldest un-echoed, else oldest
+    for (int i = 1; i < AG_SLOTS; i++) {
+        if (!ag[s].hops) break;
+        if (!ag[i].hops || (ag[i].echoed < ag[s].echoed) || (ag[i].echoed == ag[s].echoed && ag[i].up < ag[s].up)) s = i;
+    }
+    memcpy(ag[s].h, h, 8); ag[s].hops = hops; ag[s].echoed = 0; ag[s].up = uptime_s();
+}
+static void ag_echo(const uint8_t h[8], uint8_t hops) {
+    AdvGuard* g = ag_find(h);
+    if (g && hops > g->hops && !g->echoed) { g->echoed = 1; g->up = uptime_s(); }
+}
+static bool ag_blocked(const uint8_t h[8]) {
+    AdvGuard* g = ag_find(h);
+    return g && g->echoed && uptime_s() - g->up < AG_WINDOW_S;
+}
 
 static bool rt_any(void) { for (int i = 0; i < RT_SLOTS; i++) if (rt[i].used) return true; return false; }
 
@@ -1077,7 +1181,10 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
     packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
     if (p.hash_count) rr_note(p.path + (p.hash_count - 1) * p.hash_size, p.hash_size, snr4);
-    if (was_seen(h)) return rt_echo(h, false, p.hash_count) ? "echo" : "dedup";
+    if (was_seen(h)) {
+        if (p.ptype == PT_ADVERT) ag_echo(h, p.hash_count);
+        return rt_echo(h, false, p.hash_count) ? "echo" : "dedup";
+    }
     if (!cfg.repeat) return "repeat off";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
     if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
@@ -1100,6 +1207,7 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
 
     if (!flood_type_ok(p)) return "type";
     mark_seen(h);
+    if (p.ptype == PT_ADVERT && ag_blocked(h)) { stat_adv_guard++; return "advert guard"; }
 
     if (p.ptype == PT_ADVERT && !advert_verify(p.payload, p.payload_len, p.hash_count)) return "advert sig";
 
@@ -1112,6 +1220,7 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
     int n = build(out_buf, p.header, p.tc, new_len, newpath, pbytes + p.hash_size, p.payload, p.payload_len);
     if (n < 0) return "too big";
     int q = txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100));
+    if (p.ptype == PT_ADVERT) { uint32_t ts; memcpy(&ts, p.payload + 32, 4); ag_add(h, p.hash_count + 1, ts); }
     rt_create(h, q, false, p.hash_count + 1, flood_retry_count(p), 0);
     return NULL;
 }
@@ -1120,8 +1229,8 @@ static void on_receive(const uint8_t* d, int len, int8_t snr4) {
     Pkt p;
     const char* why;
     if (!parse(d, len, p)) why = "malformed";
-    else if (p.route == ROUTE_DIRECT || p.route == ROUTE_TRANSPORT_DIRECT) why = handle_direct(p, snr4);
-    else why = handle_flood(p, snr4);
+    else if (p.route == ROUTE_DIRECT || p.route == ROUTE_TRANSPORT_DIRECT) { stat_direct_rx++; why = handle_direct(p, snr4); }
+    else { stat_flood_rx++; why = handle_flood(p, snr4); }
     if (why) { stat_drop++; LOG("  drop: "); LOGLN(why); }
     else     { stat_fwd++;  LOGLN("  fwd"); }
 }
@@ -1168,6 +1277,142 @@ static void send_advert(bool flood) {
     }
     txq_push(out_buf, n, 3, 0);
     LOGLN(flood ? "ADVERT flood" : "ADVERT zero-hop");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Power: ADC (battery / VDD / temperature), low-voltage cutoff, standby
+// ═════════════════════════════════════════════════════════════════════════════
+#define CUTOFF_FLAG 0xC0FF          // kept in backup register DR1 across standby resets
+#if defined(ARDUINO_ARCH_STM32)
+static bool adc_ready = false;
+static uint16_t adc_read(uint8_t ch) {            // direct registers: no HAL ADC needed
+    if (!adc_ready) {
+        RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_ADCPRE) | RCC_CFGR_ADCPRE_DIV6;   // ADC clock ≤ 14 MHz
+        RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+        ADC1->SMPR1 = 0x00FFFFFF;                  // 239.5-cycle sampling for all channels
+        ADC1->SMPR2 = 0x3FFFFFFF;
+        ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_TSVREFE;
+        delay(2);
+        ADC1->CR2 |= ADC_CR2_RSTCAL; while (ADC1->CR2 & ADC_CR2_RSTCAL) {}
+        ADC1->CR2 |= ADC_CR2_CAL;    while (ADC1->CR2 & ADC_CR2_CAL) {}
+        adc_ready = true;
+    }
+    uint32_t sum = 0;
+    ADC1->SQR3 = ch;
+    for (int i = 0; i < 4; i++) {
+        ADC1->CR2 |= ADC_CR2_ADON;                 // ADON again = start conversion
+        uint32_t t0 = millis();
+        while (!(ADC1->SR & ADC_SR_EOC)) if (millis() - t0 > 5) return 0;
+        sum += ADC1->DR;
+    }
+    return sum / 4;
+}
+static void bkp_enable(void) {
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;
+}
+static uint16_t bkp_read(void)        { bkp_enable(); return BKP->DR1; }
+static void     bkp_write(uint16_t v) { bkp_enable(); BKP->DR1 = v; }
+static void enter_standby(void) {                 // woken only by the watchdog reset (~26 s)
+    IWatchdog.set(26000000);
+    IWatchdog.reload();
+    Serial1.flush();
+    bkp_enable();
+    PWR->CR |= PWR_CR_CWUF | PWR_CR_PDDS;
+    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    while (true) __WFI();
+}
+#else
+uint16_t adc_read(uint8_t ch);                    // host tests provide these
+uint16_t bkp_read(void);
+void     bkp_write(uint16_t v);
+void     enter_standby(void);
+#endif
+
+// Put the SX1262 in cold sleep with raw SPI (works before/without radio.begin()).
+static void radio_cold_sleep(void) {
+    SPI.begin();
+    pinMode(PIN_NSS, OUTPUT); digitalWrite(PIN_NSS, HIGH);
+    digitalWrite(PIN_TXEN, LOW); digitalWrite(PIN_RXEN, LOW);
+    uint32_t t0 = millis();
+    while (digitalRead(PIN_BUSY) && millis() - t0 < 20) {}
+    digitalWrite(PIN_NSS, LOW);
+    SPI.transfer(0x84); SPI.transfer(0x00);       // SetSleep, cold start
+    digitalWrite(PIN_NSS, HIGH);
+}
+
+static uint32_t vdd_mv(void) {
+    uint32_t r = adc_read(17);                     // VREFINT ≈ 1.20 V
+    return r ? 1200UL * 4095UL / r : 0;
+}
+// Battery mV: from the PB0/PB1 divider if configured, else the chip's own supply (VDD).
+static uint32_t battery_mv(void) {
+    uint32_t vdd = vdd_mv();
+    if (!ext.bat_pin || !vdd) return vdd;
+    return (uint32_t)adc_read(ext.bat_pin == 1 ? 8 : 9) * vdd / 4095UL * ext.bat_div_x100 / 100UL;
+}
+static int temp_c(void) {                         // internal sensor: V25 ≈ 1.43 V, 4.3 mV/°C (±several °C)
+    int32_t vs = (int32_t)((uint32_t)adc_read(16) * vdd_mv() / 4095UL);
+    return (int)((1430 - vs) * 10 / 43 + 25);
+}
+
+// Telemetry history: one sample every 30 min, 7 days, newest overwrites oldest.
+#define TELE_N 336
+#define TELE_IV_S 1800UL
+static uint16_t tele_mv[TELE_N];
+static int8_t   tele_t[TELE_N];
+static uint16_t tele_head = 0, tele_count = 0;
+static uint32_t next_tele_s = 60, next_batt_s = 30;
+static uint8_t  low_count = 0;
+static uint32_t last_batt_mv = 0;
+
+static void tele_sample(void) {
+    tele_mv[tele_head] = (uint16_t)battery_mv();
+    tele_t[tele_head] = (int8_t)temp_c();
+    tele_head = (tele_head + 1) % TELE_N;
+    if (tele_count < TELE_N) tele_count++;
+}
+
+static uint16_t resume_mv(void) { return ext.resume_mv ? ext.resume_mv : ext.cut_mv + 200; }
+
+static void cutoff_shutdown(uint32_t mv) {
+    Serial1.print("Battery low ("); Serial1.print(mv); Serial1.println(" mV): sleeping until it recovers");
+    journal_write(clock_now(), j_last_flood_ts);
+    bkp_write(CUTOFF_FLAG);
+    radio_cold_sleep();
+    digitalWrite(PIN_LED, LOW);
+    enter_standby();
+}
+
+// Every 30 s: three consecutive readings under battery.cutoff → standby.
+static void battery_monitor(uint32_t up) {
+    if ((int32_t)(up - next_batt_s) < 0) return;
+    next_batt_s = up + 30;
+    last_batt_mv = battery_mv();
+    if (!ext.cut_mv || !last_batt_mv) { low_count = 0; return; }
+    if (last_batt_mv < ext.cut_mv) { if (++low_count >= 3) cutoff_shutdown(last_batt_mv); }
+    else low_count = 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Radio stats: noise floor (as upstream RadioLibWrapper: 64 idle RSSI samples,
+//  ignoring readings more than 14 dB above the current floor)
+// ═════════════════════════════════════════════════════════════════════════════
+static uint8_t  nf_n = 0;
+static int32_t  nf_sum = 0;
+static uint32_t nf_next_ms = 0;
+static void noise_floor_sample(uint32_t irq) {
+    if ((int32_t)(millis() - nf_next_ms) < 0 || header_seen ||
+        (irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID))) return;
+    nf_next_ms = millis() + 250;
+    int r = radio.rssiInst();
+    if (noise_floor && r >= noise_floor + 14) return;
+    nf_sum += r;
+    if (++nf_n >= 64) {
+        noise_floor = nf_sum / 64;
+        if (noise_floor < -120) noise_floor = -120;
+        nf_n = 0; nf_sum = 0;
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1414,6 +1659,28 @@ static void handle_get(const char* k, char* reply) {
     if (e) { ext_get(e, reply); return; }
     if (!strcmp(k, "retry.preset")) { sprintf(reply, "> %s", ext.preset < 3 ? preset_names[ext.preset] : "custom"); return; }
     if (!strcmp(k, "clock.sync.status")) { clock_status(reply); return; }
+    if (!strcmp(k, "battery")) {
+        sprintf(reply, "> %lu mV (%s)", (unsigned long)battery_mv(), ext.bat_pin ? (ext.bat_pin == 1 ? "PB0" : "PB1") : "VDD");
+        return;
+    }
+    if (!strcmp(k, "battery.pin")) { strcpy(reply, ext.bat_pin ? (ext.bat_pin == 1 ? "> pb0" : "> pb1") : "> off"); return; }
+    if (!strcmp(k, "battery.divider")) { sprintf(reply, "> %s", fmt_fixed(a, ext.bat_div_x100, 2)); return; }
+    if (!strcmp(k, "battery.cutoff")) { if (ext.cut_mv) sprintf(reply, "> %u", ext.cut_mv); else strcpy(reply, "> off"); return; }
+    if (!strcmp(k, "battery.resume")) { sprintf(reply, "> %u", resume_mv()); return; }
+    if (!strncmp(k, "telemetry.volt", 14) || !strncmp(k, "telemetry.temp", 14)) {
+        bool volt = k[10] == 'v';
+        int page = atoi_s(k + 14), pages = (tele_count + 19) / 20;
+        if (page < 1) page = 1;
+        if (!tele_count) { strcpy(reply, "> no samples yet"); return; }
+        if (page > pages) { strcpy(reply, "Error, no such page"); return; }
+        char* p = reply + sprintf(reply, "> p%d/%d 30min newest-first:", page, pages);
+        for (int i = (page - 1) * 20; i < tele_count && i < page * 20; i++) {
+            int idx = (tele_head + TELE_N - 1 - i) % TELE_N;
+            if (volt) p += sprintf(p, " %s", fmt_fixed(a, tele_mv[idx] / 10, 2));
+            else p += sprintf(p, " %d", tele_t[idx]);
+        }
+        return;
+    }
     if (!strcmp(k, "recent.repeater")) {
         char* p = reply; *p++ = '>';
         uint32_t up = uptime_s(), shown = 0;              // newest first, prefix:SNR(dB)
@@ -1471,6 +1738,21 @@ static void handle_set(const char* cmd, char* reply) {
 
     if (e) {
         if (!ext_set(e, v, reply)) return;
+    } else if (!strcmp(k, "battery.pin")) {
+        if (!strcmp(v, "off")) ext.bat_pin = 0; else if (!strcmp(v, "pb0")) ext.bat_pin = 1;
+        else if (!strcmp(v, "pb1")) ext.bat_pin = 2; else { strcpy(reply, "Error, use off, pb0 or pb1"); return; }
+        if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
+    } else if (!strcmp(k, "battery.divider")) {
+        if (!parse_fixed(v, 2, &x) || x < 100 || x > 1000) { strcpy(reply, "Error, range 1.00-10.00"); return; }
+        ext.bat_div_x100 = x;
+    } else if (!strcmp(k, "battery.cutoff") || !strcmp(k, "battery.resume")) {
+        uint16_t mv = 0;
+        if (strcmp(v, "off")) {
+            if (!ok || iv < 2000 || iv > 4500) { strcpy(reply, "Error, 2000-4500 mV or off"); return; }
+            mv = iv;
+        }
+        if (k[8] == 'c') ext.cut_mv = mv; else ext.resume_mv = mv;
+        if (ext.cut_mv && resume_mv() <= ext.cut_mv) { strcpy(reply, "Warning: resume must be above cutoff"); cfg_save(); return; }
     } else if (!strcmp(k, "retry.preset")) {
         int pr = 0;
         while (pr < 3 && strcmp(v, preset_names[pr]) && !(v[0] == '0' + pr && !v[1])) pr++;
@@ -1572,6 +1854,26 @@ static void handle_command(char* cmd, char* reply) {
             strcpy(reply, "OK - clock set: "); fmt_clock(reply + 16, clock_now());
         }
         else strcpy(reply, "(ERR: clock cannot go backwards)");
+    } else if (!strncmp(cmd, "powersaving", 11)) {
+        const char* v = skip_ws(cmd + 11);
+        if (!strcmp(v, "on") || !strcmp(v, "off")) {
+            ext.power = v[1] == 'n';
+            cfg_save();
+            strcpy(reply, ext.power ? "on - reboot to apply (16 MHz core)" : "off - reboot to apply");
+        } else strcpy(reply, ext.power ? "on" : "off");
+    } else if (!strcmp(cmd, "stats-core")) {
+        int q = 0; for (int i = 0; i < TXQ_SIZE; i++) q += txq[i].used;
+        sprintf(reply, "{\"battery_mv\":%lu,\"uptime_secs\":%lu,\"errors\":0,\"queue_len\":%d}",
+                (unsigned long)battery_mv(), (unsigned long)uptime_s(), q);
+    } else if (!strcmp(cmd, "stats-radio")) {
+        char sn[12];
+        sprintf(reply, "{\"noise_floor\":%d,\"last_rssi\":%d,\"last_snr\":%s,\"tx_air_secs\":%lu,\"rx_air_secs\":%lu}",
+                noise_floor, last_rssi, fmt_fixed(sn, last_snr4 * 25, 2),
+                (unsigned long)(stat_tx_air_ms / 1000), (unsigned long)(stat_rx_air_ms / 1000));
+    } else if (!strcmp(cmd, "stats-packets")) {
+        sprintf(reply, "{\"recv\":%lu,\"sent\":%lu,\"flood_tx\":%lu,\"direct_tx\":%lu,\"flood_rx\":%lu,\"direct_rx\":%lu,\"recv_errors\":%lu}",
+                (unsigned long)stat_rx, (unsigned long)stat_tx, (unsigned long)stat_flood_tx, (unsigned long)stat_direct_tx,
+                (unsigned long)stat_flood_rx, (unsigned long)stat_direct_rx, (unsigned long)stat_rx_err);
     } else if (!strcmp(cmd, "clock.sync.mesh now")) {
         if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
         else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
@@ -1595,11 +1897,11 @@ static void handle_command(char* cmd, char* reply) {
     } else if (!strcmp(cmd, "log stop")) {
         log_on = false; strcpy(reply, "   logging off");
     } else if (!strcmp(cmd, "stats")) {
-        sprintf(reply, "up=%lus rx=%lu fwd=%lu drop=%lu tx=%lu retry=%lu echo=%lu lbt=%lu budget=%lums radio=%s",
+        sprintf(reply, "up=%lus rx=%lu fwd=%lu drop=%lu tx=%lu retry=%lu echo=%lu advguard=%lu lbt=%lu bat=%lumV",
                 (unsigned long)uptime_s(), (unsigned long)stat_rx, (unsigned long)stat_fwd,
                 (unsigned long)stat_drop, (unsigned long)stat_tx, (unsigned long)stat_retry,
-                (unsigned long)stat_echo, (unsigned long)stat_lbt,
-                (unsigned long)budget_ms, radio_has_tcxo ? "tcxo" : "xtal");
+                (unsigned long)stat_echo, (unsigned long)stat_adv_guard, (unsigned long)stat_lbt,
+                (unsigned long)last_batt_mv);
     } else if (!strncmp(cmd, "password", 8)) {
         strcpy(reply, "Error: remote admin not supported");
     } else if (*cmd) {
@@ -1645,7 +1947,6 @@ void setup(void) {
     pinMode(PIN_RXEN, OUTPUT); digitalWrite(PIN_RXEN, LOW);
 
     Serial1.begin(115200);
-    delay(200);
     IWatchdog.begin(8000000);
 
     bool have_cfg = false;
@@ -1658,9 +1959,22 @@ void setup(void) {
         if (have_cfg) cfg_save();      // upgrade from v2.1: keep settings, add new defaults
     }
     regions_rekey();
+    if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
 
+    bool woke = bkp_read() == CUTOFF_FLAG;          // woke from low-battery standby?
+    if (woke) {
+        uint32_t mv = battery_mv();
+        if (ext.cut_mv && mv < resume_mv()) {        // keep this path short: it runs every ~26 s
+            Serial1.print("Battery "); Serial1.print(mv); Serial1.println(" mV: still low, back to sleep");
+            radio_cold_sleep();
+            enter_standby();
+        }
+        bkp_write(0);
+    }
+    delay(200);
     Serial1.println();
     Serial1.println("SPECTER MeshCore Repeater " FW_VERSION);
+    if (woke) Serial1.println("Battery recovered: resuming");
     if (!radio_init()) {
         while (true) { led(true); delay(100); led(false); delay(100); }   // IWDG resets & retries
     }
@@ -1686,6 +2000,8 @@ void setup(void) {
     Serial1.print(fmt_fixed(b, cfg.bw_hz, 3)); Serial1.print(","); Serial1.print(cfg.sf); Serial1.print(",");
     Serial1.print(cfg.cr); Serial1.print(" "); Serial1.print(cfg.tx_dbm); Serial1.print(" dBm ");
     Serial1.println(radio_has_tcxo ? "(tcxo)" : "(xtal)");
+    Serial1.print("Power: "); Serial1.print(SystemCoreClock / 1000000UL); Serial1.print(" MHz, battery ");
+    Serial1.print(battery_mv()); Serial1.println(" mV");
     Serial1.println("Type 'get name', 'set name <x>', 'region', 'log start' ...");
 
     budget_ms = budget_max() / 2;
@@ -1719,8 +2035,11 @@ void loop(void) {
         int rssi = -(int)(ps & 0xFF) / 2;
         activity_at = 0; header_seen = false;
         rx_start();
+        if (state != RADIOLIB_ERR_NONE) stat_rx_err++;
         if (state == RADIOLIB_ERR_NONE) {
             stat_rx++;
+            last_rssi = rssi; last_snr4 = snr4;
+            stat_rx_air_ms += airtime_ms(len);
             if (log_on) {
                 Serial1.print("RX rssi="); Serial1.print(rssi);
                 Serial1.print(" snr="); Serial1.print(snr4 / 4);
@@ -1742,6 +2061,9 @@ void loop(void) {
 
     rt_service();
     txq_service(irq);
+    noise_floor_sample(irq);
+    battery_monitor(up);
+    if ((int32_t)(up - next_tele_s) >= 0) { next_tele_s = up + TELE_IV_S; tele_sample(); }
 
     if ((int32_t)(up - next_persist_s) >= 0) {
         journal_write(clock_now(), j_last_flood_ts);

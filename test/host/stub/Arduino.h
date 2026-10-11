@@ -13,6 +13,9 @@
 #define PA3 3
 #define PA4 4
 #define PB11 27
+#define PB0 16
+#define PB1 17
+#define INPUT_ANALOG 3
 #define HEX 16
 extern uint32_t fake_ms;
 inline uint32_t millis() { return fake_ms; }
@@ -20,6 +23,8 @@ inline uint32_t micros() { return fake_ms * 1000; }
 inline void delay(uint32_t ms) { fake_ms += ms; }
 inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
+inline int digitalRead(int) { return 0; }
+static uint32_t SystemCoreClock = 64000000;
 inline int analogRead(int) { return 0; }
 inline void __WFI() {}
 inline void NVIC_SystemReset() {}

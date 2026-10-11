@@ -28,10 +28,65 @@ v2.1 adds an upstream-style **USB serial CLI** with settings stored in flash (be
 Still **not** included (no room): remote admin login, telemetry, private (`$`)
 regions, neighbour tables.
 
-**Status (v2.2):** compiles (≈61 KB of the 62 KB budget) and passes the host-side tests in
+**Status (v2.3):** compiles (≈60 KB of the 62 KB budget) and passes the host-side tests in
 `test/host/` (forwarding rules, region codes cross-checked against a Python HMAC
 reference, journal wear/rollover, serial CLI, settings persistence). **Not yet RF-tested on hardware.** Test on the bench
 next to a known-good MeshCore repeater before deploying.
+
+### v2.3: power saving, battery telemetry and cutoff, advert echo guard, radio stats
+
+**Power saving.** `powersaving on`, then `reboot`, runs the processor at 16 MHz instead of
+64 MHz. The firmware already sleeps between radio polls, and sleeping at 16 MHz draws
+roughly a quarter as much (estimated savings: about 8–12 mA; measure your board).
+Trade-off: signature checks on adverts take about 4× longer, so a burst of adverts adds a
+little latency. `powersaving` shows the current setting. The boot banner prints the active
+clock speed.
+
+**Battery voltage.** With no wiring, `get battery` reports the chip's own supply voltage
+(VDD). That only tracks the battery when you use a plain LDO regulator, such as the HT7333.
+**With a buck-boost** (TPS63020, XL63802), VDD stays at 3.3 V, so add a divider:
+
+```
+battery + ──[100k]──┬──[100k]── GND
+                    ├── PB0 (or PB1)
+                    └──[100 nF]── GND   (optional, steadies the reading)
+```
+```
+set battery.pin pb0
+set battery.divider 2.00        (2.00 for two equal resistors)
+get battery
+```
+The divider draws about 20 µA. The board's POW LED and the regulator's LED draw far more,
+so remove those LEDs on solar nodes.
+
+**Telemetry history.** Battery voltage and chip temperature are recorded every 30 minutes
+for 7 days (cleared on reboot). Use `get telemetry.volt [page]` and
+`get telemetry.temp [page]`, 20 samples per page, newest first. The temperature comes from the
+STM32's internal sensor, so it's approximate and reads a few degrees warm.
+
+**Low-voltage cutoff.** `set battery.cutoff 3300` (mV; `off` disables it). After three
+readings in a row below the cutoff, 30 s apart, the node saves its clock, puts the radio in
+cold sleep, and puts the STM32 into standby. It wakes every ~26 s, checks the voltage in a
+fraction of a second, and resumes only once the battery is above `battery.resume` (default:
+cutoff + 200 mV). Each wake-up is brief, so standby draws very little on average; the LEDs
+and the regulator dominate. Suggested values: Li-ion `3300`, LiFePO4 `2900`.
+
+**Advert echo guard.** Once a downstream echo shows an advert this node forwarded got
+further, the node won't forward that exact advert again for as long as its signed timestamp
+is under 6 hours old, even after the dedup table has forgotten it. `stats` shows the count
+as `advguard`.
+
+**Radio stats** (upstream JSON format, so existing tools can parse them):
+- `stats-radio`: `noise_floor` (average of idle RSSI samples, as upstream does it), `last_rssi`, `last_snr`, TX/RX airtime
+- `stats-packets`: received, sent, flood/direct TX and RX, receive errors
+- `stats-core`: battery mV, uptime, queue length
+
+**Making room.** v2.3 replaces `sprintf` with a tiny formatter and builds with
+`-fsingle-precision-constant`, which keeps RadioLib's double-precision math out. RadioLib's
+frequency math is single precision either way. Together these freed about 4 KB.
+
+Upgrading from v2.2 resets the retry and clock-sync settings to their defaults, because the
+extended settings block gained new fields. Name, identity, regions and radio settings are kept.
 
 ### v2.2: automatic retries and mesh clock sync
 
@@ -128,7 +183,11 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `ver`, `board`, `reboot` | |
 | `erase` | Factory reset: defaults and a **new identity** after reboot |
 | `log start` / `log stop` | Live packet log (off by default so tools see clean replies) |
-| `stats` | Uptime, packet, retry and echo counters |
+| `stats` | Uptime, packet, retry, echo and advert-guard counters, battery |
+| `stats-core`, `stats-radio`, `stats-packets` | Upstream-format JSON stats |
+| `powersaving [on\|off]` | 16 MHz core (reboot to apply) |
+| `get battery`, `get`/`set battery.pin off\|pb0\|pb1`, `battery.divider`, `battery.cutoff`, `battery.resume` | Battery reading and low-voltage cutoff |
+| `get telemetry.volt [page]`, `get telemetry.temp [page]` | 7-day, 30-minute history |
 
 Not supported (no room): remote admin login / passwords, neighbours, telemetry,
 private `$` regions, region hierarchy (parent arguments are ignored).
@@ -379,8 +438,8 @@ pio run -e specter
 ### Memory Usage
 
 ```
-RAM:   ███░░░░░░░  34.6%  (7084 / 20480 bytes)
-Flash: ██████████  98.5%  (62544 / 63488 bytes)
+RAM:   ████░░░░░░  42.4%  (8684 / 20480 bytes)
+Flash: ██████████  96.9%  (61548 / 63488 bytes)
 ```
 
 The image is capped at 62 KB (`board_upload.maximum_size`) because the top two 1 KB
