@@ -37,7 +37,7 @@ next to a known-good MeshCore repeater before deploying.
 
 ### v2.4: Spectra-Cascadia, and the XL build (log in from the MeshCore app)
 
-The firmware is now called **Spectra-Cascadia** (`ver` → `Spectra-Cascadia v2.4.x`; new
+The firmware is now called **Spectra-Cascadia** (`ver` → `Spectra-Cascadia v1.17.1.1`: the official MeshCore version it tracks, plus our release number; new
 nodes default to the name `Spectra-XXXX`). Saved names are not changed.
 
 Most STM32F103**C8** chips have 128 KB of flash, although they report 64 KB. The **XL build**

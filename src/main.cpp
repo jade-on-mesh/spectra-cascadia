@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.6.0
+ * Version: 1.17.1.1 (official MeshCore 1.17.1 + Spectra-Cascadia release 1)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -39,7 +39,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v2.6.0"
+#define FW_VERSION "v1.17.1.1"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at

@@ -259,7 +259,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v2.6.0") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.1") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");

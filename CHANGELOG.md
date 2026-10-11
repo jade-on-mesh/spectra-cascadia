@@ -2,6 +2,16 @@
 
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
+Version numbers follow the official MeshCore firmware release this one tracks
+(the first three numbers, currently 1.17.1, as on meshcore.io/flasher), plus a
+fourth number for our own releases on that base. That number resets to 1 when
+upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
+
+## [1.17.1.1] - 2026-10-11
+
+### Changed
+- Version scheme: `ver` reports `Spectra-Cascadia v1.17.1.1` (official MeshCore 1.17.1 + our release 1). Same firmware as internal 2.6.0
+
 ## [2.6.0] - 2026-10-11
 
 ### Added (XL)

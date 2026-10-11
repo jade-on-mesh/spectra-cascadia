@@ -397,7 +397,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("Spectra-Cascadia v2.6.0") == 0, "ver");
+    CHECK(cli("ver").find("Spectra-Cascadia v1.17.1.1") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc").find("XL") != std::string::npos, "password needs the XL build");
