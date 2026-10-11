@@ -39,6 +39,7 @@ struct SX1262 {
   float getSNR() { return 0; }
   float getRSSI() { return 0; }
   int16_t setOutputPower(int) { return 0; }
+  int last_cr = 5; int16_t setCodingRate(int c) { last_cr = c; return 0; }
 protected:
   uint32_t getPacketStatus() { return 0; }
 public:

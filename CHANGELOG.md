@@ -2,6 +2,21 @@
 
 All notable changes to SPECTER firmware are documented here.
 
+## [2.2.0-cascadia] - 2026-10-10
+
+### Added (after mikecarper/MeshCore Halo/Keymind)
+- Echo-cancelled automatic retries for forwarded floods and direct packets: `retry.preset`, `direct.retry.*`, `flood.retry.*`
+- Adaptive/escalating coding rate on direct retries; next-hop SNR gate from a recent-repeater table (`get recent.repeater`)
+- Mesh clock sync by consensus of signed advert timestamps: `clock.sync.mesh`, `clock.sync.samples`, `clock.sync.drift`, `clock.sync.mesh now`, `get clock.sync.status`; can correct backwards
+- `stats` shows retry and echo counts
+
+### Changed
+- Replaces v2.1's forward-only "median of 3 adverts" clock learning
+- Clock journal now resumes from the last record written, not the largest
+- Manual `time` suppresses mesh clock sync until reboot
+- New settings stored after the v2.1 config in the same page; upgrade keeps existing settings and identity
+- RadioLib LR-FHSS code stubbed out to fit the 62 KB image
+
 ## [2.1.0-cascadia] - 2026-10-09
 
 ### Added

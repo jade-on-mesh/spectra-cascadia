@@ -1,6 +1,6 @@
 /*
  * SPECTER — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.1.0-cascadia
+ * Version: 2.2.0-cascadia
  *
  * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). Forwarding follows upstream
  * MeshCore (src/Mesh.cpp + examples/simple_repeater) as closely as a 20 KB-RAM,
@@ -26,7 +26,7 @@
 #include <Ed25519.h>
 #include <IWatchdog.h>
 
-#define FW_VERSION "2.1.0-cascadia"
+#define FW_VERSION "2.2.0-cascadia"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -182,11 +182,50 @@ struct Config {
 };
 static Config cfg;
 
-static uint32_t cfg_checksum(const Config& c) {
-    const uint32_t* w = (const uint32_t*)&c;
+static uint32_t fnv_words(const void* p, unsigned words) {
+    const uint32_t* w = (const uint32_t*)p;
     uint32_t h = 0x811C9DC5UL;
-    for (unsigned i = 0; i < offsetof(Config, check) / 4; i++) { h ^= w[i]; h *= 16777619UL; }
+    for (unsigned i = 0; i < words; i++) { h ^= w[i]; h *= 16777619UL; }
     return h;
+}
+static uint32_t cfg_checksum(const Config& c) { return fnv_words(&c, offsetof(Config, check) / 4); }
+
+// v2.2 settings live right after Config in the same flash page, with their own
+// magic/checksum, so upgrading keeps the saved name, regions and identity.
+#define EXT_MAGIC 0x31585053UL   // "SPX1"
+struct ConfigExt {
+    uint32_t magic;
+    uint32_t clk_drift_s;                     // clock.sync.drift
+    uint16_t d_base_ms, d_step_ms;            // direct.retry.base / step
+    uint8_t  clk_on, clk_samples;             // clock.sync.mesh / samples
+    uint8_t  preset;                          // retry.preset (0 infra, 1 rooftop, 2 mobile, 255 custom)
+    uint8_t  d_count, d_margin, d_heard, d_cr; // direct.retry.count / margin / heard / cr (adaptive on)
+    uint8_t  f_count, f_path, f_gpath, f_advert;
+    uint8_t  pad[3];
+    uint32_t check;
+};
+static ConfigExt ext;
+static_assert(sizeof(Config) % 4 == 0 && sizeof(ConfigExt) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t ext_checksum(const ConfigExt& e) { return fnv_words(&e, offsetof(ConfigExt, check) / 4); }
+
+// retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
+static void ext_apply_preset(uint8_t pr) {
+    static const uint16_t base[3] = { 275, 175, 175 }, step[3] = { 150, 100, 50 };
+    static const uint8_t dcount[3] = { 4, 15, 15 }, margin[3] = { 15, 5, 0 };
+    static const uint8_t fcount[3] = { 1, 3, 15 }, fpath[3] = { 1, 2, 1 };
+    ext.preset = pr;
+    ext.d_base_ms = base[pr]; ext.d_step_ms = step[pr];
+    ext.d_count = dcount[pr]; ext.d_margin = margin[pr];
+    ext.f_count = fcount[pr]; ext.f_path = fpath[pr]; ext.f_gpath = 1;
+}
+
+static void ext_defaults(void) {
+    memset(&ext, 0, sizeof(ext));
+    ext.magic = EXT_MAGIC;
+    ext.clk_on = 1; ext.clk_samples = 9; ext.clk_drift_s = 600;
+    ext.d_heard = 1; ext.d_cr = 1; ext.f_advert = 0;
+    ext_apply_preset(1);                      // rooftop
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -265,11 +304,15 @@ static void flash_erase(uint32_t addr) {
 
 static void cfg_save(void) {
     cfg.check = cfg_checksum(cfg);
+    ext.check = ext_checksum(ext);
     HAL_FLASH_Unlock();
     flash_erase(CONFIG_ADDR);
     const uint32_t* w = (const uint32_t*)&cfg;
     for (unsigned i = 0; i < sizeof(Config) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CONFIG_ADDR + i * 4, w[i]);
+    w = (const uint32_t*)&ext;
+    for (unsigned i = 0; i < sizeof(ConfigExt) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CONFIG_ADDR + sizeof(Config) + i * 4, w[i]);
     HAL_FLASH_Lock();
 }
 
@@ -336,6 +379,7 @@ static int region_match(uint16_t code0, uint8_t ptype, const uint8_t* payload, i
 // ═════════════════════════════════════════════════════════════════════════════
 //  Clock — monotonic across reboots, learns forward from verified adverts
 // ═════════════════════════════════════════════════════════════════════════════
+static uint32_t airtime_ms(int len);
 static bool is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
 static const uint8_t month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
 
@@ -389,7 +433,7 @@ static bool journal_read(uint32_t* ts, uint32_t* flood_ts) {
         const volatile uint32_t* r = (const volatile uint32_t*)(JOURNAL_ADDR + i * 12);
         if (r[0] == 0xFFFFFFFFUL && r[1] == 0xFFFFFFFFUL && r[2] == 0xFFFFFFFFUL) break;
         j_next_slot = i + 1;
-        if (r[2] == ~(r[0] ^ r[1]) && (!found || r[0] >= *ts)) { *ts = r[0]; *flood_ts = r[1]; found = true; }
+        if (r[2] == ~(r[0] ^ r[1])) { *ts = r[0]; *flood_ts = r[1]; found = true; }   // last valid wins
     }
     return found;
 }
@@ -417,40 +461,93 @@ static void clock_init(void) {
     journal_write(clock_now(), j_last_flood_ts);
 }
 
-static bool clock_set_forward(uint32_t ts) {
-    uint32_t now = clock_now();
-    if (ts <= now) return ts == now;
-    clk_base += ts - now;
+static void clock_set(uint32_t ts) {
+    clk_base = ts - uptime_s();
     journal_write(clock_now(), j_last_flood_ts);
+}
+
+// ── Mesh clock sync (after mikecarper/MeshCore clock.sync.mesh, edge mode) ──
+// Signed-advert timestamps from distinct senders are collected for up to 2 h.
+// Once clock.sync.samples are fresh, the median is used if a strict majority
+// (and at least the configured count) agree within 10 minutes. The clock is
+// corrected only when it is off by more than clock.sync.drift, then sync
+// sleeps for 7 days. A manual "time" set suppresses mesh sync until reboot.
+#define CS_SLOTS      16
+#define CS_MAX_AGE_S  (2UL * 3600UL)
+#define CS_WINDOW_S   600UL
+struct ClockSample { uint32_t est, rx_up; uint8_t key[4]; };
+static ClockSample cs[CS_SLOTS];
+static uint8_t  cs_count = 0;
+static bool     cs_manual = false;
+static uint32_t cs_next_up = 0;               // uptime (s) before which sync sleeps
+static uint8_t  cs_last_agree = 0, cs_last_fresh = 0;
+static int32_t  cs_last_delta = 0;
+static uint32_t cs_last_up = 0;
+static char     cs_reason = 'w';              // w waiting, s set, k in-sync, n no-consensus, m manual, o off
+
+static bool cs_active(void) {
+    return ext.clk_on && !cs_manual && (int32_t)(uptime_s() - cs_next_up) >= 0;
+}
+
+static void cs_prune(void) {
+    uint32_t up = uptime_s();
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < cs_count; i++)
+        if (up - cs[i].rx_up <= CS_MAX_AGE_S) cs[n++] = cs[i];
+    cs_count = n;
+}
+
+// Returns true if a consensus was reached (clock set or already in sync).
+static bool clock_sync_eval(void) {
+    cs_prune();
+    cs_last_fresh = cs_count;
+    if (!cs_active()) {
+        if (!ext.clk_on) cs_reason = 'o';
+        else if (cs_manual) cs_reason = 'm';
+        else if (cs_reason != 's' && cs_reason != 'k') cs_reason = 'w';   // sleeping after a sync
+        return false;
+    }
+    if (cs_count < ext.clk_samples) { cs_reason = 'w'; return false; }
+    uint32_t up = uptime_s(), v[CS_SLOTS];
+    for (uint8_t i = 0; i < cs_count; i++) v[i] = cs[i].est + (up - cs[i].rx_up);
+    for (uint8_t i = 1; i < cs_count; i++)
+        for (uint8_t j = i; j > 0 && v[j-1] > v[j]; j--) { uint32_t t = v[j]; v[j] = v[j-1]; v[j-1] = t; }
+    uint32_t med = v[cs_count / 2];
+    uint8_t agree = 0;
+    for (uint8_t i = 0; i < cs_count; i++)
+        if ((v[i] > med ? v[i] - med : med - v[i]) <= CS_WINDOW_S) agree++;
+    uint8_t need = cs_count / 2 + 1;
+    if (need < ext.clk_samples) need = ext.clk_samples;
+    cs_last_agree = agree;
+    if (agree < need) { cs_reason = 'n'; return false; }
+    uint32_t now = clock_now();
+    cs_last_delta = (int32_t)(med - now);
+    cs_last_up = up;
+    uint32_t off = med > now ? med - now : now - med;
+    if (off > ext.clk_drift_s) { clock_set(med); cs_reason = 's'; LOGLN("clock set from mesh consensus"); }
+    else cs_reason = 'k';
+    cs_count = 0;
+    cs_next_up = up + 7UL * 86400UL;
     return true;
 }
 
-// Median of recent verified-advert timestamps from distinct senders.
-#define TSAMPLES 5
-static uint32_t ts_samples[TSAMPLES];
-static uint8_t  ts_sender[TSAMPLES][4];
-static uint8_t  ts_count = 0, ts_head = 0;
-
-static void clock_learn(const uint8_t* pubkey, uint32_t ts) {
-    bool known = false;
-    for (int i = 0; i < ts_count; i++)
-        if (memcmp(ts_sender[i], pubkey, 4) == 0) { ts_samples[i] = ts; known = true; break; }
-    if (!known) {
-        memcpy(ts_sender[ts_head], pubkey, 4);
-        ts_samples[ts_head] = ts;
-        ts_head = (ts_head + 1) % TSAMPLES;
-        if (ts_count < TSAMPLES) ts_count++;
+static void clock_sample(const uint8_t* pubkey, uint32_t ts, uint8_t hops, int pkt_len) {
+    if (!cs_active()) return;
+    uint32_t build = build_unix_ts();
+    if (ts < build || ts > build + 315360000UL) return;          // build time .. +10 years
+    // Estimated flood transit: each relay waits ~2.5 × txdelay airtimes, then transmits.
+    ts += (uint32_t)((uint64_t)hops * airtime_ms(pkt_len) * (100 + cfg.txdelay_x100 * 5 / 2) / 100000UL);
+    cs_prune();
+    int slot = -1;
+    for (uint8_t i = 0; i < cs_count; i++) if (!memcmp(cs[i].key, pubkey, 4)) { slot = i; break; }
+    if (slot < 0) {
+        if (cs_count < CS_SLOTS) slot = cs_count++;
+        else { slot = 0; for (uint8_t i = 1; i < CS_SLOTS; i++) if (cs[i].rx_up < cs[slot].rx_up) slot = i; }
+        memcpy(cs[slot].key, pubkey, 4);
     }
-    if (ts_count < 3) return;
-    uint32_t s[TSAMPLES];
-    memcpy(s, ts_samples, sizeof(s));
-    for (int i = 1; i < ts_count; i++)
-        for (int j = i; j > 0 && s[j-1] > s[j]; j--) { uint32_t t = s[j]; s[j] = s[j-1]; s[j-1] = t; }
-    uint32_t median = s[ts_count / 2];
-    if (median > clock_now() + 120 && median < build_unix_ts() + 315360000UL) {
-        clock_set_forward(median);
-        LOGLN("clock advanced from adverts");
-    }
+    cs[slot].est = ts;
+    cs[slot].rx_up = uptime_s();
+    clock_sync_eval();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -491,6 +588,15 @@ public:
     uint32_t packetStatus() { return getPacketStatus(); }
 };
 Radio radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
+
+#if defined(ARDUINO_ARCH_STM32)
+// We never use the LR-FHSS modem. Defining these members here keeps the linker
+// from pulling RadioLib's SX126x_LR_FHSS object (~1.8 KB) into the 62 KB image.
+int16_t SX126x::buildLRFHSSPacket(const uint8_t*, size_t, uint8_t*, size_t*, size_t*, size_t*) { return RADIOLIB_ERR_UNSUPPORTED; }
+int16_t SX126x::resetLRFHSS() { return RADIOLIB_ERR_UNSUPPORTED; }
+uint16_t SX126x::stepLRFHSS() { return 0; }
+int16_t SX126x::setLRFHSSHop(uint8_t) { return RADIOLIB_ERR_UNSUPPORTED; }
+#endif
 
 static bool     radio_has_tcxo = true;
 static uint32_t preamble_ms = 0, max_pkt_ms = 0;
@@ -560,9 +666,10 @@ static void budget_refill(void) {
     if (budget_ms > budget_max()) budget_ms = budget_max();
 }
 
-static bool transmit(const uint8_t* buf, int len) {
+static bool transmit(const uint8_t* buf, int len, uint8_t cr) {
     uint32_t toa = airtime_ms(len);
     radio.standby();
+    if (cr && cr != cfg.cr) radio.setCodingRate(cr);
     led(true);
     int state = radio.startTransmit(buf, len);
     if (state == RADIOLIB_ERR_NONE) {
@@ -573,6 +680,7 @@ static bool transmit(const uint8_t* buf, int len) {
         }
     }
     radio.finishTransmit();
+    if (cr && cr != cfg.cr) radio.setCodingRate(cfg.cr);
     led(false);
     budget_ms = (budget_ms > toa) ? budget_ms - toa : 0;
     activity_at = 0; header_seen = false;
@@ -587,26 +695,149 @@ static bool transmit(const uint8_t* buf, int len) {
 #define TXQ_SIZE 6
 struct TxItem {
     bool     used;
-    uint8_t  pri, len;
+    uint8_t  pri, len, cr;
+    int8_t   rslot;            // retry slot to arm after this TX, or -1
     uint32_t due, busy_since;
     uint8_t  buf[MAX_PKT];
 };
 static TxItem txq[TXQ_SIZE];
 
-static bool txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms) {
-    if (len <= 0) return false;
+static int txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms) {
+    if (len <= 0) return -1;
     int slot = -1;
     for (int i = 0; i < TXQ_SIZE; i++) if (!txq[i].used) { slot = i; break; }
     if (slot < 0) {
         for (int i = 0; i < TXQ_SIZE; i++)
             if (txq[i].pri > pri && (slot < 0 || txq[i].pri > txq[slot].pri)) slot = i;
-        if (slot < 0) { LOGLN("  txq full"); return false; }
+        if (slot < 0) { LOGLN("  txq full"); return -1; }
     }
     TxItem& t = txq[slot];
-    t.used = true; t.pri = pri; t.len = (uint8_t)len;
+    t.used = true; t.pri = pri; t.len = (uint8_t)len; t.cr = 0; t.rslot = -1;
     t.due = millis() + delay_ms; t.busy_since = 0;
     memcpy(t.buf, buf, len);
-    return true;
+    return slot;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Recent repeaters — last-hop prefix + SNR, learned from received floods and
+//  zero-hop repeater adverts. Gates direct retries (direct.retry.heard) and
+//  picks the starting coding rate for them.
+// ═════════════════════════════════════════════════════════════════════════════
+#define RR_SLOTS 16
+struct RecentRpt { uint8_t pfx[3], len; int8_t snr4; uint32_t up; };
+static RecentRpt rr[RR_SLOTS];
+
+static void rr_note(const uint8_t* pfx, uint8_t len, int8_t snr4) {
+    if (len > 3) len = 3;
+    uint32_t up = uptime_s();
+    int slot = 0;
+    bool match = false;
+    for (int i = 0; i < RR_SLOTS && !match; i++) {
+        if (rr[i].len && !memcmp(rr[i].pfx, pfx, len < rr[i].len ? len : rr[i].len)) { slot = i; match = true; }
+        else if (!rr[i].len || rr[i].up < rr[slot].up) slot = i;
+    }
+    if (!match || rr[slot].len < len) { memcpy(rr[slot].pfx, pfx, len); rr[slot].len = len; }
+    rr[slot].snr4 = snr4;
+    rr[slot].up = up;
+}
+
+// SNR×4 of a repeater heard in the last 24 h, or -128 if unknown.
+static int rr_snr4(const uint8_t* pfx, uint8_t len) {
+    uint32_t up = uptime_s();
+    for (int i = 0; i < RR_SLOTS; i++) {
+        if (!rr[i].len || up - rr[i].up > 86400UL) continue;
+        if (!memcmp(rr[i].pfx, pfx, len < rr[i].len ? len : rr[i].len)) return rr[i].snr4;
+    }
+    return -128;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Automatic retries (after mikecarper/MeshCore flood.retry / direct.retry)
+//  After forwarding, keep a copy. If no qualifying echo is heard (the next hop
+//  forwarding a direct packet, or anyone forwarding our flood further) before
+//  the wait expires, resend it, escalating the coding rate on direct retries.
+// ═════════════════════════════════════════════════════════════════════════════
+#define RT_SLOTS 4
+struct RetrySlot {
+    bool     used, direct, armed;
+    uint8_t  hash[8];
+    uint8_t  hops;             // path count in the packet we sent
+    uint8_t  left, attempt, cr0, len, pri;
+    uint32_t due;
+    uint8_t  buf[MAX_PKT];
+};
+static RetrySlot rt[RT_SLOTS];
+static uint32_t stat_retry = 0, stat_echo = 0;
+
+static uint32_t rt_wait(const RetrySlot& r) {
+    uint32_t a = airtime_ms(r.len);
+    if (r.direct) {
+        uint8_t ptype = (r.buf[0] >> 2) & 0x0F;
+        uint32_t k = (ptype == PT_TXT_MSG) ? 7 : (ptype == PT_TRACE || ptype == PT_ANON_REQ) ? 3 : 6;
+        return ext.d_base_ms + k * a + (uint32_t)r.attempt * ext.d_step_ms + rnd_range(0, a + 1);
+    }
+    return max_pkt_ms + 20 * a + rnd_range(0, 2 * a + 1);
+}
+
+// Coding-rate ladder 4/5, 4/7, 4/7, 4/8: retry n (1-based) steps along it from the start CR.
+static uint8_t rt_cr(uint8_t start, uint8_t n) {
+    static const uint8_t ladder[4] = { 5, 7, 7, 8 };
+    uint8_t i = 0;
+    while (i < 3 && ladder[i] < start) i++;
+    i += n - 1;
+    return ladder[i > 3 ? 3 : i];
+}
+
+static void rt_free(int i) {
+    rt[i].used = false;
+    for (int k = 0; k < TXQ_SIZE; k++) if (txq[k].used && txq[k].rslot == i) txq[k].used = false;
+}
+
+static void rt_create(const uint8_t h[8], int qslot, bool direct, uint8_t hops, uint8_t count, uint8_t cr0) {
+    if (qslot < 0 || !count) return;
+    int i = 0;
+    for (int k = 0; k < RT_SLOTS; k++) {
+        if (!rt[k].used) { i = k; break; }
+        if (rt[k].pri > rt[i].pri) i = k;              // evict the farthest-from-source flood
+    }
+    if (rt[i].used) rt_free(i);
+    RetrySlot& r = rt[i];
+    r.used = true; r.armed = false; r.direct = direct;
+    memcpy(r.hash, h, 8);
+    r.hops = hops; r.left = count; r.attempt = 0; r.cr0 = cr0;
+    r.len = txq[qslot].len; r.pri = txq[qslot].pri;
+    memcpy(r.buf, txq[qslot].buf, r.len);
+    txq[qslot].rslot = i;
+}
+
+// Called for every duplicate we hear. Returns true if it cancelled a retry.
+static bool rt_echo(const uint8_t h[8], bool direct, uint8_t hops) {
+    for (int i = 0; i < RT_SLOTS; i++) {
+        if (!rt[i].used || memcmp(rt[i].hash, h, 8)) continue;
+        bool ok = rt[i].direct ? (direct && hops < rt[i].hops) : (!direct && hops > rt[i].hops);
+        if (!ok) return false;
+        rt_free(i);
+        stat_echo++;
+        LOGLN("  echo: retry cancelled");
+        return true;
+    }
+    return false;
+}
+
+static void rt_service(void) {
+    uint32_t now = millis();
+    for (int i = 0; i < RT_SLOTS; i++) {
+        RetrySlot& r = rt[i];
+        if (!r.used || !r.armed || (int32_t)(now - r.due) < 0) continue;
+        if (!r.left) { r.used = false; continue; }    // final echo window expired
+        r.left--; r.attempt++; r.armed = false;
+        int q = txq_push(r.buf, r.len, r.pri, 0);
+        if (q < 0) { r.used = false; continue; }
+        txq[q].rslot = i;
+        txq[q].cr = r.direct || r.hops == 0 ? rt_cr(r.cr0, r.attempt) : 0;
+        stat_retry++;
+        LOGLN("  retry");
+    }
 }
 
 static uint32_t stat_rx = 0, stat_fwd = 0, stat_drop = 0, stat_tx = 0, stat_lbt = 0;
@@ -635,8 +866,12 @@ static void txq_service(uint32_t irq) {
         t.due = now + (toa / 2 - budget_ms) * (100 + cfg.af_x100) / 100 + 1;
         return;
     }
-    if (transmit(t.buf, t.len)) stat_tx++;
+    if (transmit(t.buf, t.len, t.cr)) stat_tx++;
     t.used = false;
+    if (t.rslot >= 0 && rt[t.rslot].used) {          // start this retry slot's echo window
+        rt[t.rslot].armed = true;
+        rt[t.rslot].due = millis() + rt_wait(rt[t.rslot]);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -697,7 +932,7 @@ static uint32_t delay_for(const Pkt& p, uint8_t factor_x100) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Advert verification (+ clock learning)
 // ═════════════════════════════════════════════════════════════════════════════
-static bool advert_verify(const uint8_t* payload, int plen) {
+static bool advert_verify(const uint8_t* payload, int plen, uint8_t hops) {
     if (plen < 100) return false;
     if (memcmp(payload, own_pubkey, 32) == 0) return false;
     int app_len = plen - 100;
@@ -709,7 +944,7 @@ static bool advert_verify(const uint8_t* payload, int plen) {
     if (!Ed25519::verify(payload + 36, payload, msg, 36 + app_len)) return false;
     uint32_t ts;
     memcpy(&ts, payload + 32, 4);
-    clock_learn(payload, ts);
+    clock_sample(payload, ts, hops, plen + 2 + hops);
     return true;
 }
 
@@ -717,6 +952,11 @@ static bool advert_verify(const uint8_t* payload, int plen) {
 //  Forwarding (Mesh::onRecvPacket + simple_repeater::allowPacketForward)
 // ═════════════════════════════════════════════════════════════════════════════
 static uint8_t out_buf[MAX_PKT];
+
+static bool rt_any(void) { for (int i = 0; i < RT_SLOTS; i++) if (rt[i].used) return true; return false; }
+
+// SNR floor per spreading factor (dB×4): SF7 -7.5 … SF12 -20
+static int snr_floor4(void) { return -30 - ((int)cfg.sf - 7) * 10; }
 
 static const char* handle_direct(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
@@ -746,11 +986,22 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
     if (p.hash_count == 0) {
         if (p.ptype == PT_ADVERT) {                    // neighbour advert: verify, learn time
             packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
-            if (!was_seen(h)) { mark_seen(h); advert_verify(p.payload, p.payload_len); }
+            if (!was_seen(h)) {
+                mark_seen(h);
+                if (advert_verify(p.payload, p.payload_len, 0) && (p.payload[100] & 0x0F) == ADV_TYPE_REPEATER)
+                    rr_note(p.payload, 3, snr4);
+            }
         }
         return "zero-hop";
     }
-    if (!is_own_hash(p.path, p.hash_size)) return "not next hop";
+    if (!is_own_hash(p.path, p.hash_size)) {
+        if (rt_any()) {                                // is this the next hop forwarding our packet?
+            if (p.ptype == PT_MULTIPART && p.payload_len >= 5) packet_hash(h, PT_ACK, 0, p.payload + 1, p.payload_len - 1);
+            else packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
+            if (rt_echo(h, true, p.hash_count)) return "echo";
+        }
+        return "not next hop";
+    }
     if (!cfg.repeat) return "repeat off";
 
     uint8_t new_path_len  = (p.path_len & 0xC0) | ((p.hash_count - 1) & 0x3F);
@@ -777,7 +1028,18 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
     mark_seen(h);
     int n = build(out_buf, header, p.tc, new_path_len, rest, rest_bytes, pl, plen);
     if (n < 0) return "too big";
-    txq_push(out_buf, n, pri, delay);
+    int q = txq_push(out_buf, n, pri, delay);
+
+    // Direct retry: only when the next hop will forward again (so we can hear the
+    // echo) and, with direct.retry.heard, when we have recently heard it well enough.
+    if (p.hash_count > 1 && ext.d_count) {
+        int snr = rr_snr4(rest, p.hash_size);
+        bool ok = !ext.d_heard || (snr != -128 && snr >= snr_floor4() + ext.d_margin * 4);
+        uint8_t cr0 = cfg.cr;
+        if (ext.d_cr && snr != -128) { if (snr <= 10) cr0 = 8; else if (snr < 30) cr0 = 7; }
+        if (cr0 < cfg.cr) cr0 = cfg.cr;
+        if (ok) rt_create(h, q, true, p.hash_count - 1, ext.d_count, cr0);
+    }
     return NULL;
 }
 
@@ -796,7 +1058,26 @@ static bool flood_type_ok(const Pkt& p) {
     }
 }
 
-static const char* handle_flood(const Pkt& p) {
+static uint8_t flood_retry_count(const Pkt& p) {
+    if (!ext.f_count || (ext.f_path != 255 && p.hash_count > ext.f_path)) return 0;
+    uint8_t c = ext.f_count;
+    switch (p.ptype) {
+        case PT_REQ:       return 0;
+        case PT_GRP_TXT:   return c;
+        case PT_RESPONSE: case PT_TXT_MSG: case PT_ANON_REQ: case PT_PATH:
+            return (p.hash_count == 0 || c < 2) ? c : 2;
+        case PT_ADVERT:    return ext.f_advert ? 1 : 0;
+        case PT_GRP_DATA:  if (ext.f_gpath != 255 && p.hash_count > ext.f_gpath) return 0;
+        /* fall through */
+        default:           return 1;
+    }
+}
+
+static const char* handle_flood(const Pkt& p, int8_t snr4) {
+    uint8_t h[8];
+    packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
+    if (p.hash_count) rr_note(p.path + (p.hash_count - 1) * p.hash_size, p.hash_size, snr4);
+    if (was_seen(h)) return rt_echo(h, false, p.hash_count) ? "echo" : "dedup";
     if (!cfg.repeat) return "repeat off";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
     if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
@@ -818,13 +1099,9 @@ static const char* handle_flood(const Pkt& p) {
     }
 
     if (!flood_type_ok(p)) return "type";
-
-    uint8_t h[8];
-    packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
-    if (was_seen(h)) return "dedup";
     mark_seen(h);
 
-    if (p.ptype == PT_ADVERT && !advert_verify(p.payload, p.payload_len)) return "advert sig";
+    if (p.ptype == PT_ADVERT && !advert_verify(p.payload, p.payload_len, p.hash_count)) return "advert sig";
 
     int pbytes = p.hash_count * p.hash_size;
     if (pbytes + p.hash_size > MAX_PATH_SIZE) return "path full";
@@ -834,7 +1111,8 @@ static const char* handle_flood(const Pkt& p) {
     uint8_t new_len = (p.path_len & 0xC0) | ((p.hash_count + 1) & 0x3F);
     int n = build(out_buf, p.header, p.tc, new_len, newpath, pbytes + p.hash_size, p.payload, p.payload_len);
     if (n < 0) return "too big";
-    txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100));
+    int q = txq_push(out_buf, n, p.hash_count + 1, delay_for(p, cfg.txdelay_x100));
+    rt_create(h, q, false, p.hash_count + 1, flood_retry_count(p), 0);
     return NULL;
 }
 
@@ -843,7 +1121,7 @@ static void on_receive(const uint8_t* d, int len, int8_t snr4) {
     const char* why;
     if (!parse(d, len, p)) why = "malformed";
     else if (p.route == ROUTE_DIRECT || p.route == ROUTE_TRANSPORT_DIRECT) why = handle_direct(p, snr4);
-    else why = handle_flood(p);
+    else why = handle_flood(p, snr4);
     if (why) { stat_drop++; LOG("  drop: "); LOGLN(why); }
     else     { stat_fwd++;  LOGLN("  fwd"); }
 }
@@ -1068,8 +1346,90 @@ static void handle_region(const char* args, char* reply) {
     }
 }
 
+// Retry / clock-sync settings (stored in ConfigExt), same names as mikecarper/MeshCore.
+enum { EK_U8, EK_U16, EK_U32, EK_ONOFF, EK_U8OFF };
+struct ExtKey { const char* k; uint8_t off, kind; uint16_t lo, hi; bool retry; };
+static const ExtKey ext_keys[] = {
+    { "direct.retry.heard",     offsetof(ConfigExt, d_heard),     EK_ONOFF, 0, 1,    true  },
+    { "direct.retry.margin",    offsetof(ConfigExt, d_margin),    EK_U8,    0, 40,   true  },
+    { "direct.retry.count",     offsetof(ConfigExt, d_count),     EK_U8,    0, 15,   true  },
+    { "direct.retry.base",      offsetof(ConfigExt, d_base_ms),   EK_U16,   10, 5000, true },
+    { "direct.retry.step",      offsetof(ConfigExt, d_step_ms),   EK_U16,   0, 5000, true  },
+    { "direct.retry.cr",        offsetof(ConfigExt, d_cr),        EK_ONOFF, 0, 1,    true  },
+    { "flood.retry.count",      offsetof(ConfigExt, f_count),     EK_U8,    0, 15,   true  },
+    { "flood.retry.path",       offsetof(ConfigExt, f_path),      EK_U8OFF, 0, 63,   true  },
+    { "flood.retry.group.path", offsetof(ConfigExt, f_gpath),     EK_U8OFF, 0, 63,   true  },
+    { "flood.retry.advert",     offsetof(ConfigExt, f_advert),    EK_ONOFF, 0, 1,    true  },
+    { "clock.sync.mesh",        offsetof(ConfigExt, clk_on),      EK_ONOFF, 0, 1,    false },
+    { "clock.sync.samples",     offsetof(ConfigExt, clk_samples), EK_U8,    3, 16,   false },
+    { "clock.sync.drift",       offsetof(ConfigExt, clk_drift_s), EK_U32,   30, 0,   false },  // hi 0 → 86400
+};
+static const char* const preset_names[] = { "infra", "rooftop", "mobile" };
+
+static const ExtKey* ext_find(const char* k) {
+    for (unsigned i = 0; i < sizeof(ext_keys) / sizeof(ext_keys[0]); i++)
+        if (!strcmp(k, ext_keys[i].k)) return &ext_keys[i];
+    return NULL;
+}
+
+static void ext_get(const ExtKey* e, char* reply) {
+    uint8_t* f = (uint8_t*)&ext + e->off;
+    uint32_t v = e->kind == EK_U16 ? *(uint16_t*)f : e->kind == EK_U32 ? *(uint32_t*)f : *f;
+    if (e->kind == EK_ONOFF) sprintf(reply, "> %s", v ? "on" : "off");
+    else if (e->kind == EK_U8OFF && v == 255) strcpy(reply, "> off");
+    else sprintf(reply, "> %lu", (unsigned long)v);
+}
+
+// Returns false (with reply set) on a bad value.
+static bool ext_set(const ExtKey* e, const char* v, char* reply) {
+    uint8_t* f = (uint8_t*)&ext + e->off;
+    uint32_t hi = e->hi ? e->hi : 86400UL, x;
+    if (e->kind == EK_ONOFF) {
+        if (!strcmp(v, "on")) x = 1; else if (!strcmp(v, "off")) x = 0;
+        else { strcpy(reply, "Error, use on/off"); return false; }
+    } else if (e->kind == EK_U8OFF && !strcmp(v, "off")) {
+        x = 255;
+    } else {
+        bool ok; x = (uint32_t)atoi_u(v, &ok);
+        if (!ok || x < e->lo || x > hi) { sprintf(reply, "Error, range %u-%lu", e->lo, (unsigned long)hi); return false; }
+    }
+    if (e->kind == EK_U16) *(uint16_t*)f = x; else if (e->kind == EK_U32) *(uint32_t*)f = x; else *f = x;
+    if (e->retry) ext.preset = 255;
+    return true;
+}
+
+static void clock_status(char* reply) {
+    static const char* const why[] = { "waiting", "set", "in-sync", "no-consensus", "manual", "off" };
+    const char* codes = "wsknmo";
+    clock_sync_eval();
+    sprintf(reply, "> %s samples=%u/%u agree=%u", why[strchr(codes, cs_reason) - codes],
+            cs_last_fresh, ext.clk_samples, cs_last_agree);
+    if (cs_last_up) sprintf(reply + strlen(reply), " last=%lds %lus ago", (long)cs_last_delta,
+                            (unsigned long)(uptime_s() - cs_last_up));
+}
+
 static void handle_get(const char* k, char* reply) {
     char a[16], b[16];
+    const ExtKey* e = ext_find(k);
+    if (e) { ext_get(e, reply); return; }
+    if (!strcmp(k, "retry.preset")) { sprintf(reply, "> %s", ext.preset < 3 ? preset_names[ext.preset] : "custom"); return; }
+    if (!strcmp(k, "clock.sync.status")) { clock_status(reply); return; }
+    if (!strcmp(k, "recent.repeater")) {
+        char* p = reply; *p++ = '>';
+        uint32_t up = uptime_s(), shown = 0;              // newest first, prefix:SNR(dB)
+        while (p - reply < 140) {
+            int best = -1;
+            for (int i = 0; i < RR_SLOTS; i++)
+                if (rr[i].len && up - rr[i].up <= 86400UL && !(shown & (1UL << i)) && (best < 0 || rr[i].up > rr[best].up)) best = i;
+            if (best < 0) break;
+            shown |= 1UL << best;
+            *p++ = ' '; to_hex(p, rr[best].pfx, rr[best].len); p += rr[best].len * 2;
+            p += sprintf(p, ":%d", rr[best].snr4 / 4);
+        }
+        *p = 0;
+        if (p == reply + 1) strcpy(reply, "> none");
+        return;
+    }
     if      (!strcmp(k, "name"))   sprintf(reply, "> %s", cfg.name);
     else if (!strcmp(k, "lat"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lat_e6, 6));
     else if (!strcmp(k, "lon"))    sprintf(reply, "> %s", fmt_fixed(a, cfg.lon_e6, 6));
@@ -1107,8 +1467,16 @@ static void handle_set(const char* cmd, char* reply) {
     int32_t x; bool ok;
     int iv = atoi_u(v, &ok);
     const char* done = "OK";
+    const ExtKey* e = ext_find(k);
 
-    if (!strcmp(k, "name")) {
+    if (e) {
+        if (!ext_set(e, v, reply)) return;
+    } else if (!strcmp(k, "retry.preset")) {
+        int pr = 0;
+        while (pr < 3 && strcmp(v, preset_names[pr]) && !(v[0] == '0' + pr && !v[1])) pr++;
+        if (pr == 3) { strcpy(reply, "Error, use infra, rooftop or mobile"); return; }
+        ext_apply_preset(pr);
+    } else if (!strcmp(k, "name")) {
         if (!valid_name(v) || strlen(v) >= sizeof(cfg.name)) { strcpy(reply, "Error, bad chars"); return; }
         strcpy(cfg.name, v);
     } else if (!strcmp(k, "lat") || !strcmp(k, "lon")) {
@@ -1198,8 +1566,15 @@ static void handle_command(char* cmd, char* reply) {
         uint32_t t = 0; const char* s = skip_ws(cmd + 5);
         while (*s >= '0' && *s <= '9') t = t * 10 + (*s++ - '0');
         ok = t > 1600000000UL;
-        if (ok && clock_set_forward(t)) { strcpy(reply, "OK - clock set: "); fmt_clock(reply + 16, clock_now()); }
+        if (ok && t >= clock_now()) {
+            clock_set(t);
+            cs_manual = true;                  // manual time wins over mesh sync until reboot
+            strcpy(reply, "OK - clock set: "); fmt_clock(reply + 16, clock_now());
+        }
         else strcpy(reply, "(ERR: clock cannot go backwards)");
+    } else if (!strcmp(cmd, "clock.sync.mesh now")) {
+        if (!ext.clk_on) strcpy(reply, "Error: clock.sync.mesh is off");
+        else { cs_next_up = 0; cs_manual = false; clock_status(reply); }
     } else if (!strcmp(cmd, "clock")) {
         fmt_clock(reply, clock_now());
     } else if (!strcmp(cmd, "ver")) {
@@ -1220,9 +1595,10 @@ static void handle_command(char* cmd, char* reply) {
     } else if (!strcmp(cmd, "log stop")) {
         log_on = false; strcpy(reply, "   logging off");
     } else if (!strcmp(cmd, "stats")) {
-        sprintf(reply, "up=%lus rx=%lu fwd=%lu drop=%lu tx=%lu lbt=%lu budget=%lums radio=%s",
+        sprintf(reply, "up=%lus rx=%lu fwd=%lu drop=%lu tx=%lu retry=%lu echo=%lu lbt=%lu budget=%lums radio=%s",
                 (unsigned long)uptime_s(), (unsigned long)stat_rx, (unsigned long)stat_fwd,
-                (unsigned long)stat_drop, (unsigned long)stat_tx, (unsigned long)stat_lbt,
+                (unsigned long)stat_drop, (unsigned long)stat_tx, (unsigned long)stat_retry,
+                (unsigned long)stat_echo, (unsigned long)stat_lbt,
                 (unsigned long)budget_ms, radio_has_tcxo ? "tcxo" : "xtal");
     } else if (!strncmp(cmd, "password", 8)) {
         strcpy(reply, "Error: remote admin not supported");
@@ -1276,6 +1652,11 @@ void setup(void) {
     memcpy(&cfg, (const void*)CONFIG_ADDR, sizeof(cfg));
     if (cfg.magic == CFG_MAGIC && cfg.check == cfg_checksum(cfg)) have_cfg = true;
     else cfg_defaults();
+    memcpy(&ext, (const void*)(CONFIG_ADDR + sizeof(Config)), sizeof(ext));
+    if (ext.magic != EXT_MAGIC || ext.check != ext_checksum(ext)) {
+        ext_defaults();
+        if (have_cfg) cfg_save();      // upgrade from v2.1: keep settings, add new defaults
+    }
     regions_rekey();
 
     Serial1.println();
@@ -1359,6 +1740,7 @@ void loop(void) {
         next_local_advert_s = up + cfg.advert_interval_min * 60UL;
     }
 
+    rt_service();
     txq_service(irq);
 
     if ((int32_t)(up - next_persist_s) >= 0) {

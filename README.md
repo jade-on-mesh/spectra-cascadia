@@ -28,10 +28,61 @@ v2.1 adds an upstream-style **USB serial CLI** with settings stored in flash (be
 Still **not** included (no room): remote admin login, telemetry, private (`$`)
 regions, neighbour tables.
 
-**Status (v2.1):** compiles (≈61 KB of the 62 KB budget) and passes the host-side tests in
+**Status (v2.2):** compiles (≈61 KB of the 62 KB budget) and passes the host-side tests in
 `test/host/` (forwarding rules, region codes cross-checked against a Python HMAC
 reference, journal wear/rollover, serial CLI, settings persistence). **Not yet RF-tested on hardware.** Test on the bench
 next to a known-good MeshCore repeater before deploying.
+
+### v2.2: automatic retries and mesh clock sync
+
+Ported from [mikecarper/MeshCore](https://github.com/mikecarper/MeshCore)
+(Halo/Keymind `flood.retry`, `direct.retry` and `clock.sync.mesh`), using the same
+command names, in a compact form that fits this board.
+
+**Retries.** After forwarding, the node keeps a copy and listens for an *echo*:
+- a **flood** is echoed when anyone forwards it further (longer path),
+- a **direct** packet is echoed when the next hop forwards it (shorter path).
+
+If no echo arrives before the wait expires, the packet is resent. Direct retries step
+up the coding rate (4/5 → 4/7 → 4/7 → 4/8) for robustness, starting higher when the next
+hop's recent SNR is low. Direct retries are only attempted toward a next hop heard in
+the last 24 h above the SF floor + `direct.retry.margin` (`direct.retry.heard`), and never
+on the final hop to the destination (no echo is possible there). Floods are retried only
+near their source (`flood.retry.path`), REQ never, adverts only with `flood.retry.advert on`.
+
+| Command | Default (rooftop) |
+|---|---|
+| `set retry.preset infra\|rooftop\|mobile` | rooftop |
+| `direct.retry.count` / `.base` / `.step` / `.margin` | 15 / 175 ms / 100 ms / 5 dB |
+| `direct.retry.heard on\|off`, `direct.retry.cr on\|off` | on, on |
+| `flood.retry.count` / `.path` / `.group.path` | 3 / 2 / 1 (`off` disables a path gate) |
+| `flood.retry.advert on\|off` | off |
+| `get recent.repeater` | last-hop prefixes and SNR (newest first) |
+
+Not ported (no room): bridge buckets, target/ignore prefix lists, flood rules.
+
+**Clock sync.** Signed advert timestamps from distinct nodes are collected for up to 2 h
+(with an estimate of flood transit time added). When `clock.sync.samples` (default 9) are
+fresh and a strict majority of them, and at least that many, agree within 10 minutes, the
+median is used. The clock is moved, **forwards or backwards**, only if it is off by more
+than `clock.sync.drift` (default 600 s). After a consensus, sync sleeps for 7 days. A manual
+`time <epoch>` suppresses mesh sync until reboot.
+
+| Command | |
+|---|---|
+| `get` / `set clock.sync.mesh on\|off` | default on |
+| `get` / `set clock.sync.samples 3-16` | default 9 |
+| `get` / `set clock.sync.drift 30-86400` | seconds, default 600 |
+| `clock.sync.mesh now` | re-evaluate now (still needs quorum) |
+| `get clock.sync.status` | waiting / set / in-sync / no-consensus / manual / off, with sample counts |
+
+A backward correction makes this node's next adverts older than ones neighbours already
+stored, so they are ignored until the clock catches up. That is the reason for the 600 s
+threshold.
+
+Upgrading from v2.1 keeps the name, identity, regions and radio settings. The new settings
+are stored after them in the same flash page and get their defaults on first boot. When
+flashing an upgrade, **don't** use Full chip erase.
 
 ### Configuring over USB serial
 
@@ -77,7 +128,7 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `ver`, `board`, `reboot` | |
 | `erase` | Factory reset: defaults and a **new identity** after reboot |
 | `log start` / `log stop` | Live packet log (off by default so tools see clean replies) |
-| `stats` | Uptime and packet counters |
+| `stats` | Uptime, packet, retry and echo counters |
 
 Not supported (no room): remote admin login / passwords, neighbours, telemetry,
 private `$` regions, region hierarchy (parent arguments are ignored).
@@ -328,14 +379,15 @@ pio run -e specter
 ### Memory Usage
 
 ```
-RAM:   ███░░░░░░░  30.4%  (6216 / 20480 bytes)
-Flash: ██████████  96.0%  (60972 / 63488 bytes)
+RAM:   ███░░░░░░░  34.6%  (7084 / 20480 bytes)
+Flash: ██████████  98.5%  (62544 / 63488 bytes)
 ```
 
 The image is capped at 62 KB (`board_upload.maximum_size`) because the top two 1 KB
 pages of the first 64 KB hold the settings and the clock journal, so it works on
-genuine 64 KB C8 chips. Unused STM32 HAL modules are disabled in `platformio.ini`
-to make it fit; keep those flags if you build another way.
+genuine 64 KB C8 chips. Unused STM32 HAL modules are disabled in `platformio.ini`,
+and `src/main.cpp` stubs out RadioLib's unused LR-FHSS code, to make it fit; keep those
+flags if you build another way.
 
 ### Building with the Arduino IDE instead
 

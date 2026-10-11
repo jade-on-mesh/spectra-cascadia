@@ -150,13 +150,119 @@ int main() {
       n = mk(buf, 8, base+2, false); on_receive(buf, n, 0);
       CHECK(queued() == 0, "advert at flood.max.advert (8) dropped"); clearq(); }
 
-    { uint32_t future = clock_now() + 50000;
-      for (int k = 0; k < 3; k++) {
-          uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = i+k*31+1; Ed25519::derivePublicKey(pkey, sk);
-          uint8_t pl[105]; memcpy(pl, pkey, 32); uint32_t ts = future+k; memcpy(pl+32, &ts, 4); uint8_t app[] = {0x81,'A','B','C','D'};
+    // ── mesh clock sync (consensus of signed advert timestamps) ──────────
+    { auto zh = [&](int k, uint32_t ts) {
+          uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = (uint8_t)(i * 3 + k * 37 + 11); Ed25519::derivePublicKey(pkey, sk);
+          uint8_t pl[105]; memcpy(pl, pkey, 32); memcpy(pl+32, &ts, 4); uint8_t app[] = {0x82,'R','p','t','r'};
           memcpy(pl+100, app, 5); uint8_t m[41]; memcpy(m, pl, 36); memcpy(m+36, app, 5); Ed25519::sign(pl+36, sk, pkey, m, 41);
-          uint8_t pk[200]; pk[0] = (PT_ADVERT<<2)|ROUTE_DIRECT; pk[1] = 0; memcpy(pk+2, pl, 105); on_receive(pk, 107, 0); }
-      CHECK(clock_now() >= future, "clock learned forward from verified zero-hop adverts"); clearq(); }
+          uint8_t pk[200]; pk[0] = (PT_ADVERT<<2)|ROUTE_DIRECT; pk[1] = 0; memcpy(pk+2, pl, 105); on_receive(pk, 107, 40); };
+      cs_count = 0;
+      uint32_t t0 = clock_now();
+      for (int k = 0; k < 8; k++) zh(k, t0 + 5000);
+      CHECK(clock_now() < t0 + 100 && cli("get clock.sync.status").find("waiting samples=8/9") != std::string::npos,
+            "clock sync waits for 9 samples");
+      zh(8, t0 + 5000);
+      CHECK(clock_now() >= t0 + 4995 && clock_now() <= t0 + 5010, "9 agreeing adverts set the clock forward");
+      CHECK(cli("get clock.sync.status").find("> set") == 0, "status reports set");
+      uint32_t t1 = clock_now();
+      for (int k = 0; k < 9; k++) zh(20 + k, t1 + 99999);
+      CHECK(clock_now() < t1 + 100, "after a successful sync, mesh sync sleeps 7 days");
+      CHECK(cli("clock.sync.mesh now").find(">") == 0, "clock.sync.mesh now wakes sync");
+      uint32_t t2 = clock_now();
+      for (int k = 0; k < 9; k++) zh(40 + k, t2 - 3000);
+      CHECK(clock_now() <= t2 - 2990 && clock_now() >= t2 - 3010, "consensus can move the clock backwards");
+      cli("clock.sync.mesh now");
+      uint32_t t3 = clock_now();
+      for (int k = 0; k < 5; k++) zh(60 + k, t3 + 20000);
+      for (int k = 0; k < 4; k++) zh(70 + k, t3 + 40000);
+      CHECK(clock_now() < t3 + 100 && cli("get clock.sync.status").find("no-consensus") != std::string::npos,
+            "split evidence: no consensus, clock unchanged");
+      cli("clock.sync.mesh now"); cs_count = 0;
+      uint32_t t4 = clock_now();
+      for (int k = 0; k < 9; k++) zh(80 + k, t4 + 300);
+      CHECK(clock_now() < t4 + 100 && cli("get clock.sync.status").find("in-sync") != std::string::npos,
+            "offset under clock.sync.drift (600 s): left alone");
+      cli("clock.sync.mesh now"); cs_count = 0;
+      cli("time 4000000000");
+      uint32_t t5 = clock_now();
+      for (int k = 0; k < 9; k++) zh(90 + k, t5 + 9000);
+      CHECK(clock_now() < t5 + 100 && cli("get clock.sync.status").find("manual") != std::string::npos,
+            "manual time suppresses mesh sync");
+      cs_manual = false; clk_base -= (4000000000UL - t4);         // undo the manual set for later tests
+      clearq(); }
+
+    // ── automatic retries ───────────────────────────────────────────────
+    { auto tx_all = [&]() { for (int i = 0; i < 8; i++) { fake_ms += 10000; txq_service(0); } };
+      auto fire = [&]() { fake_ms += 60000; rt_service(); };
+      for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false;
+      clearq();
+      // flood retry, no echo → resent
+      uint8_t f1[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x00, 0x11,0x22,0x33,0x44,0x55,0x66,0x01 };
+      on_receive(f1, sizeof(f1), 0);
+      CHECK(rt_any(), "flood forward creates a retry slot");
+      std::string first((char*)last_q()->buf, last_q()->len);
+      tx_all(); fire();
+      TxItem* t = last_q();
+      CHECK(t && std::string((char*)t->buf, t->len) == first && stat_retry == 1, "no echo heard: flood packet resent");
+      tx_all();
+      // echo from a downstream repeater cancels remaining retries
+      uint8_t f1e[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x02, own_pubkey[0], 0x99, 0x11,0x22,0x33,0x44,0x55,0x66,0x01 };
+      on_receive(f1e, sizeof(f1e), 0);
+      CHECK(!rt_any() && stat_echo == 1, "downstream echo cancels flood retry");
+      fire(); CHECK(queued() == 0, "no resend after echo");
+      // parallel repeater at the same hop count does not count as an echo
+      uint8_t f2[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x00, 0x11,0x22,0x33,0x44,0x55,0x66,0x02 };
+      on_receive(f2, sizeof(f2), 0); tx_all();
+      uint8_t f2p[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x01, 0x98, 0x11,0x22,0x33,0x44,0x55,0x66,0x02 };
+      on_receive(f2p, sizeof(f2p), 0);
+      CHECK(rt_any(), "same-hop duplicate is not an echo");
+      for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false; clearq();
+      // path gate (rooftop: flood.retry.path 2) and REQ never retried
+      uint8_t f3[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x03, 0x91,0x92,0x93, 0x11,0x22,0x33,0x44,0x55,0x66,0x03 };
+      on_receive(f3, sizeof(f3), 0);
+      CHECK(queued() == 1 && !rt_any(), "flood beyond flood.retry.path: forwarded, no retry");
+      clearq();
+      uint8_t f4[] = { (PT_REQ<<2)|ROUTE_FLOOD, 0x00, 0xAB,0xCD,0x01,0x02,0x03,0x04 };
+      on_receive(f4, sizeof(f4), 0);
+      CHECK(queued() == 1 && !rt_any(), "REQ floods are never retried");
+      clearq();
+
+      // direct retry: next hop unknown → no retry (direct.retry.heard)
+      uint8_t d1[] = { (PT_TXT_MSG<<2)|ROUTE_DIRECT, 0x03, own_pubkey[0], 0x5A, 0x6B, 0xAA,0xBB,0x01,0x02,0x03,0x21 };
+      on_receive(d1, sizeof(d1), 0);
+      CHECK(queued() == 1 && !rt_any(), "direct to an unheard next hop: no retry");
+      clearq();
+      // hear 0x5A relay a flood at +3 dB SNR → recent table; then retry is allowed
+      uint8_t hz[] = { (PT_GRP_TXT<<2)|ROUTE_FLOOD, 0x01, 0x5A, 0x77,0x77,0x77,0x77,0x77,0x77,0x77 };
+      on_receive(hz, sizeof(hz), 12); clearq(); for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false;
+      CHECK(cli("get recent.repeater").find("5A:3") != std::string::npos, "recent.repeater learns last hop + SNR");
+      uint8_t d2[] = { (PT_TXT_MSG<<2)|ROUTE_DIRECT, 0x03, own_pubkey[0], 0x5A, 0x6B, 0xAA,0xBB,0x01,0x02,0x03,0x22 };
+      on_receive(d2, sizeof(d2), 0);
+      CHECK(rt_any(), "direct to a recently heard next hop: retry armed");
+      tx_all(); fire();
+      t = last_q();
+      CHECK(t && t->cr == 7, "direct retry at 3 dB starts at CR 4/7");
+      tx_all(); fire(); tx_all(); fire();
+      t = last_q();
+      CHECK(t && t->cr == 8, "later direct retries escalate to CR 4/8");
+      uint8_t d2e[] = { (PT_TXT_MSG<<2)|ROUTE_DIRECT, 0x01, 0x6B, 0xAA,0xBB,0x01,0x02,0x03,0x22 };
+      on_receive(d2e, sizeof(d2e), 0);
+      CHECK(!rt_any(), "next hop forwarding (shorter path) cancels direct retry");
+      clearq();
+      // last hop before destination: no echo possible → no retry
+      uint8_t d3[] = { (PT_TXT_MSG<<2)|ROUTE_DIRECT, 0x01, own_pubkey[0], 0xAA,0xBB,0x01,0x02,0x03,0x23 };
+      on_receive(d3, sizeof(d3), 0);
+      CHECK(queued() == 1 && !rt_any(), "final hop to destination: no retry");
+      clearq(); for (int i = 0; i < RT_SLOTS; i++) rt[i].used = false; }
+
+    // retry / clock CLI
+    CHECK(cli("get retry.preset") == "> rooftop", "default preset rooftop");
+    CHECK(cli("set retry.preset infra") == "OK" && cli("get direct.retry.count") == "> 4" && cli("get flood.retry.count") == "> 1", "preset infra");
+    CHECK(cli("set flood.retry.path off") == "OK" && cli("get flood.retry.path") == "> off" && cli("get retry.preset") == "> custom", "flood.retry.path off → custom");
+    CHECK(cli("set direct.retry.base 9") == "Error, range 10-5000", "range check");
+    CHECK(cli("set clock.sync.drift 900") == "OK" && cli("get clock.sync.drift") == "> 900", "clock.sync.drift");
+    CHECK(cli("set clock.sync.samples 2") == "Error, range 3-16", "clock.sync.samples range");
+    CHECK(cli("set retry.preset rooftop") == "OK" && cli("set clock.sync.drift 600") == "OK", "restore defaults");
 
     { uint8_t pk[] = { (PT_RAW_CUSTOM<<2)|ROUTE_FLOOD, 0x00, 1,2,3,4,5,6 };
       on_receive(pk, sizeof(pk), 0); CHECK(queued() == 0, "RAW_CUSTOM never flooded"); clearq();
@@ -190,7 +296,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("2.1.0-cascadia") == 0, "ver");
+    CHECK(cli("ver").find("2.2.0-cascadia") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc") == "Error: remote admin not supported", "password not supported");
@@ -237,7 +343,12 @@ int main() {
       CHECK(clock_now() > t_before, "clock resumes ahead of last advert");
       for (int i = 0; i < 200; i++) journal_write(clock_now() + i, j_last_flood_ts);
       uint32_t ts = 0, fl = 0; journal_read(&ts, &fl);
-      CHECK(ts >= clock_now() + 199, "journal wraps and keeps newest record"); }
+      CHECK(ts >= clock_now() + 199, "journal wraps and keeps newest record");
+      fake_config[sizeof(Config) / 4] = 0;               // simulate v2.1 flash: no extended settings
+      memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();
+      CHECK(Serial1.out.find("First boot") == std::string::npos && !strcmp(cfg.name, "CM-Woodway-1")
+            && !memcmp(pub_before, own_pubkey, 32) && ext.magic == EXT_MAGIC && ext.preset == 1,
+            "upgrade from v2.1 keeps name/identity, adds retry/clock defaults"); }
 
     CHECK(cli("erase").find("OK") != std::string::npos, "erase");
     { memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();
