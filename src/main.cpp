@@ -1,6 +1,9 @@
 /*
- * SPECTER — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 2.3.1-cascadia
+ * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
+ * Version: 2.4.0
+ *
+ * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
+ * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
  *
  * Fork of MaliosDark/meshcore-specter-dx-lr30 (MIT). Forwarding follows upstream
  * MeshCore (src/Mesh.cpp + examples/simple_repeater) as closely as a 20 KB-RAM,
@@ -25,8 +28,18 @@
 #include <SHA256.h>
 #include <Ed25519.h>
 #include <IWatchdog.h>
+#ifdef SPECTER_XL
+#include <AES.h>
+#include <SHA512.h>
+#include <BigNumberUtil.h>
+#include "utility/LimbUtil.h"
+#define private public            // the field arithmetic we need for X25519 is private
+#include <Curve25519.h>
+#undef private
+#endif
 
-#define FW_VERSION "2.3.1-cascadia"
+#define FW_NAME    "Spectra-Cascadia"
+#define FW_VERSION "v2.4.0"
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -213,6 +226,23 @@ static_assert(sizeof(Config) % 4 == 0 && sizeof(ConfigExt) % 4 == 0, "word-align
 static_assert(sizeof(Config) + sizeof(ConfigExt) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t ext_checksum(const ConfigExt& e) { return fnv_words(&e, offsetof(ConfigExt, check) / 4); }
 
+#ifdef SPECTER_XL
+// XL: login passwords, stored after ConfigExt in the same page. An empty admin
+// password means remote login is off until one is set over USB.
+#define AUTH_MAGIC 0x32415053UL  // "SPA2"
+struct ConfigAuth {
+    uint32_t magic;
+    char     admin_pw[16];
+    char     guest_pw[16];
+    uint32_t check;
+};
+static ConfigAuth auth;
+#define AUTH_ADDR (CONFIG_ADDR + sizeof(Config) + sizeof(ConfigExt))
+static_assert(sizeof(ConfigAuth) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t auth_checksum(const ConfigAuth& a) { return fnv_words(&a, offsetof(ConfigAuth, check) / 4); }
+#endif
+
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
 static void ext_apply_preset(uint8_t pr) {
     static const uint16_t base[3] = { 275, 175, 175 }, step[3] = { 150, 100, 50 };
@@ -352,6 +382,12 @@ static void cfg_save(void) {
     w = (const uint32_t*)&ext;
     for (unsigned i = 0; i < sizeof(ConfigExt) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CONFIG_ADDR + sizeof(Config) + i * 4, w[i]);
+#ifdef SPECTER_XL
+    auth.check = auth_checksum(auth);
+    w = (const uint32_t*)&auth;
+    for (unsigned i = 0; i < sizeof(ConfigAuth) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, AUTH_ADDR + i * 4, w[i]);
+#endif
     HAL_FLASH_Lock();
 }
 
@@ -627,7 +663,17 @@ public:
     uint32_t packetStatus() { return getPacketStatus(); }
     int rssiInst() { uint8_t r = 0; getMod()->SPIreadStream(RADIOLIB_SX126X_CMD_GET_RSSI_INST, &r, 1); return -(int)r / 2; }
 };
+#ifdef SPECTER_XL
+// XL keeps RadioLib in the upper 64 KB, so nothing may run its code (including
+// a global constructor) before setup() has checked that half was flashed.
+static Radio* radio_p = NULL;
+#define radio (*radio_p)
+// Linked last into the upper 64 KB: if it reads back, that half was flashed.
+#define XL_MAGIC 0x4C584353UL
+__attribute__((section(".xl_magic"), used)) static const volatile uint32_t xl_magic_word = XL_MAGIC;
+#else
 Radio radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
+#endif
 
 #if defined(ARDUINO_ARCH_STM32)
 // Core clock is chosen before setup() runs, from the saved powersaving flag:
@@ -1062,6 +1108,13 @@ static bool rt_any(void) { for (int i = 0; i < RT_SLOTS; i++) if (rt[i].used) re
 // SNR floor per spreading factor (dB×4): SF7 -7.5 … SF12 -20
 static int snr_floor4(void) { return -30 - ((int)cfg.sf - 7) * 10; }
 
+#ifdef SPECTER_XL
+static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope);
+static void xl_note_neighbour(const uint8_t* pub, int8_t snr4);
+static uint32_t stat_for_us = 0;
+static bool xl_type(uint8_t t) { return t == PT_REQ || t == PT_TXT_MSG || t == PT_ANON_REQ || t == PT_PATH; }
+#endif
+
 static const char* handle_direct(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
 
@@ -1092,10 +1145,21 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
             packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
             if (!was_seen(h)) {
                 mark_seen(h);
-                if (advert_verify(p.payload, p.payload_len, 0) && (p.payload[100] & 0x0F) == ADV_TYPE_REPEATER)
+                if (advert_verify(p.payload, p.payload_len, 0) && (p.payload[100] & 0x0F) == ADV_TYPE_REPEATER) {
                     rr_note(p.payload, 3, snr4);
+#ifdef SPECTER_XL
+                    xl_note_neighbour(p.payload, snr4);
+#endif
+                }
             }
         }
+#ifdef SPECTER_XL
+        else if (xl_type(p.ptype)) {                   // addressed to us (last hop removed)
+            packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
+            if (was_seen(h)) return "dedup";
+            if (xl_handle_for_us(p, snr4, -1)) { mark_seen(h); stat_for_us++; return "for us"; }
+        }
+#endif
         return "zero-hop";
     }
     if (!is_own_hash(p.path, p.hash_size)) {
@@ -1185,6 +1249,14 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
         if (p.ptype == PT_ADVERT) ag_echo(h, p.hash_count);
         return rt_echo(h, false, p.hash_count) ? "echo" : "dedup";
     }
+#ifdef SPECTER_XL
+    if (xl_type(p.ptype) && p.payload_len > 2 && p.payload[0] == own_pubkey[0]) {
+        int scope = -1;
+        if (p.route == ROUTE_TRANSPORT_FLOOD && (p.tc[0] || p.tc[1]))
+            scope = region_match(p.tc[0], p.ptype, p.payload, p.payload_len);
+        if (xl_handle_for_us(p, snr4, scope)) { mark_seen(h); stat_for_us++; return "for us"; }
+    }
+#endif
     if (!cfg.repeat) return "repeat off";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
     if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
@@ -1455,7 +1527,7 @@ static void cfg_defaults(void) {
 #ifdef NODE_NAME_STR
     strncpy(cfg.name, NODE_NAME_STR, sizeof(cfg.name) - 1);
 #else
-    sprintf(cfg.name, "SPECTER-%04X", (unsigned)(uid[2] & 0xFFFF));
+    sprintf(cfg.name, "Spectra-%04X", (unsigned)(uid[2] & 0xFFFF));
 #endif
     // Identity seed: UID only for now; setup() mixes in radio noise before saving.
     SHA256 sha;
@@ -1718,6 +1790,9 @@ static void handle_get(const char* k, char* reply) {
         static const char* const ld[] = { "off", "minimal", "moderate", "strict" };
         sprintf(reply, "> %s", ld[cfg.loop_detect & 3]);
     }
+#ifdef SPECTER_XL
+    else if (!strcmp(k, "guest.password")) sprintf(reply, "> %s", auth.guest_pw);
+#endif
     else if (!strcmp(k, "public.key")) { strcpy(reply, "> "); to_hex(reply + 2, own_pubkey, 32); }
     else if (!strcmp(k, "prv.key"))    { strcpy(reply, "> "); to_hex(reply + 2, cfg.privkey, 32); }
     else if (!strcmp(k, "role"))       strcpy(reply, "> repeater");
@@ -1824,7 +1899,12 @@ static void handle_set(const char* cmd, char* reply) {
         memcpy(cfg.privkey, key, 32);
         done = "OK, reboot to apply!";
     } else if (!strcmp(k, "password") || !strcmp(k, "guest.password")) {
-        strcpy(reply, "Error: remote admin not supported"); return;
+#ifdef SPECTER_XL
+        if (strlen(v) > 15) { strcpy(reply, "Error, max 15 characters"); return; }
+        strcpy(k[0] == 'p' ? auth.admin_pw : auth.guest_pw, v);
+#else
+        strcpy(reply, "Error: remote admin needs the XL (128 KB) build"); return;
+#endif
     } else {
         sprintf(reply, "unknown config: %s", k); return;
     }
@@ -1880,7 +1960,7 @@ static void handle_command(char* cmd, char* reply) {
     } else if (!strcmp(cmd, "clock")) {
         fmt_clock(reply, clock_now());
     } else if (!strcmp(cmd, "ver")) {
-        strcpy(reply, FW_VERSION " (Build: " __DATE__ ")");
+        strcpy(reply, FW_NAME " " FW_VERSION " (Build: " __DATE__ ")");
     } else if (!strcmp(cmd, "board")) {
         strcpy(reply, "DX-LR30 (STM32F103+SX1262)");
     } else if (!strcmp(cmd, "erase")) {
@@ -1902,12 +1982,48 @@ static void handle_command(char* cmd, char* reply) {
                 (unsigned long)stat_drop, (unsigned long)stat_tx, (unsigned long)stat_retry,
                 (unsigned long)stat_echo, (unsigned long)stat_adv_guard, (unsigned long)stat_lbt,
                 (unsigned long)last_batt_mv);
-    } else if (!strncmp(cmd, "password", 8)) {
-        strcpy(reply, "Error: remote admin not supported");
+    } else if (!strncmp(cmd, "password", 8) && (cmd[8] == 0 || cmd[8] == ' ')) {
+#ifdef SPECTER_XL
+        const char* v = skip_ws(cmd + 8);           // upstream: "password <new admin password>"
+        if (!*v) strcpy(reply, auth.admin_pw[0] ? "Error: give a new password" : "remote login is off (no password set)");
+        else if (strlen(v) > 15) strcpy(reply, "Error, max 15 characters");
+        else { strcpy(auth.admin_pw, v); cfg_save(); sprintf(reply, "password now: %s", auth.admin_pw); }
+#else
+        strcpy(reply, "Error: remote admin needs the XL (128 KB) build");
+#endif
     } else if (*cmd) {
         strcpy(reply, "Unknown command");
     }
 }
+
+#ifdef SPECTER_XL
+static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts);
+#include "xl_admin.inc"
+
+// Over-the-air CLI (admin login): everything the USB console offers except the
+// identity/erase commands, plus upstream's "clock sync" (sets time from the app).
+static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
+    while (*cmd == ' ') cmd++;
+    reply[0] = 0;
+    if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4)) {
+        strcpy(reply, "Error: USB console only"); return;
+    }
+    if (!strcmp(cmd, "clock sync")) {
+        if (sender_ts > clock_now()) {
+            clock_set(sender_ts);
+            cs_manual = true;
+            strcpy(reply, "OK - clock set: "); fmt_clock(reply + 16, clock_now());
+        } else strcpy(reply, "ERR: clock cannot go backwards");
+        return;
+    }
+    handle_command(cmd, reply);
+    if (reboot_pending) {                       // let the reply go out first
+        reboot_pending = false;
+        xl_reboot_at = (millis() + 4000) | 1;
+        strcpy(reply, "OK - rebooting");
+    }
+}
+#endif
 
 static char    cli_buf[160];
 static uint8_t cli_len = 0;
@@ -1947,6 +2063,14 @@ void setup(void) {
     pinMode(PIN_RXEN, OUTPUT); digitalWrite(PIN_RXEN, LOW);
 
     Serial1.begin(115200);
+#ifdef SPECTER_XL
+    if (xl_magic_word != XL_MAGIC) {                 // nothing from the upper half has run yet
+        Serial1.println(FW_NAME " XL: upper 64 KB of flash is blank or missing.");
+        Serial1.println("Flash the complete .hex file (this build needs a 128 KB chip).");
+        while (true) { led(true); delay(150); led(false); delay(850); }
+    }
+    radio_p = new Radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
+#endif
     IWatchdog.begin(8000000);
 
     bool have_cfg = false;
@@ -1962,6 +2086,15 @@ void setup(void) {
             cfg_save();
         }
     }
+#ifdef SPECTER_XL
+    memcpy(&auth, (const void*)AUTH_ADDR, sizeof(auth));
+    if (auth.magic != AUTH_MAGIC || auth.check != auth_checksum(auth)) {
+        memset(&auth, 0, sizeof(auth));
+        auth.magic = AUTH_MAGIC;
+    }
+    auth.admin_pw[15] = auth.guest_pw[15] = 0;
+    xl_init();
+#endif
     regions_rekey();
     if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
 
@@ -1977,7 +2110,7 @@ void setup(void) {
     }
     delay(200);
     Serial1.println();
-    Serial1.println("SPECTER MeshCore Repeater " FW_VERSION);
+    Serial1.println(FW_NAME " MeshCore Repeater " FW_VERSION);
     if (woke) Serial1.println("Battery recovered: resuming");
     if (!radio_init()) {
         while (true) { led(true); delay(100); led(false); delay(100); }   // IWDG resets & retries
@@ -2006,6 +2139,9 @@ void setup(void) {
     Serial1.println(radio_has_tcxo ? "(tcxo)" : "(xtal)");
     Serial1.print("Power: "); Serial1.print(SystemCoreClock / 1000000UL); Serial1.print(" MHz, battery ");
     Serial1.print(battery_mv()); Serial1.println(" mV");
+#ifdef SPECTER_XL
+    Serial1.println(auth.admin_pw[0] ? "App login: on" : "App login: off (set one with 'password <x>')");
+#endif
     Serial1.println("Type 'get name', 'set name <x>', 'region', 'log start' ...");
 
     budget_ms = budget_max() / 2;
@@ -2079,6 +2215,15 @@ void loop(void) {
         handle_command((char*)"stats", r);
         Serial1.println(r);
     }
+#ifdef SPECTER_XL
+    if (xl_reboot_at && (int32_t)(millis() - xl_reboot_at) >= 0) {
+        int q = 0; for (int i = 0; i < TXQ_SIZE; i++) q += txq[i].used;
+        if (!q || (int32_t)(millis() - xl_reboot_at) > 15000) {
+            journal_write(clock_now(), j_last_flood_ts);
+            NVIC_SystemReset();
+        }
+    }
+#endif
     if (timers_dirty) {
         timers_dirty = false;
         next_local_advert_s = up + cfg.advert_interval_min * 60UL;

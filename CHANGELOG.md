@@ -1,6 +1,19 @@
 # Changelog
 
-All notable changes to SPECTER firmware are documented here.
+All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
+
+## [2.4.0] - 2026-10-11
+
+### Added
+- XL build (`env:specter_xl`, `env:specter_xl_eu`) for chips with 128 KB flash. RadioLib and Crypto are linked into the upper 64 KB (`specter_xl.ld`) and shipped as a `.hex` that skips the settings pages
+- Login from the MeshCore app: admin/guest passwords (`password`, `set/get guest.password`). Login stays off until a password is set
+- Status, telemetry (LPP voltage and temperature), neighbours, access list, owner info and anonymous clock/owner/regions queries
+- Remote CLI over the air for admins, plus upstream's `clock sync`. `prv.key`, `erase` and `log` are USB only, and remote `reboot` is delayed until the reply is sent
+- Boot-time check that the upper half was flashed; build check that no global constructor lives there
+- `test/host/test_xl.cpp`: key exchange checked against upstream's ed25519, plus an end-to-end protocol test
+
+### Changed
+- Firmware renamed **Spectra-Cascadia**. `ver` now reports `Spectra-Cascadia v2.4.0`, and the default name for new nodes is `Spectra-XXXX`
 
 ## [2.3.1-cascadia] - 2026-10-11
 

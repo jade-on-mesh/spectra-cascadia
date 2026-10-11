@@ -392,10 +392,10 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("2.3.1-cascadia") == 0, "ver");
+    CHECK(cli("ver").find("Spectra-Cascadia v2.4.0") == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
-    CHECK(cli("password abc") == "Error: remote admin not supported", "password not supported");
+    CHECK(cli("password abc").find("XL") != std::string::npos, "password needs the XL build");
     CHECK(cli("frobnicate") == "Unknown command", "unknown command");
     { Serial1.out.clear(); Serial1.in = "get tx\n"; cli_poll();
       CHECK(Serial1.out.find("  -> > 22") != std::string::npos, "LF-only line ending accepted");
@@ -450,7 +450,7 @@ int main() {
 
     CHECK(cli("erase").find("OK") != std::string::npos, "erase");
     { memset(&cfg, 0, sizeof(cfg)); Serial1.out.clear(); setup();
-      CHECK(Serial1.out.find("First boot") != std::string::npos && !strncmp(cfg.name, "SPECTER-", 8), "erase -> defaults on next boot"); }
+      CHECK(Serial1.out.find("First boot") != std::string::npos && !strncmp(cfg.name, "Spectra-", 8), "erase -> defaults on next boot"); }
 
     printf("\n%d failure(s)\n", fails);
     return fails != 0;

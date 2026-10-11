@@ -1,4 +1,6 @@
-# SPECTER Native MeshCore Repeater for DX-LR30
+# Spectra-Cascadia: native MeshCore repeater for the DX-LR30
+
+*(CascadiaMesh fork of SPECTER by MaliosDark)*
 
 > The DX-LR30 is a cheap Chinese LoRa shell device. MeshCore has no official
 > firmware for STM32F103 + SX1262.
@@ -25,13 +27,62 @@ no-filesystem part allows.
 | Busy-polling at 72 MHz | MCU sleeps (`WFI`) between polls |
 
 v2.1 adds an upstream-style **USB serial CLI** with settings stored in flash (below).
-Still **not** included (no room): remote admin login, telemetry, private (`$`)
-regions, neighbour tables.
+v2.4 adds an **XL build** with login from the normal MeshCore app (below). Still not
+included: private (`$`) regions.
 
-**Status (v2.3):** compiles (≈60 KB of the 62 KB budget) and passes the host-side tests in
+**Status (v2.4):** the standard build compiles (≈60 KB of the 62 KB budget) and passes the host-side tests in
 `test/host/` (forwarding rules, region codes cross-checked against a Python HMAC
 reference, journal wear/rollover, serial CLI, settings persistence). **Not yet RF-tested on hardware.** Test on the bench
 next to a known-good MeshCore repeater before deploying.
+
+### v2.4: Spectra-Cascadia, and the XL build (log in from the MeshCore app)
+
+The firmware is now called **Spectra-Cascadia** (`ver` → `Spectra-Cascadia v2.4.0`; new
+nodes default to the name `Spectra-XXXX`). Saved names are not changed.
+
+Most STM32F103**C8** chips have 128 KB of flash, although they report 64 KB. The **XL build**
+uses the upper 64 KB: RadioLib and the crypto library move up there, which frees
+room in the lower 62 KB for the server side of upstream `simple_repeater`:
+
+| From the MeshCore app | XL |
+|---|---|
+| Log in as admin / guest (password) | ✓ (`ANON_REQ` login, same key exchange and AES/HMAC as upstream) |
+| Status screen (battery, uptime, queue, noise floor, RSSI/SNR, packet counts, airtime) | ✓ |
+| Telemetry (voltage + MCU temperature, Cayenne LPP) | ✓ |
+| Neighbours (zero-hop repeater adverts heard: key, last heard, SNR) | ✓ (last 8) |
+| Command line: every USB command, plus `clock sync` (sets time from the phone) | ✓ (admin only) |
+| Access list, owner info, anonymous clock/owner/regions queries | ✓ |
+| `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
+
+**Login is off until you set a password over USB:**
+
+```
+password <admin password>        (max 15 characters; also works over the air)
+set guest.password <password>    (optional, read-only access)
+get guest.password
+```
+
+An empty password never matches, and upstream's default `password` is **not** set.
+Remote `reboot` waits about 4 s so its reply can go out first.
+
+**Before flashing XL, run `tools/flash128_test` on that board** (each chip has to pass).
+If the upper half is missing or wasn't written, XL stops at boot, prints why on the
+serial port and blinks the LED slowly. It doesn't run half-installed.
+
+**Flash the `.hex` file, not a `.bin`.** The image skips the two settings pages at
+0x0800F800–0x0800FFFF, so name, identity, regions and passwords survive the upgrade
+(and a later downgrade to the standard build). A `.bin` would fill that gap with zeros.
+With STM32CubeProgrammer, open the `.hex` and click Download. Don't use Full chip erase.
+If the programmer refuses addresses above 0x08010000 (it believes the 64 KB size register),
+use `pio run -e specter_xl -t upload`, which runs OpenOCD with the flash size forced to 128 KB.
+
+Layout (`specter_xl.ld`): 0x08000000 core (≈45 KB of 62 KB used) · 0x0800F800 settings ·
+0x0800FC00 clock journal · 0x08010000 RadioLib + Crypto (≈26 KB of 64 KB), with a marker
+word at the end. `tools/xl_hex.py` writes the `.hex` and fails the build if any global
+constructor ends up in the upper half, because constructors run before the check.
+Host tests (`test/host/test_xl.cpp`) check the key exchange against upstream
+MeshCore's own ed25519 code. They also run login, PATH learning, status, telemetry,
+neighbours, the access list, remote CLI, the legacy ACK and replay rejection end to end.
 
 ### v2.3.1: quieter adverts
 
@@ -197,7 +248,7 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `get battery`, `get`/`set battery.pin off\|pb0\|pb1`, `battery.divider`, `battery.cutoff`, `battery.resume` | Battery reading and low-voltage cutoff |
 | `get telemetry.volt [page]`, `get telemetry.temp [page]` | 7-day, 30-minute history |
 
-Not supported (no room): remote admin login / passwords, neighbours, telemetry,
+Not supported in the standard build (no room; see the XL build): remote admin login / passwords, neighbours, telemetry,
 private `$` regions, region hierarchy (parent arguments are ignored).
 
 On first boot the node creates a **random identity** from radio noise and saves it,
@@ -468,7 +519,8 @@ Use Sketch → Export Compiled Binary and check the size stays under 63,488 byte
 
 ```bash
 git clone https://github.com/rweather/arduinolibs
-CRYPTO_DIR=$PWD/arduinolibs/libraries/Crypto ./test/host/run.sh
+git clone https://github.com/meshcore-dev/MeshCore      # only for the XL tests
+CRYPTO_DIR=$PWD/arduinolibs/libraries/Crypto MESHCORE_DIR=$PWD/MeshCore ./test/host/run.sh
 ```
 
 ---
