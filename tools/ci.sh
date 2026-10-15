@@ -8,6 +8,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 DEPS="${SPECTRA_DEPS:-$HOME/.spectra-deps}"
 OUT="${CI_OUT:-$ROOT/dist}"; mkdir -p "$OUT"
 
+# On GitHub Actions, surface failures as annotations (readable without log access).
+fail() {  # title file
+  echo "FAILED: $1"; tail -40 "$2"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    msg=$(grep -E "error|Error|FAIL|overflow|XL:|No such|not found|undefined" "$2" | head -25 || true)
+    [ -n "$msg" ] || msg=$(tail -25 "$2")
+    msg=${msg//'%'/'%25'}; msg=${msg//$'\n'/'%0A'}
+    echo "::error title=$1::$msg"
+  fi
+  exit 1
+}
+
 if [ -n "${CI_ONLINE:-}" ]; then
   CONF=platformio.ini; ENVS=(specter specter_xl specter_eu specter_xl_eu)
   CRYPTO_DIR="${CRYPTO_DIR:?}"; MESHCORE_DIR="${MESHCORE_DIR:?}"
@@ -18,12 +30,12 @@ else
 fi
 
 echo "== host tests"
-TMPDIR="$(mktemp -d)" CRYPTO_DIR="$CRYPTO_DIR" MESHCORE_DIR="$MESHCORE_DIR" test/host/run.sh > "$OUT/tests.log" 2>&1 || { tail -40 "$OUT/tests.log"; exit 1; }
-grep -q "^FAIL" "$OUT/tests.log" && { grep "^FAIL" "$OUT/tests.log"; exit 1; }
+TMPDIR="$(mktemp -d)" CRYPTO_DIR="$CRYPTO_DIR" MESHCORE_DIR="$MESHCORE_DIR" test/host/run.sh > "$OUT/tests.log" 2>&1 || fail "host tests" "$OUT/tests.log"
+if grep -q "^FAIL" "$OUT/tests.log"; then fail "host tests" "$OUT/tests.log"; fi
 echo "   $(grep -c '^PASS' "$OUT/tests.log") checks passed"
 
 echo "== builds"
-pio run -c "$CONF" $(printf -- '-e %s ' "${ENVS[@]}") > "$OUT/build.log" 2>&1 || { grep -E "error|Error|overflow|XL:" "$OUT/build.log" | head -20; exit 1; }
+pio run -c "$CONF" $(printf -- '-e %s ' "${ENVS[@]}") > "$OUT/build.log" 2>&1 || fail "firmware builds" "$OUT/build.log"
 grep -E "^(RAM|Flash):" "$OUT/build.log" | sed 's/^/   /'
 
 VER=$(sed -n 's/^#define FW_VERSION *"\(v[^"]*\)".*/\1/p' src/main.cpp)
@@ -34,7 +46,7 @@ cp "$B/${ENVS[2]}/firmware.bin" "$OUT/spectra-cascadia-$VER-eu.bin"
 cp "$B/${ENVS[3]}/firmware.hex" "$OUT/spectra-cascadia-$VER-xl-eu.hex"
 
 echo "== image checks"
-python3 - "$OUT" "$VER" <<'PY'
+python3 - "$OUT" "$VER" > "$OUT/images.log" 2>&1 <<'PY' || fail "image checks" "$OUT/images.log"
 import sys, glob, os
 out, ver = sys.argv[1], sys.argv[2]
 for hx in glob.glob(f"{out}/spectra-cascadia-{ver}-xl-*.hex"):
@@ -46,10 +58,11 @@ for hx in glob.glob(f"{out}/spectra-cascadia-{ver}-xl-*.hex"):
             a = base + int(l[3:7], 16); segs.append((a, a + int(l[1:3], 16)))
     bad = [s for s in segs if s[0] < 0x08010000 and s[1] > 0x0800F800] + [s for s in segs if s[1] > 0x0801FC00]
     assert not bad, f"{hx}: data in the settings or admin-list pages"
-    print(f"   {os.path.basename(hx)}: low end {max(b for a,b in segs if a < 0x08010000):#x}, high end {max(b for a,b in segs):#x}")
+    print(f"{os.path.basename(hx)}: low end {max(b for a,b in segs if a < 0x08010000):#x}, high end {max(b for a,b in segs):#x}")
 for bn in glob.glob(f"{out}/spectra-cascadia-{ver}-*.bin"):
     n = os.path.getsize(bn); assert n <= 63488, f"{bn}: {n} > 62 KB"
     assert ver.encode() in open(bn, "rb").read(), f"{bn}: version string missing"
-    print(f"   {os.path.basename(bn)}: {n} bytes")
+    print(f"{os.path.basename(bn)}: {n} bytes")
 PY
+sed 's/^/   /' "$OUT/images.log"
 echo "OK $VER -> $OUT"
