@@ -1,10 +1,11 @@
-# PlatformIO build output
-.pio/
-
-# Python cache
-__pycache__/
-*.pyc
 
 # Logs
-logs/
+# PlatformIO build output
+# Python cache
 *.log
+*.pyc
+.pio/
+__pycache__/
+dist/
+logs/
+platformio-offline.ini

@@ -1,0 +1,22 @@
+{
+  "_doc": "State for the upstream-sync task (see UPSTREAM_SYNC.md). Updated by every sync run.",
+  "official": {
+    "repo": "meshcore-dev/MeshCore",
+    "last_release": "repeater-v1.17.1"
+  },
+  "keymind": {
+    "repo": "mikecarper/MeshCore",
+    "branch": "keymindCascade",
+    "last_version": "v1.17.1.9",
+    "last_commit": "656cb6924"
+  },
+  "ported": [
+    "keymind: echo-cancelled flood/direct retries, CR ladder, presets (v2.2)",
+    "keymind: mesh clock sync by advert consensus (v2.2)",
+    "keymind: power saving, battery telemetry/cutoff, advert echo guard, radio stats (v2.3)",
+    "keymind: LoRa OTA relay during tempradio (1.17.1.3)"
+  ],
+  "declined": [
+    "keymind: LoRa OTA install (needs bootloader; ~10 KB patch limit on STM32F103 — paused, see Cheapeater OTA design)"
+  ]
+}

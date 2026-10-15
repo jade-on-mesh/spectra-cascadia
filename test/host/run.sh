@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 CR="${CRYPTO_DIR:?set CRYPTO_DIR to rweather Crypto library folder}"
 CSRC=("$CR"/SHA256.cpp "$CR"/SHA512.cpp "$CR"/Hash.cpp "$CR"/Ed25519.cpp "$CR"/Curve25519.cpp
       "$CR"/BigNumberUtil.cpp "$CR"/Crypto.cpp "$CR"/RNG.cpp "$CR"/NoiseSource.cpp "$CR"/ChaCha.cpp "$CR"/Cipher.cpp)
-OUT="${TMPDIR:-/tmp}"
+OUT="${TMPDIR:-/tmp}"; mkdir -p "$OUT"
 g++ -std=gnu++17 -O1 -w -Istub -I"$CR" test_forwarding.cpp "${CSRC[@]}" -o "$OUT/specter_host_test"
 "$OUT/specter_host_test"
 

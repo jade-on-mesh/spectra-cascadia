@@ -1,0 +1,43 @@
+# Builds and publishes a release whenever a version tag (v*) is pushed —
+# by a person or by the upstream-sync task. Runs the same checks as tools/ci.sh.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Tools
+        run: |
+          pip install platformio==6.1.18
+          git clone -q --depth 1 https://github.com/rweather/arduinolibs.git ../arduinolibs
+          git clone -q --depth 1 https://github.com/meshcore-dev/MeshCore.git ../MeshCore
+      - name: Tests, builds, image checks
+        env:
+          CI_ONLINE: 1
+          CRYPTO_DIR: ${{ github.workspace }}/../arduinolibs/libraries/Crypto
+          MESHCORE_DIR: ${{ github.workspace }}/../MeshCore
+        run: tools/ci.sh
+      - name: Tag matches FW_VERSION
+        run: |
+          V=$(sed -n 's/^#define FW_VERSION *"\(v[^"]*\)".*/\1/p' src/main.cpp)
+          [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" = "$V" ] || { echo "tag $GITHUB_REF_NAME != $V"; exit 1; }
+      - name: Release notes from CHANGELOG
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          awk -v v="$V" '$0 ~ "^## \\[" v "\\]" {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md" > notes.md
+      - uses: softprops/action-gh-release@v2.0.8
+        if: github.ref_type == 'tag'
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.hex
+            dist/*.bin
