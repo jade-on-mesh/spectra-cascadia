@@ -18,16 +18,14 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - name: Tools
-        run: |
-          pip install platformio==6.1.18
-          git clone -q --depth 1 https://github.com/rweather/arduinolibs.git ../arduinolibs
-          git clone -q --depth 1 https://github.com/meshcore-dev/MeshCore.git ../MeshCore
+      - name: Cache toolchain sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.spectra-deps
+          key: spectra-deps-${{ hashFiles('tools/offline/setup.sh') }}
+      - name: Pinned toolchain (same as the sync task and local builds)
+        run: tools/offline/setup.sh
       - name: Tests, builds, image checks
-        env:
-          CI_ONLINE: 1
-          CRYPTO_DIR: ${{ github.workspace }}/../arduinolibs/libraries/Crypto
-          MESHCORE_DIR: ${{ github.workspace }}/../MeshCore
         run: tools/ci.sh
       - name: Already released?
         id: ver
@@ -52,3 +50,13 @@ jobs:
           files: |
             dist/*.hex
             dist/*.bin
+
+  # Informational: the normal `pio run` path (registry packages). Never blocks a release.
+  registry-build:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install platformio==6.1.18 && pio run -e specter -e specter_xl > build.log 2>&1 || { grep -E "error|Error|overflow" build.log | head -15 | sed 's/^/::warning title=registry build::/'; exit 1; }
