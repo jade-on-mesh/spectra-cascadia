@@ -36,8 +36,13 @@ nRF52/ESP32-only drivers and bootloaders, OTA install, build tooling, docs-only 
 4. `tools/ci.sh` must pass: all tests, all four builds, image checks.
 5. Version (see below), `CHANGELOG.md` entry ("Upstream sync" section listing ported and declined items with
    upstream commit links), update `.upstream-sync.json`.
-6. Commit, tag `vX.Y.Z.N`, push. GitHub Actions builds and publishes the release.
+6. Commit and push to `main`. **Do not push tags.** On every push to `main`, GitHub Actions
+   (`.github/workflows/release.yml`) re-runs `tools/ci.sh`. If `FW_VERSION` has no release yet, it tags that commit
+   and publishes the release with the firmware files.
 7. If a check fails or a port is unsafe, push nothing to `main`. Put the work on a `sync/<version>` branch and report why.
+
+## Releasing by hand
+Bump `FW_VERSION` in `src/main.cpp` (and the `* Version:` header line), add the `CHANGELOG.md` section, push to `main`.
 
 ## Versioning
 - The first three numbers follow official MeshCore. A new official release `X.Y.Z` → `vX.Y.Z.1`.
