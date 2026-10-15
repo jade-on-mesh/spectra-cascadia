@@ -261,7 +261,7 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.2") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.3") == 0, "remote CLI: ver");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -624,6 +624,40 @@ int main() {
       CHECK(cfg.freq_khz == 910525 && cfg.sf == 7 && cli("get radio") == "> 910.525,62.5,7,5", "reverts after the timeout");
       CHECK(cli("tempradio 915,250,10,5,0") == "Error, invalid params", "minutes required");
       clearq(); }
+
+
+    // ── LoRa OTA relay (mikecarper protocol), only during tempradio
+    { auto ota = [&](uint8_t msg, uint8_t hops, uint8_t seq) {
+          uint8_t pk[64]; int n = 0; pk[n++] = (PT_OTA << 2) | ROUTE_FLOOD; pk[n++] = hops;
+          for (int i = 0; i < hops; i++) pk[n++] = 0x30 + i;
+          pk[n++] = msg; for (int i = 0; i < 20; i++) pk[n++] = (uint8_t)(seq + i);
+          on_receive(pk, n, 10); };
+      clearq(); ota(0x07, 1, 1);
+      CHECK(queued() == 0, "OTA packets ignored outside tempradio");
+      reboot_pending = false;
+      cli("tempradio 910.525,250,7,5,60"); fake_ms += 2100; loop(); clearq();
+      CHECK(tr_active, "tempradio running");
+      ota(0x07, 1, 2);                                                // OTA_DATA (active transfer)
+      TxItem* t = last_q();
+      CHECK(queued() == 1 && t->pri == 0 && t->buf[1] == 2 && t->buf[3] == own_pubkey[0], "OTA DATA relayed at primary priority, hash appended");
+      ota(0x07, 1, 2);
+      CHECK(queued() == 1, "identical copy still queued: not added twice");
+      clearq(); ota(0x07, 1, 2);
+      CHECK(queued() == 0, "same packet again right away: duplicate");
+      ota(0x07, 3, 2);
+      CHECK(queued() == 0, "longer-path copy: downstream echo");
+      fake_ms += 1100; ota(0x07, 1, 2);
+      CHECK(queued() == 1, "re-sent after the quiet time: forwarded again (retry after a loss)");
+      clearq(); ota(0x01, 0, 9);                                      // OTA_ADV (discovery)
+      CHECK(queued() == 1 && last_q()->pri == 250, "discovery relayed at background priority");
+      int fm = cfg.flood_max; cfg.flood_max = 8;
+      clearq(); ota(0x07, 8, 3);
+      CHECK(queued() == 0, "flood.max still applies"); cfg.flood_max = fm;
+      CHECK(cli("normalradio") == "OK - restoring normal radio", "normalradio");
+      fake_ms += 2100; loop();
+      CHECK(!tr_active && cfg.freq_khz == 910525 && cfg.bw_hz == 62500, "normalradio restores the saved radio");
+      clearq(); ota(0x07, 1, 4);
+      CHECK(queued() == 0, "and OTA relay stops"); clearq(); }
 
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);

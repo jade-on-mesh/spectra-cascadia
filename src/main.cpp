@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 1.17.1.2 (official MeshCore 1.17.1 + Spectra-Cascadia release 2)
+ * Version: 1.17.1.3 (official MeshCore 1.17.1 + Spectra-Cascadia release 3)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.17.1.2"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.17.1.3"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -157,6 +157,7 @@
 #define PT_TRACE      0x09
 #define PT_MULTIPART  0x0A
 #define PT_CONTROL    0x0B
+#define PT_OTA        0x0C      // mikecarper/MeshCore LoRa OTA (docs/ota_protocol.md)
 #define PT_RAW_CUSTOM 0x0F
 
 #define MAX_PATH_SIZE        64
@@ -1478,8 +1479,71 @@ static bool better_copy(const Pkt& p, int8_t snr4) {
 }
 #endif
 
+#ifdef SPECTER_XL
+// LoRa OTA relay (mikecarper/MeshCore Mesh::onRecvPacket, PAYLOAD_TYPE_OTA): carried
+// opaquely, and only while a tempradio window is running. Ordinary flood limits and
+// region rules apply; duplicates use a time-bounded cache instead of the seen table so
+// a re-sent request or block after a loss is forwarded again (allowOtaForwardRetry).
+#define OTA_FWD_SLOTS 16
+struct OtaFwd { uint8_t h[4]; uint32_t at; uint8_t min_hops, used; };
+static OtaFwd ota_fwd[OTA_FWD_SLOTS];
+static uint8_t ota_fwd_next = 0;
+static uint32_t stat_ota_relay = 0;
+static bool ota_is_transfer(uint8_t t) { return t >= 0x04 && t <= 0x0B; }   // GET_MANIFEST … LEAVES
+static const char* handle_ota_flood(const Pkt& p) {
+    if (!tr_active) return "ota (no tempradio)";                  // invisible outside the window
+    if (p.payload_len < 1) return "ota short";
+    if (!cfg.repeat) return "repeat off";
+    if (p.hash_count >= cfg.flood_max) return "flood.max";
+    if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
+    if (p.route == ROUTE_TRANSPORT_FLOOD) {
+        if (p.tc[0] == 0 && p.tc[1] == 0) return "share";
+        if (region_match(p.tc[0], p.ptype, p.payload, p.payload_len) < 0) return "region";
+    } else if (cfg.wildcard_flags & REGION_DENY_FLOOD) return "unscoped denied";
+    for (int k = 0; k < p.hash_count; k++) if (is_own_hash(p.path + k * p.hash_size, p.hash_size)) return "loop";
+    int pbytes = p.hash_count * p.hash_size;
+    if (pbytes + p.hash_size > MAX_PATH_SIZE) return "path full";
+    // an identical copy is already waiting to go out
+    for (int i = 0; i < TXQ_SIZE; i++)
+        if (txq[i].used && ((txq[i].buf[0] >> 2) & 15) == PT_OTA && txq[i].len >= p.payload_len
+            && !memcmp(txq[i].buf + txq[i].len - p.payload_len, p.payload, p.payload_len)) return "ota queued";
+    uint8_t h[8];
+    packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
+    int raw = 2 + (p.route == ROUTE_TRANSPORT_FLOOD ? 4 : 0) + pbytes + p.payload_len;
+    uint32_t air = airtime_ms(raw), quiet = air > 500 ? air * 2 : 1000, now = millis();
+    OtaFwd* e = NULL;
+    for (int i = 0; i < OTA_FWD_SLOTS; i++) if (ota_fwd[i].used && !memcmp(ota_fwd[i].h, h, 4)) { e = &ota_fwd[i]; break; }
+    if (e) {
+        uint32_t age = now - e->at;
+        if (!(age >= 30000 && age >= quiet * 4)) {
+            if (p.hash_count > e->min_hops) return "ota echo";       // a downstream copy of ours
+            if (age < quiet) return "ota dup";
+        }
+    }
+    bool transfer = ota_is_transfer(p.payload[0]);
+    if (!transfer) {                                              // discovery sheds load first
+        int free_slots = 0; for (int i = 0; i < TXQ_SIZE; i++) free_slots += !txq[i].used;
+        if (free_slots < 2) return "ota busy";
+    }
+    if (!e) { e = &ota_fwd[ota_fwd_next]; ota_fwd_next = (ota_fwd_next + 1) % OTA_FWD_SLOTS; }
+    memcpy(e->h, h, 4); e->at = now; e->min_hops = p.hash_count; e->used = 1;
+    uint8_t newpath[MAX_PATH_SIZE];
+    memcpy(newpath, p.path, pbytes);
+    memcpy(newpath + pbytes, own_pubkey, p.hash_size);
+    int n = build(out_buf, p.header, p.tc, (p.path_len & 0xC0) | ((p.hash_count + 1) & 0x3F), newpath, pbytes + p.hash_size, p.payload, p.payload_len);
+    if (n < 0) return "too big";
+    uint32_t d = transfer ? delay_for(p, cfg.txdelay_x100) : rnd_range((air + 3) / 4, air / 2 + 1);
+    txq_push(out_buf, n, transfer ? 0 : 250, d);                  // active transfer = primary priority
+    stat_ota_relay++;
+    return NULL;
+}
+#endif
+
 static const char* handle_flood(const Pkt& p, int8_t snr4) {
     uint8_t h[8];
+#ifdef SPECTER_XL
+    if (p.ptype == PT_OTA) return handle_ota_flood(p);
+#endif
     packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
     if (p.hash_count) rr_note(p.path + (p.hash_count - 1) * p.hash_size, p.hash_size, snr4);
     if (was_seen(h)) {
@@ -2521,6 +2585,11 @@ static void handle_command(char* cmd, char* reply) {
         tr_apply_at = (millis() + 2000) | 1;              // let the reply go out first
         tr_revert_at = millis() + 2000 + (uint32_t)mins * 60000UL;
         sprintf(reply, "OK - temp params for %d mins", mins);
+    } else if (!strcmp(cmd, "normalradio")) {            // cancel tempradio (after this reply goes out)
+        if (!tr_active && !tr_apply_at) { strcpy(reply, "OK - normal radio"); return; }
+        tr_apply_at = 0;
+        if (tr_active) tr_revert_at = millis() + 2000;   // the loop reverts once the reply is on air
+        strcpy(reply, "OK - restoring normal radio");
     } else if (!strcmp(cmd, "alert test")) {
         if (!more.key_len) strcpy(reply, "Error: no alert.channel set");
         else if (!more.alerts) strcpy(reply, "Error: alerts are off");

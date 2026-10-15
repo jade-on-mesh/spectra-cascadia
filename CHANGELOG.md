@@ -7,6 +7,12 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.17.1.3] - 2026-10-15
+
+### Added (XL)
+- Relays mikecarper/MeshCore LoRa OTA packets (`PAYLOAD_TYPE_OTA` 0x0C) during a `tempradio` window, as his relay-only repeaters do, so Cheapeaters can sit between an OTA source and a destination. Packets are carried opaquely and ignored outside the window. Ordinary flood limits and region rules apply. Duplicates use a time-limited cache, so a copy re-sent after a loss is forwarded again while echoes are not. Active-transfer messages go at top priority and discovery at background priority; discovery is dropped first when the send queue is nearly full
+- `normalradio`: ends a `tempradio` window early (2 s after the reply goes out)
+
 ## [1.17.1.2] - 2026-10-11
 
 ### Added (XL)
