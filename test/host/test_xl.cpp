@@ -261,7 +261,15 @@ int main() {
     };
     CHECK(rcli(a, "get name", 1) == std::string("> ") + cfg.name, "remote CLI: get name");
     CHECK(rcli(a, "set name Hilltop", 1) == "OK" && !strcmp(cfg.name, "Hilltop"), "remote CLI: set name (saved)");
-    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia v1.17.1.3") == 0, "remote CLI: ver");
+    CHECK(rcli(a, "ver", 1).find("Spectra-Cascadia " FW_VERSION) == 0, "remote CLI: ver");
+    CHECK(rcli(a, "get name", 3) == std::string("> ") + cfg.name, "remote CLI: TXT_TYPE_CLI_COMMAND (3) accepted (1.18)");
+    CHECK(rcli(a, "get name", 2) == "<none>", "remote CLI: signed plain text is not a command");
+    { std::string r = rcli(a, "power", 1);
+      CHECK(r.find("batt:") == 0 && r.find(" mV usb:n/a solar_chg:n/a ext:no charger:no") != std::string::npos,
+            "power: upstream 1.18 reply format"); }
+    CHECK(cli("set af 9.5") == "ERROR: af must be 0-9" && cli("set af 9") == "OK" && cli("get af") == "> 9",
+          "af range 0-9 with upstream error text");
+    cli("set af 1");
     CHECK(rcli(a, "get prv.key", 1) == "Error: USB console only", "remote CLI: private key can't be read over the air");
     CHECK(rcli(a, "set prv.key 00", 1) == "Error: USB console only", "remote CLI: private key can't be set over the air");
     CHECK(rcli(a, "erase", 1) == "Error: USB console only", "remote CLI: erase refused");
@@ -337,6 +345,9 @@ int main() {
       setup();
       CHECK(!strcmp(app.owner_info, "Jade\nCascadiaMesh") && app.rxgain && radio.boosted && app.agc_s == 28 && app.int_thresh == 14,
             "app settings survive reboot (rx gain re-applied)");
+      CHECK(cli("set agc.reset.interval 5000") == "OK - interval rounded to 1020" && app.agc_s == 1020,
+            "agc.reset.interval clamps to 1020 s like upstream 1.18");
+      cli("set agc.reset.interval 28");
       xl_init();
       login(a, "swordfish", ts_now++, false); clearq(); }
 
@@ -349,8 +360,8 @@ int main() {
       for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) { if ((txq[i].buf[0] >> 2) == PT_MULTIPART) mp = &txq[i]; else ack = &txq[i]; }
       CHECK(queued() == 2 && mp && ack && mp->buf[1] == 1 && mp->buf[2] == 0x66 && mp->buf[3] == ((1 << 4) | PT_ACK)
             && !memcmp(mp->buf + 4, pk + 4, 4) && ack->buf[0] == ((PT_ACK<<2)|ROUTE_DIRECT) && !memcmp(ack->buf + 3, pk + 4, 4)
-            && (int32_t)(ack->due - mp->due) >= 0,
-            "multi.acks 1: multipart ACK (remaining=1) then the plain ACK");
+            && ack->due - mp->due == 300,
+            "multi.acks 1: multipart ACK (remaining=1), the plain ACK 300 ms after it");
       app.multi_acks = 0; clearq();
       uint8_t pk2[] = { (PT_ACK<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x66, 0x55,0x66,0x77,0x88 };
       on_receive(pk2, sizeof(pk2), 0);
@@ -436,7 +447,22 @@ int main() {
       for (int i = 0; i < 4; i++) { clearq(); on_receive(rq, 12, 22); }
       CHECK(queued() == 0, "discover answers rate-limited (4 per 2 min)");
       fake_ms += 121000; clearq(); rq[3] = 0x02; on_receive(rq, 12, 22);
-      CHECK(queued() == 0, "discover for other node types ignored"); clearq(); }
+      CHECK(queued() == 0, "discover for other node types ignored"); clearq();
+      uint8_t sa = cfg.advert_interval_min, sf = cfg.flood_advert_h;
+      cfg.advert_interval_min = 0; cfg.flood_advert_h = 0; rq[3] = 0x04; rq[4] ^= 1;
+      on_receive(rq, 12, 22);
+      CHECK(queued() == 0, "adverts off (hidden node): discover not answered (1.18)"); clearq();
+      cfg.flood_advert_h = sf; rq[4] ^= 2; on_receive(rq, 12, 22);
+      CHECK(queued() == 1, "flood adverts on: discover answered again"); clearq();
+      cfg.advert_interval_min = sa; }
+
+    // ── 1.18: MACThenDecrypt rejects ciphertext that isn't whole AES blocks
+    { uint8_t key[32]; for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i * 7 + 1);
+      uint8_t pt[16] = "spectra-cascadi", ct[64], out[64];
+      int n = encrypt_then_mac(key, ct, pt, 16);
+      CHECK(n == 18 && mac_then_decrypt(key, out, ct, n) == 16 && !memcmp(out, pt, 16), "mac_then_decrypt: aligned ciphertext ok");
+      ct[18] = 0x5A; SHA256 sha; sha.resetHMAC(key, 32); sha.update(ct + 2, 17); sha.finalizeHMAC(key, 32, ct, 2);
+      CHECK(mac_then_decrypt(key, out, ct, 19) == 0, "mac_then_decrypt: valid MAC over 17 bytes still rejected"); }
 
     // ── v2.5: reset reason
     { fake_csr = (1UL << 29); Serial1.out.clear(); setup();

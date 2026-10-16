@@ -46,11 +46,11 @@ echo "{\"name\":\"toolchain-gccarmnoneeabi\",\"version\":\"$GCCV\",\"system\":[\
 SC="$HOME/.platformio/packages/tool-scons"
 if [ ! -f "$SC/scons.py" ]; then
   mkdir -p "$SC" && T=$(mktemp -d)
-  pip download -q --no-deps --no-binary :all: scons==4.11.1 -d "$T" 2>/dev/null || pip download -q --no-deps scons==4.11.1 -d "$T"
+  pip download -q --no-deps --no-binary :all: scons==4.8.1 -d "$T" 2>/dev/null || pip download -q --no-deps scons==4.8.1 -d "$T"
   (cd "$T" && for a in *; do case "$a" in *.whl) python3 -m zipfile -e "$a" x;; *.tar.gz) tar xzf "$a" && mv [Ss][Cc]ons-*/ x;; esac; done)
   cp -r "$T"/x/SCons "$SC/" && printf 'import sys\nfrom SCons.Script.Main import main\nif __name__ == "__main__":\n    sys.exit(main())\n' > "$SC/scons.py"
-  echo '{"name":"tool-scons","version":"4.41101.0"}' > "$SC/package.json"
-  echo '{"type": "tool", "name": "tool-scons", "version": "4.41101.0", "spec": {"owner": "platformio", "id": 4919, "name": "tool-scons", "requirements": null, "uri": null}}' > "$SC/.piopm"
+  echo '{"name":"tool-scons","version":"4.40801.0"}' > "$SC/package.json"
+  echo '{"type": "tool", "name": "tool-scons", "version": "4.40801.0", "spec": {"owner": "platformio", "id": 4919, "name": "tool-scons", "requirements": null, "uri": null}}' > "$SC/.piopm"
   rm -rf "$T"
 fi
 

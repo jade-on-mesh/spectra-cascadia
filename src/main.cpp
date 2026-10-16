@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 1.17.1.3 (official MeshCore 1.17.1 + Spectra-Cascadia release 3)
+ * Version: 1.18.0.1 (official MeshCore 1.18.0 + Spectra-Cascadia release 1)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.17.1.3"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.1"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -1097,6 +1097,7 @@ static bool parse(const uint8_t* d, int len, Pkt& p) {
     int i = 0;
     if (len < 3) return false;
     p.header = d[i++];
+    if (p.header & 0x80) return false;         // payload version > 1: not ours to parse or relay (Dispatcher)
     p.route  = p.header & 0x03;
     p.ptype  = (p.header >> 2) & 0x0F;
     if (p.route == ROUTE_TRANSPORT_FLOOD || p.route == ROUTE_TRANSPORT_DIRECT) {
@@ -1218,7 +1219,8 @@ static void xl_acl_touch_regions(void);
 
 static const char* handle_control(const Pkt& p, int8_t snr4) {
     uint8_t type = p.payload[0] & 0xF0;
-    if (type == CTL_DISCOVER_REQ && p.payload_len >= 6 && cfg.repeat) {
+    // not answered when adverts are off: the node wishes not to be discoverable (isHiddenNode)
+    if (type == CTL_DISCOVER_REQ && p.payload_len >= 6 && cfg.repeat && (cfg.advert_interval_min || cfg.flood_advert_h)) {
         uint32_t now = millis();
         if (now - disc_win > 120000UL) { disc_win = now; disc_count = 0; }    // max 4 per 2 minutes
         if (disc_count >= 4) return "discover limit";
@@ -1318,32 +1320,30 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
     const uint8_t* pl = p.payload;
     int plen = p.payload_len;
     uint8_t header = p.header, pri = 0;
-    uint32_t delay;
+    uint32_t delay = delay_for(p, cfg.direct_txdelay_x100);   // ACKs too (upstream 1.18: they had none)
 
     if (p.ptype == PT_MULTIPART) {                     // forwardMultipartDirect
         if (plen < 5 || (pl[0] & 0x0F) != PT_ACK) return "multipart";
-        delay = ((uint32_t)(pl[0] >> 4) + 1) * 300;
+        delay += ((uint32_t)(pl[0] >> 4) + 1) * 300;
         pl++; plen--;
         packet_hash(h, PT_ACK, 0, pl, plen);
         header = hdr_ack;
     } else {
         packet_hash(h, p.ptype, p.path_len, pl, plen);
-        if (p.ptype == PT_ACK) { header = hdr_ack; delay = 0; }      // routeDirectRecvAcks
-        else delay = delay_for(p, cfg.direct_txdelay_x100);
+        if (p.ptype == PT_ACK) header = hdr_ack;      // routeDirectRecvAcks
     }
     if (was_seen(h)) return "dedup";
     mark_seen(h);
 #ifdef SPECTER_XL
     // multi.acks (Mesh::routeDirectRecvAcks): send N extra copies as multipart ACKs
-    // 300 ms apart, counting down, then the plain ACK last.
+    // 300 ms apart from the retransmit delay, counting down, then the plain ACK last.
     if (header == hdr_ack && app.multi_acks && plen <= 16) {
         for (uint8_t extra = app.multi_acks; extra > 0; extra--) {
             uint8_t mp[17];
             mp[0] = (uint8_t)((extra << 4) | PT_ACK);
             memcpy(mp + 1, pl, plen);
-            delay += 300;
             int m = build(out_buf, (PT_MULTIPART << 2) | ROUTE_DIRECT, p.tc, new_path_len, rest, rest_bytes, mp, plen + 1);
-            if (m > 0) txq_push(out_buf, m, pri, delay);
+            if (m > 0) { txq_push(out_buf, m, pri, delay); delay += 300; }
         }
     }
 #endif
@@ -1495,9 +1495,8 @@ static const char* handle_ota_flood(const Pkt& p) {
     if (p.payload_len < 1) return "ota short";
     if (!cfg.repeat) return "repeat off";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
-    if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
-    if (p.route == ROUTE_TRANSPORT_FLOOD) {
-        if (p.tc[0] == 0 && p.tc[1] == 0) return "share";
+    if (!p.tc[0] && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";   // tc 0 = un-scoped
+    if (p.tc[0]) {
         if (region_match(p.tc[0], p.ptype, p.payload, p.payload_len) < 0) return "region";
     } else if (cfg.wildcard_flags & REGION_DENY_FLOOD) return "unscoped denied";
     for (int k = 0; k < p.hash_count; k++) if (is_own_hash(p.path + k * p.hash_size, p.hash_size)) return "loop";
@@ -1556,18 +1555,19 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
 #ifdef SPECTER_XL
     if (xl_type(p.ptype) && p.payload_len > 2 && p.payload[0] == own_pubkey[0]) {
         int scope = -1;
-        if (p.route == ROUTE_TRANSPORT_FLOOD && (p.tc[0] || p.tc[1]))
+        if (p.tc[0])
             scope = region_match(p.tc[0], p.ptype, p.payload, p.payload_len);
         if (xl_handle_for_us(p, snr4, scope)) { mark_seen(h); stat_for_us++; return "for us"; }
     }
 #endif
     if (!cfg.repeat) return "repeat off";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
-    if (p.route == ROUTE_FLOOD && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
+    // Transport code 0 counts as un-scoped (RegionMap::findMatch, isFloodHopLimitExceeded):
+    // un-scoped hop limit and the wildcard's flood policy apply.
+    if (!p.tc[0] && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";
     if (p.ptype == PT_ADVERT && p.hash_count >= cfg.flood_max_advert) return "flood.max.advert";
 
-    if (p.route == ROUTE_TRANSPORT_FLOOD) {
-        if (p.tc[0] == 0 && p.tc[1] == 0) return "share";
+    if (p.tc[0]) {
         if (region_match(p.tc[0], p.ptype, p.payload, p.payload_len) < 0) return "region";
     } else if (cfg.wildcard_flags & REGION_DENY_FLOOD) {
         return "unscoped denied";
@@ -2429,7 +2429,7 @@ static void handle_set(const char* cmd, char* reply) {
         if (!parse_fixed(v, 2, &x) || x < 0 || x > 200) { strcpy(reply, "Error, must be 0-2"); return; }
         if (k[0] == 't') cfg.txdelay_x100 = x; else cfg.direct_txdelay_x100 = x;
     } else if (!strcmp(k, "af")) {
-        if (!parse_fixed(v, 2, &x) || x < 0 || x > 9900) { strcpy(reply, "Error, bad value"); return; }
+        if (!parse_fixed(v, 2, &x) || x < 0 || x > 900) { strcpy(reply, "ERROR: af must be 0-9"); return; }
         cfg.af_x100 = x;
     } else if (!strcmp(k, "path.hash.mode")) {
         if (!ok || iv > 2) { strcpy(reply, "Error, must be 0,1, or 2"); return; }
@@ -2471,7 +2471,8 @@ static void handle_set(const char* cmd, char* reply) {
         if (!ok || iv > 60) { strcpy(reply, "Error, range 0-60 dB (0 = off)"); return; }
         app.int_thresh = iv;
     } else if (!strcmp(k, "agc.reset.interval")) {
-        if (!ok || iv > 1020) { strcpy(reply, "Error, range 0-1020 seconds"); return; }
+        if (!ok) { strcpy(reply, "Error, range 0-1020 seconds"); return; }
+        if (iv > 1020) iv = 1020;                    // CommonRadioPrefs: constrain(secs, 0, 255 * 4)
         app.agc_s = iv / 4 * 4;
         cfg_save();
         sprintf(reply, "OK - interval rounded to %u", app.agc_s);
@@ -2671,6 +2672,10 @@ static void handle_command(char* cmd, char* reply) {
         strcpy(reply, FW_NAME " " FW_VERSION " (Build: " __DATE__ ")");
     } else if (!strcmp(cmd, "board")) {
         strcpy(reply, "DX-LR30 (STM32F103+SX1262)");
+#ifdef SPECTER_XL
+    } else if (!strcmp(cmd, "power")) {              // CommonCLI 1.18; this board has no USB/solar/charger sensing
+        sprintf(reply, "batt:%u mV usb:n/a solar_chg:n/a ext:no charger:no", (unsigned)battery_mv());
+#endif
     } else if (!strcmp(cmd, "erase")) {
         HAL_FLASH_Unlock(); flash_erase(CONFIG_ADDR); HAL_FLASH_Lock();
         strcpy(reply, "File system erase: OK (defaults + new identity after reboot)");

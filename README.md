@@ -235,7 +235,7 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `get` / `set advert.interval` | Zero-hop advert, minutes (0 = off, the default; 2–240) |
 | `get` / `set flood.advert.interval` | Hours (default 83; 0 = off, 3–168) |
 | `get` / `set flood.max`, `flood.max.unscoped`, `flood.max.advert` | Hop limits |
-| `get` / `set txdelay`, `direct.txdelay`, `af` | Same meaning as upstream |
+| `get` / `set txdelay`, `direct.txdelay`, `af` | Same meaning as upstream (`af` 0-9, as 1.18) |
 | `get` / `set path.hash.mode` | 0/1/2 → 1/2/3-byte hashes for our own floods |
 | `get` / `set loop.detect` | off / minimal / moderate / strict |
 | `get public.key`, `get prv.key`, `set prv.key <64 hex>` | 32-byte Ed25519 seed (not upstream's 64-byte format) |
@@ -246,7 +246,7 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `region list allowed\|denied`, `region save` | Region edits are kept in RAM until `region save` |
 | `advert`, `advert.zerohop` | Send an advert now |
 | `clock`, `time <epoch>` | Clock can only move forward |
-| `ver`, `board`, `reboot` | |
+| `ver`, `board`, `reboot` | `power` (XL, 1.18 format; this board reports battery only) |
 | `erase` | Factory reset: defaults and a **new identity** after reboot |
 | `log start` / `log stop` | Live packet log (off by default so tools see clean replies) |
 | `stats` | Uptime, packet, retry, echo and advert-guard counters, battery |

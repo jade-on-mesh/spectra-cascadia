@@ -2,21 +2,25 @@
   "_doc": "State for the upstream-sync task (see UPSTREAM_SYNC.md). Updated by every sync run.",
   "official": {
     "repo": "meshcore-dev/MeshCore",
-    "last_release": "repeater-v1.17.1"
+    "last_release": "repeater-v1.18.0"
   },
   "keymind": {
     "repo": "mikecarper/MeshCore",
     "branch": "keymindCascade",
-    "last_version": "v1.17.1.9",
-    "last_commit": "656cb6924"
+    "last_version": "v1.18.0.1",
+    "last_commit": "0fdf7901d"
   },
   "ported": [
     "keymind: echo-cancelled flood/direct retries, CR ladder, presets (v2.2)",
     "keymind: mesh clock sync by advert consensus (v2.2)",
     "keymind: power saving, battery telemetry/cutoff, advert echo guard, radio stats (v2.3)",
-    "keymind: LoRa OTA relay during tempradio (1.17.1.3)"
+    "keymind: LoRa OTA relay during tempradio (1.17.1.3)",
+    "official 1.18.0: MACThenDecrypt alignment, direct ACK delay, transport code 0 unscoped (+keymind wildcard/hop fix), hidden-node discover, af range, agc clamp, TXT_TYPE_CLI_COMMAND, power (1.18.0.1)",
+    "keymind 1.18.0.1: drop payload version > 1 (direct LoRa OTA frames not relayed) (1.18.0.1)"
   ],
   "declined": [
-    "keymind: LoRa OTA install (needs bootloader; ~10 KB patch limit on STM32F103 — paused, see Cheapeater OTA design)"
+    "keymind: LoRa OTA install (needs bootloader; ~10 KB patch limit on STM32F103 \u2014 paused, see Cheapeater OTA design)",
+    "official 1.18.0: loop.detect default minimal (ours moderate), SUBSCRIBE/region load-save (sensor), LR11xx/LR2021, FEM, gps diag",
+    "keymind 1.18.0.1: negotiated direct LoRa OTA transport, Ethernet/WiFi/BLE/MQTT/Meshtext"
   ]
 }

@@ -111,6 +111,29 @@ int main() {
       on_receive(pk, n, 0);
       CHECK(queued() == 0, "scoped flood for unknown region dropped"); clearq(); }
 
+    // ── 1.18: transport code 0 = un-scoped (RegionMap::findMatch; keymind: wildcard deny + hop limit apply)
+    { uint8_t pk[] = { (PT_TXT_MSG<<2)|ROUTE_TRANSPORT_FLOOD, 0x00,0x00, 0x34,0x12, 0x01, other, 0xA1,0xB2,0x01,0x02,0x03,0x04,0x05 };
+      on_receive(pk, sizeof(pk), 0);
+      TxItem* t = last_q();
+      CHECK(t && t->buf[0] == pk[0] && !memcmp(t->buf+1, pk+1, 4) && t->buf[5] == 0x02 && t->buf[7] == own_pubkey[0],
+            "transport code 0: forwarded like un-scoped, codes kept"); clearq();
+      uint8_t sv = cfg.wildcard_flags; cfg.wildcard_flags |= REGION_DENY_FLOOD;
+      pk[13] ^= 0x11; on_receive(pk, sizeof(pk), 0);
+      CHECK(queued() == 0, "transport code 0: dropped when the wildcard denies flood"); clearq();
+      cfg.wildcard_flags = sv;
+      uint8_t su = cfg.flood_max_unscoped; cfg.flood_max_unscoped = 1;
+      pk[13] ^= 0x22; on_receive(pk, sizeof(pk), 0);
+      CHECK(queued() == 0, "transport code 0: flood.max.unscoped applies"); clearq();
+      cfg.flood_max_unscoped = su; }
+
+    // ── 1.18: packets with payload version > 1 are not parsed or relayed
+    { uint8_t pk[] = { 0x80|(PT_TXT_MSG<<2)|ROUTE_FLOOD, 0x01, other, 0xA9,0xBB,0x01,0x02,0x03,0x04,0x05 };
+      on_receive(pk, sizeof(pk), 0);
+      CHECK(queued() == 0, "payload version 3 flood dropped");
+      uint8_t ota[] = { 0xF2, 0x00, 0x04, 1,2,3,4,5,6,7,8 };    // keymind negotiated direct OTA frame (version 4)
+      on_receive(ota, sizeof(ota), 0);
+      CHECK(queued() == 0, "keymind direct-OTA frame (F2 00 ...) not relayed"); clearq(); }
+
     // ── direct ────────────────────────────────────────────────────────────
     { uint8_t pk[] = { (PT_TXT_MSG<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x77, 0xAA,0xBB,0x01,0x02,0x03,0x09 };
       on_receive(pk, sizeof(pk), 0);
@@ -133,6 +156,26 @@ int main() {
       TxItem* t = last_q();
       CHECK(t && t->buf[0] == ((PT_ACK<<2)|ROUTE_DIRECT) && t->buf[1] == 0x00 && !memcmp(t->buf+2, pk+4, 4),
             "multipart ACK forwarded as plain ACK"); clearq(); }
+
+    // ── 1.18: forwarded direct ACKs get the direct retransmit delay (they had none)
+    { uint8_t sv = cfg.direct_txdelay_x100; cfg.direct_txdelay_x100 = 200;
+      uint32_t t = airtime_ms(2 + 4 + 2) * 200 / 100, maxd = 0; bool in_range = true;
+      for (int k = 0; k < 20; k++) {
+        uint8_t pk[] = { (PT_ACK<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x66, 0x5A,0x5B,(uint8_t)k,0x5D };
+        on_receive(pk, sizeof(pk), 0);
+        TxItem* q = last_q();
+        uint32_t d = q ? q->due - millis() : 0xFFFFFFFF;
+        if (!q || d > 5 * t + 1) in_range = false; else if (d > maxd) maxd = d;
+        clearq();
+      }
+      CHECK(in_range && maxd > 0, "direct ACK forward delayed by random(0, 5 x airtime x direct.txdelay)");
+      uint8_t mp[] = { (PT_MULTIPART<<2)|ROUTE_DIRECT, 0x01, own_pubkey[0], (1<<4)|PT_ACK, 0xC1,0xC2,0xC3,0xC4 };
+      on_receive(mp, sizeof(mp), 0);
+      TxItem* q = last_q();
+      uint32_t tm = airtime_ms(1 + 5 + 2) * 200 / 100;
+      CHECK(q && q->due - millis() >= 600 && q->due - millis() <= 600 + 5 * tm + 1,
+            "multipart ACK: retransmit delay + (remaining+1) x 300 ms"); clearq();
+      cfg.direct_txdelay_x100 = sv; }
 
     { uint8_t pk[] = { (PT_TRACE<<2)|ROUTE_DIRECT, 0x01, 0x28, 1,2,3,4, 5,6,7,8, 0x00, 0x99, own_pubkey[0], 0x55 };
       on_receive(pk, sizeof(pk), -20);
@@ -397,7 +440,7 @@ int main() {
     CHECK(cli("set repeat on") == "OK - repeat is now ON", "repeat on");
     CHECK(cli("get role") == "> repeater", "get role");
     CHECK(cli("get public.key").size() == 2 + 64, "get public.key");
-    CHECK(cli("ver").find("Spectra-Cascadia v1.17.1.3") == 0, "ver");
+    CHECK(cli("ver").find("Spectra-Cascadia " FW_VERSION) == 0, "ver");
     CHECK(cli("clock").find("UTC") != std::string::npos, "clock");
     CHECK(cli("time 1000") == "(ERR: clock cannot go backwards)", "time cannot go backwards");
     CHECK(cli("password abc").find("XL") != std::string::npos, "password needs the XL build");

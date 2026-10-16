@@ -26,6 +26,7 @@
 #define ANON_REQ_TYPE_BASIC   0x03
 #define TXT_TYPE_PLAIN    0
 #define TXT_TYPE_CLI_DATA 1
+#define TXT_TYPE_CLI_COMMAND 3
 #define SERVER_RESPONSE_DELAY 300
 #define TXT_ACK_DELAY         200
 #define CLI_REPLY_DELAY       600
@@ -137,9 +138,10 @@ static int encrypt_then_mac(const uint8_t* secret, uint8_t* dest, const uint8_t*
     return n + CIPHER_MAC_SIZE;
 }
 
-// Returns decrypted length (multiple of 16), or 0 if the MAC doesn't match.
+// Returns decrypted length (multiple of 16), or 0 if the MAC doesn't match or the
+// ciphertext isn't a whole number of AES blocks (checked first, as upstream 1.18).
 static int mac_then_decrypt(const uint8_t* secret, uint8_t* dest, const uint8_t* src, int len) {
-    if (len <= CIPHER_MAC_SIZE) return 0;
+    if (len <= CIPHER_MAC_SIZE || (len - CIPHER_MAC_SIZE) % 16) return 0;
     uint8_t mac[CIPHER_MAC_SIZE];
     SHA256 sha;
     sha.resetHMAC(secret, 32);
@@ -516,7 +518,7 @@ static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
         // TXT_MSG: CLI command (admins only)
         if (c->perms != PERM_ACL_ADMIN || n <= 5) return true;
         uint8_t flags = data[4] >> 2;
-        if (flags != TXT_TYPE_PLAIN && flags != TXT_TYPE_CLI_DATA) return true;
+        if (flags != TXT_TYPE_PLAIN && flags != TXT_TYPE_CLI_DATA && flags != TXT_TYPE_CLI_COMMAND) return true;
         if (ts < c->last_ts) { LOGLN("  cli: replay"); return true; }
         bool retry = ts == c->last_ts;
         c->last_ts = ts;

@@ -3,9 +3,55 @@
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
 Version numbers follow the official MeshCore firmware release this one tracks
-(the first three numbers, currently 1.17.1, as on meshcore.io/flasher), plus a
+(the first three numbers, currently 1.18.0, as on meshcore.io/flasher), plus a
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
+
+## [1.18.0.1] - 2026-10-16
+
+Covers official MeshCore `repeater-v1.18.0` and mikecarper Halo Keymind Cascade `v1.18.0.1` (preview1, incl. `v1.17.1.10`).
+This release was ported automatically by the upstream-sync task and has **not yet been tested on hardware**.
+
+### Fixed
+- Floods with transport code 0 are treated as un-scoped (were dropped): the un-scoped hop limit and the wildcard's flood policy apply, as in Halo Keymind Cascade
+- Packets with a payload version above 1 are no longer parsed or relayed (as upstream `Dispatcher`). This keeps Halo Keymind Cascade's new negotiated direct LoRa OTA frames (`F2 00 …`) off the mesh
+- Forwarded direct ACKs now wait the random direct retransmit delay like other direct packets (upstream sent them at once). Multipart ACKs add it to their (remaining + 1) × 300 ms
+- XL: `multi.acks` copies start after that delay, 300 ms apart, with the plain ACK last
+- XL: encrypted requests and messages whose ciphertext isn't whole AES blocks are rejected before the MAC check (upstream stack overflow fix; our decrypt already ignored partial blocks)
+
+### Changed
+- Discover requests aren't answered when both `advert.interval` and `flood.advert.interval` are 0 (node doesn't want to be discoverable)
+- `set af` accepts 0-9 and replies `ERROR: af must be 0-9` otherwise, as upstream
+- XL: `set agc.reset.interval` above 1020 s is clamped to 1020 instead of refused, as upstream
+- XL: remote CLI accepts the new `TXT_TYPE_CLI_COMMAND` (3) text type
+- Offline toolchain: SCons pinned to 4.8.1, the version PlatformIO 6.1.18 asks for
+
+### Added (XL)
+- `power` (upstream 1.18): `batt:<mV> mV usb:n/a solar_chg:n/a ext:no charger:no` (this board has no USB, solar or charger sensing)
+
+### Upstream sync
+Ported:
+- [9c9a2ba2](https://github.com/meshcore-dev/MeshCore/commit/9c9a2ba2db59) / [b74ba545](https://github.com/meshcore-dev/MeshCore/commit/b74ba545308f) MACThenDecrypt block-alignment check
+- [6df5aaed](https://github.com/meshcore-dev/MeshCore/commit/6df5aaed4335) ACK forwarding (direct) had zero delay
+- [01f9293b](https://github.com/meshcore-dev/MeshCore/commit/01f9293be073) transport code 0 = un-scoped, with keymind's [b842438e](https://github.com/mikecarper/MeshCore/commit/b842438e6469) (wildcard deny + hop limits apply; official alone would forward it even when the wildcard denies flood)
+- [f19733e4](https://github.com/meshcore-dev/MeshCore/commit/f19733e47879) don't answer DISCOVER when adverts are off
+- [0c3fe356](https://github.com/meshcore-dev/MeshCore/commit/0c3fe356d06e) `agc.reset.interval` clamp (the 1020 s range we already had)
+- [41588d80](https://github.com/meshcore-dev/MeshCore/commit/41588d805253) `set af` 0-9 range and reply text (CommonRadioPrefs refactor; other CLI names and replies unchanged)
+- [2c0ace25](https://github.com/meshcore-dev/MeshCore/commit/2c0ace2519d9) `TXT_TYPE_CLI_COMMAND`
+- [77057aef](https://github.com/meshcore-dev/MeshCore/commit/77057aefdd39) / [6b696a4e](https://github.com/meshcore-dev/MeshCore/commit/6b696a4ef6db) `power` command
+- keymind [938f6374](https://github.com/mikecarper/MeshCore/commit/938f63748799) direct LoRa OTA frames must not be relayed → payload-version filter
+
+Already have:
+- [95214e8c](https://github.com/meshcore-dev/MeshCore/commit/95214e8c4026) serial command buffer NUL-termination (our reader is bounded)
+- [1d5283de](https://github.com/meshcore-dev/MeshCore/commit/1d5283de7678) StaticPoolPacketManager null/index checks (no packet pool here)
+
+Declined:
+- [2db4b406](https://github.com/meshcore-dev/MeshCore/commit/2db4b40617c3) `loop.detect` default `minimal`: we already default to `moderate` (stricter)
+- [9bc60608](https://github.com/meshcore-dev/MeshCore/commit/9bc6060831a0) and follow-ups: REQ_TYPE_SUBSCRIBE / region load-save / DynamicConfigSerializer: sensor role and file-system prefs
+- LR1110/LR1121/LR2021 radio fixes, new boards, FEM prefs, board loop hook, LED off, RadioLib pin, `gps diag`: other hardware or out of scope
+- keymind: OTA install and identity restamping ([39eaf8d8](https://github.com/mikecarper/MeshCore/commit/39eaf8d8b7ef)), direct OTA transport itself, Ethernet/Wi-Fi/BLE/MQTT/Meshtext/MeshTalk, SD seeder, new variants: out of scope (OTA install stays paused, see Cheapeater OTA design)
+
+Size: standard build 62,948 / 63,488 bytes (8 bytes smaller than 1.17.1.3); XL +128 bytes, RAM unchanged.
 
 ## [1.17.1.3] - 2026-10-15
 
