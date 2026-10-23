@@ -43,6 +43,9 @@ SECTIONS
     /* libm (powf for rxdelay) is only used after setup(); libgcc and libc stay
        low because startup code needs them before the upper half is checked. */
     *libm.a:*(.text .text* .rodata .rodata*)
+    /* Our own functions marked XL_HI (CLI and remote-admin handlers, radio2 control):
+       only called from loop(), after setup() has checked the upper half. */
+    *(.xlhi .xlhi*)
     . = ALIGN(4);
     KEEP(*(.xl_magic))   /* last word: present only if the whole upper half was written */
     . = ALIGN(4);

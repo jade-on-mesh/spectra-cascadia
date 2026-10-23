@@ -763,6 +763,99 @@ int main() {
       clearq(); ota(0x07, 1, 4);
       CHECK(queued() == 0, "and OTA relay stops"); clearq(); }
 
+    // ── 1.18.0.3: radio2 (second profile, time-shared)
+    { clearq(); fake_ms += 121000;
+      CHECK(radio.pre == 32 && pre_eff[0] == 32, "SF7 primary sends a 32-symbol preamble, as upstream 1.18");
+      CHECK(cli("get radio2") == "> off" && cli("get radio2.cross") == "> off" && cli("get tx.reply") == "> both"
+            && cli("get radio2.status") == "> off", "radio2 defaults: off, cross off, tx.reply both");
+      CHECK(cli("set radio2 911,300,7,5,rxtx") == "Error, invalid radio2 params", "radio2: bandwidth must be a LoRa one");
+      CHECK(cli("set radio2 911,250,7,5,both") == "Error, invalid radio2 params", "radio2: mode rx or rxtx");
+      CHECK(cli("set radio2.cross maybe").find("Error") == 0 && cli("set tx.reply radio force").find("Error") == 0, "cross / tx.reply checks");
+      std::string r = cli("set radio2 mediamesh");
+      CHECK(r == "OK - radio2 911.15,250,7,5,rxtx; timing self-test pending", "set radio2 mediamesh (911.150 / 250 kHz / SF7 / CR5, rxtx)");
+      CHECK(radio.f_khz == 910525, "radio2 waits 2 s so the reply goes out first");
+      fake_ms += 2100; loop();
+      CHECK(r2_active() && cur_prof == 0 && radio.pre == 32 && pre_eff[1] == 48, "applied: radio keeps 32 symbols, radio2 gets 48 (auto)");
+      CHECK(cli("get radio2.scan") == "> first=radio visits=9421,19347us pre=32,48",
+            "scan: 4.6 symbols on the slower profile, the rest of half its preamble on the faster");
+      int hops = 0; uint32_t seen_f[2] = {0, 0};
+      for (int i = 0; i < 16; i++) { fake_ms += 10; loop(); if (radio.f_khz != seen_f[cur_prof]) { seen_f[cur_prof] = radio.f_khz; } hops = (int)sw_count; }
+      CHECK(seen_f[0] == 910525 && seen_f[1] == 911150 && radio.bw_hz == (cur_prof ? 250000u : 62500u), "loop alternates between the two profiles");
+      CHECK(r2_ready() && cli("get radio2.status").find("test=4/4,4/4 ready") != std::string::npos, "switch self-test: 4 hops each way");
+      CHECK(cli("get radio2.timing").find("> chirps=4.6,37.78; need=32,48; switch=2000us;") == 0, "radio2.timing");
+      CHECK(cli("get radio2.timing").find("; WARN recommended preamble: radio2=48") != std::string::npos,
+            "timing warns that radio2 senders need more than 32 symbols");
+      // a packet being received holds the profile
+      while (cur_prof != 1) { fake_ms += 10; loop(); }
+      uint32_t sc = sw_count; radio.irq = RADIOLIB_SX126X_IRQ_HEADER_VALID;
+      fake_ms += 30; loop(); fake_ms += 30; loop();
+      CHECK(sw_count == sc && cur_prof == 1, "header seen: stays on the profile until the packet is in");
+      radio.irq = 0; fake_ms += 30; loop();
+      CHECK(sw_count == sc + 1, "then scanning resumes");
+      // forwarding follows the arrival profile
+      uint8_t seq = 0;
+      auto flood_on = [&](uint8_t prof) { uint8_t pk[40]; int n = 0; pk[n++] = (PT_GRP_TXT << 2) | ROUTE_FLOOD; pk[n++] = 1; pk[n++] = 0x47;
+          pk[n++] = 0x35; seq++; for (int i = 0; i < 18; i++) pk[n++] = (uint8_t)(seq * 13 + i);
+          clearq(); rx_prof = prof; on_receive(pk, n, 0); rx_prof = 0;
+          int m = 0; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) m |= 1 << txq[i].prof; return m; };
+      CHECK(flood_on(1) == 2 && flood_on(0) == 1, "cross off: a flood is relayed on the profile it arrived on");
+      cli("set radio2.cross on");
+      CHECK(flood_on(1) == 3 && flood_on(0) == 3, "cross on: relayed on both profiles");
+      cli("set radio2.cross auto");
+      CHECK(flood_on(1) == 3, "cross auto: both (neither profile is temporary)");
+      cli("set radio2.cross off");
+      // own adverts stay on radio unless crossing
+      clearq(); cli("advert.zerohop");
+      CHECK(queued() == 1 && last_q()->prof == 0, "own advert: radio only (cross off)");
+      // a copy for radio2 waits until the radio is on radio2
+      { clearq(); flood_on(1); fake_ms += 5000; int tx0 = radio.tx_count;
+        cur_prof = 0; txq_service(0);
+        CHECK(radio.tx_count == tx0 && queued() == 1, "radio2 copy not sent while on radio");
+        cur_prof = 1; txq_service(0);
+        CHECK(radio.tx_count == tx0 + 1 && queued() == 0 && r2_txn[1] >= 1, "sent once the radio is on radio2"); clearq(); }
+      // replies: tx.reply
+      auto login_on = [&](uint8_t prof) { rx_prof = prof; login(a, "swordfish", ts_now++, false); rx_prof = 0;
+          int m = 0; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) m |= 1 << txq[i].prof; clearq(); return m; };
+      CHECK(login_on(1) == 3 && login_on(0) == 3, "tx.reply both: a reply goes out on both profiles");
+      cli("set tx.reply radio");  CHECK(login_on(1) == 1, "tx.reply radio: radio only");
+      cli("set tx.reply radio2"); CHECK(login_on(0) == 2, "tx.reply radio2: radio2 only");
+      cli("set tx.reply auto");   CHECK(login_on(1) == 2 && login_on(0) == 1, "tx.reply auto: the profile the request came in on");
+      cli("set tx.reply both");
+      // rx-only radio2
+      cli("set radio2 911.15,250,7,5,rx"); fake_ms += 2100; loop();
+      CHECK(cli("get radio2") == "> 911.15,250,7,5,rx", "radio2 rx-only");
+      CHECK(flood_on(1) == 0, "rx-only, cross off: nothing relayed from radio2");
+      CHECK(login_on(1) == 1 && cli("get tx.reply") == "> both (radio2 can't transmit)", "rx-only: replies on radio only");
+      cli("set tx.reply both force"); CHECK(login_on(1) == 3 && cli("get tx.reply") == "> both force", "tx.reply both force: replies on rx-only radio2 too");
+      cli("set tx.reply both"); cli("set radio2.cross on");
+      CHECK(flood_on(1) == 1, "rx-only + cross on: radio2 traffic relayed on radio");
+      cli("set radio2.cross off");
+      // discovery trailer
+      cli("set radio2 mediamesh"); fake_ms += 2100; loop(); fake_ms += 121000;
+      { uint8_t rq[12] = { (PT_CONTROL << 2) | ROUTE_DIRECT, 0, 0x82, 4, 0xAB, 0xCD, 0xEF, 0x01, 0, 0, 0, 0 };
+        clearq(); on_receive(rq, 12, 20);
+        TxItem* t = nullptr; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used && txq[i].prof == 0) t = &txq[i];
+        uint32_t f = 0, bw = 0; if (t && t->len >= 52) { memcpy(&f, t->buf + 2 + 40, 4); memcpy(&bw, t->buf + 2 + 44, 4); }
+        CHECK(t && t->len == 52 && t->buf[2 + 38] == 1 && t->buf[2 + 39] == 0x05 && f == 911150 && bw == 250000
+              && t->buf[2 + 48] == 7 && t->buf[2 + 49] == 5, "discover 0x82: radio2 trailer (v1, rxtx, 911150 / 250000 / SF7 / CR5)");
+        rq[2] = 0x80; rq[4] ^= 1; clearq(); on_receive(rq, 12, 20); t = last_q();
+        CHECK(t && t->len == 2 + 38, "no trailer unless asked"); clearq(); }
+      // channel spacing warning
+      r = cli("set radio2 910.550,62.5,7,5,rx");
+      CHECK(r.find("; WARN radio2 overlaps radio1 (6kHz guard); try 910.594MHz") != std::string::npos, "overlap warning with a suggested centre");
+      cli("set radio2 mediamesh"); fake_ms += 2100; loop();
+      // survives reboot
+      setup();
+      CHECK(cli("get radio2") == "> 911.15,250,7,5,rxtx" && r2_active() && pre_eff[1] == 48, "radio2 survives reboot");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq();
+      // off
+      flood_on(1);
+      CHECK(cli("set radio2 off") == "OK - radio2 off", "set radio2 off");
+      fake_ms += 2100; loop();
+      CHECK(!r2_active() && cur_prof == 0 && radio.f_khz == 910525 && radio.pre == 32 && queued() == 0,
+            "off: back on radio only, radio2 copies dropped");
+      clearq(); }
+
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);
       uint8_t pk[64]; int n = mk_pkt(pk, (PT_REQ << 2) | ROUTE_FLOOD, &hop, 1, pl, 20);

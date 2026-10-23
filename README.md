@@ -60,6 +60,7 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | `flood.ratelimit`: cap floods per minute from one source | ✓ (v2.6) |
 | `tempradio` (try radio settings for N minutes, then revert), `cad on/off`, `rxdelay`, `radio.watchdog`, login attempt limits, `neighbors.detail` (RSSI, times heard) | ✓ (1.17.1.2) |
 | `set guest on/off`, `get guests`, `get logins` (recent login attempts); `repeat.battery` / `flood.battery` (pause forwarding on a low battery) | ✓ (1.18.0.2) |
+| `radio2`: a second LoRa profile (e.g. MediaMesh) on the same radio, `radio2.cross`, `tx.reply` | ✓ (1.18.0.3) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**
@@ -92,6 +93,34 @@ set battery.empty 3000           (mV for 0 %; battery.full for 100 %, default 42
 Relaying resumes 2 points above the threshold. The node's own adverts, replies and alerts
 still go out, and `set repeat`, flood limits and `battery.cutoff` work as before.
 Remote `reboot` waits about 4 s so its reply can go out first.
+
+**radio2: a second profile on the same radio** (as Halo Keymind Cascade 1.18). The SX1262
+alternates between your normal `radio` and a second profile, so the Cheapeater can relay a
+MediaMesh side channel (MeshCore Open TAK / Wadamesh TAK photos and voice) as well as the
+normal network:
+
+```
+set radio2 mediamesh             (911.150 MHz, 250 kHz, SF7, CR5, rx+tx; mediamesh-range = 125 kHz)
+set radio2 911.15,250,7,5,rxtx   (any profile: MHz,kHz,SF,CR,rx|rxtx[,preamble])
+get radio2                       (warns if radio2 sits within 6 kHz of radio's channel, and suggests a centre)
+get radio2.status                (packets per profile, switches, measured switch time, preambles)
+get radio2.scan / radio2.timing  (listening windows; recommended preambles)
+set radio2 off
+```
+
+Packets are relayed on the profile they arrived on. `set radio2.cross on` copies them to the
+other profile as well (default `off` keeps the two networks apart). Replies to logins, requests
+and discovery go out on both profiles by default; `set tx.reply radio|radio2|auto|off` changes
+that (`both force` / `radio2 force` lets replies use an `rx`-only radio2). The node's own adverts
+stay on `radio` unless crossing is on.
+
+**It is one radio taking turns, not two.** It listens about 9 ms on the slower profile and
+about 19 ms on the faster one, and can't hear either while it is receiving or sending on the
+other. Packets will be missed when senders use short preambles. The firmware measures how long
+a switch takes and sets its own preambles to match (radio: 32 symbols, MediaMesh: 48), and
+`get radio2.timing` says what the *senders* need. Stock MeshCore sends 32 symbols at SF7, which
+covers the normal network; MediaMesh senders need about 48. Noise-floor sampling and
+`int.thresh` pause while scanning. Changes take effect 2 s after the reply.
 
 **Before flashing XL, run `tools/flash128_test` on that board** (each chip has to pass).
 If the upper half is missing or wasn't written, XL stops at boot, prints why on the

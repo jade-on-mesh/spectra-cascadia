@@ -437,7 +437,7 @@ static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* se
 static void put16(uint8_t*& p, uint16_t v) { memcpy(p, &v, 2); p += 2; }
 static void put32(uint8_t*& p, uint32_t v) { memcpy(p, &v, 4); p += 4; }
 
-static int xl_request(XlClient* c, uint32_t ts, const uint8_t* req, int len) {
+XL_HI static int xl_request(XlClient* c, uint32_t ts, const uint8_t* req, int len) {
     memcpy(xl_reply, &ts, 4);                         // reflect the sender's timestamp as a tag
     uint8_t* p = xl_reply + 4;
     switch (req[0]) {
@@ -512,7 +512,7 @@ static int xl_anon_query(uint8_t type, uint32_t ts, const uint8_t* data) {
 
 // ── entry point: a packet whose dest hash is ours ───────────────────────────
 // Returns true if it was for us (decrypted), so the caller must not forward it.
-static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
+XL_HI static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
     (void)snr4;
     if (p.payload_len < 4 || p.payload[0] != own_pubkey[0]) return false;
     bool flood = p.route == ROUTE_FLOOD || p.route == ROUTE_TRANSPORT_FLOOD;

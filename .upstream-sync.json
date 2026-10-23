@@ -17,12 +17,15 @@
     "keymind: LoRa OTA relay during tempradio (1.17.1.3)",
     "official 1.18.0: MACThenDecrypt alignment, direct ACK delay, transport code 0 unscoped (+keymind wildcard/hop fix), hidden-node discover, af range, agc clamp, TXT_TYPE_CLI_COMMAND, power (1.18.0.1)",
     "keymind 1.18.0.1: drop payload version > 1 (direct LoRa OTA frames not relayed) (1.18.0.1)",
-    "keymind 1.18.0.1: repeat.battery/flood.battery, battery.empty/full, battery.forward; guest on/off, get guests, get logins (1.18.0.2)"
+    "keymind 1.18.0.1: repeat.battery/flood.battery, battery.empty/full, battery.forward; guest on/off, get guests, get logins (1.18.0.2)",
+    "official 1.18.0: preambleLengthForSF (32 symbols at SF<=8) (1.18.0.3)",
+    "keymind 1.18.0.1: radio2 (rx/rxtx, mediamesh presets), radio2.cross, tx.reply, scan timing/auto preambles, switch self-test, discovery trailer, spacing warning, radio2.status/scan/timing (1.18.0.3)"
   ],
   "declined": [
     "keymind: LoRa OTA install (needs bootloader; ~10 KB patch limit on STM32F103 \u2014 paused, see Cheapeater OTA design)",
     "official 1.18.0: loop.detect default minimal (ours moderate), SUBSCRIBE/region load-save (sensor), LR11xx/LR2021, FEM, gps diag",
     "keymind 1.18.0.1: negotiated direct LoRa OTA transport, Ethernet/WiFi/BLE/MQTT/Meshtext",
-    "keymind 1.18.0.1: noise-floor telemetry history, battery ADC calibration (battery.divider), flood filter/moderation engine, solar/MPPT, regulator, LED, bridges"
+    "keymind 1.18.0.1: noise-floor telemetry history, battery ADC calibration (battery.divider), flood filter/moderation engine, solar/MPPT, regulator, LED, bridges",
+    "keymind 1.18.0.1: tempradio2, radioat2/tempradioat2 schedules, Meshtext, Ethernet over LoRa, Companion tx.user/tx.channel/tx.media routing"
   ]
 }

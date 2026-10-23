@@ -39,8 +39,16 @@
 #undef private
 #endif
 
+// XL: code placed in the upper 64 KB (see specter_xl.ld). Only for functions that
+// run from loop(), after setup() has checked that half was flashed.
+#if defined(SPECTER_XL) && defined(ARDUINO_ARCH_STM32)
+#define XL_HI __attribute__((section(".xlhi"), noinline))
+#else
+#define XL_HI
+#endif
+
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.2"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.3"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -62,7 +70,7 @@
 #define LORA_TX_POWER 20          // dBm; DX-LR30 max is 22
 #endif
 #ifndef LORA_PREAMBLE
-#define LORA_PREAMBLE 16          // upstream MeshCore uses 16
+#define LORA_PREAMBLE 0           // 0 = as upstream 1.18 (preambleLengthForSF): 32 at SF5-8, 16 above
 #endif
 #ifndef LORA_SYNC
 #define LORA_SYNC 0x12
@@ -296,6 +304,25 @@ static ConfigPow bp;
 static_assert(sizeof(ConfigPow) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t pow_checksum(const ConfigPow& p) { return fnv_words(&p, offsetof(ConfigPow, check) / 4); }
+
+// XL: a second LoRa profile (radio2), time-shared on the one SX1262 (Halo Keymind Cascade 1.18).
+#define R2_MAGIC 0x32525053UL    // "SPR2"
+enum { R2_OFF, R2_RX, R2_RXTX };
+enum { R2_CROSS_OFF, R2_CROSS_AUTO, R2_CROSS_ON };
+enum { REPLY_BOTH, REPLY_RADIO, REPLY_RADIO2, REPLY_AUTO, REPLY_OFF };
+struct ConfigR2 {
+    uint32_t magic;
+    uint32_t freq_khz, bw_hz;
+    uint8_t  sf, cr, mode, cross;             // radio2 tuple + R2_* mode, radio2.cross
+    uint16_t pre;                             // preamble symbols, 0 = automatic
+    uint8_t  reply, reply_force;              // tx.reply: REPLY_*, and "force" (replies on an rx-only radio2)
+    uint32_t check;
+};
+static ConfigR2 r2;
+#define R2_ADDR (POW_ADDR + sizeof(ConfigPow))
+static_assert(sizeof(ConfigR2) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) + sizeof(ConfigR2) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t r2_checksum(const ConfigR2& c) { return fnv_words(&c, offsetof(ConfigR2, check) / 4); }
 #endif
 
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
@@ -477,6 +504,10 @@ static void cfg_save(void) {
     w = (const uint32_t*)&bp;
     for (unsigned i = 0; i < sizeof(ConfigPow) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, POW_ADDR + i * 4, w[i]);
+    r2.check = r2_checksum(r2);
+    w = (const uint32_t*)&r2;
+    for (unsigned i = 0; i < sizeof(ConfigR2) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, R2_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
 #ifdef SPECTER_XL
@@ -807,13 +838,18 @@ static uint32_t airtime_ms(int len) {
     return (uint32_t)(radio.getTimeOnAir(len) / 1000UL) + 1;
 }
 
+static uint16_t base_pre(uint8_t sf) { return LORA_PREAMBLE ? LORA_PREAMBLE : (sf <= 8 ? 32 : 16); }
+#ifdef SPECTER_XL
+static void r2_reset(void);
+#endif
+
 static bool radio_init(void) {
     SPI.begin();
     float freq = cfg.freq_khz / 1000.0f, bw = cfg.bw_hz / 1000.0f;
-    int state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, LORA_PREAMBLE, LORA_TCXO_VOLTAGE, false);
+    int state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, base_pre(cfg.sf), LORA_TCXO_VOLTAGE, false);
     if (state == RADIOLIB_ERR_SPI_CMD_FAILED || state == RADIOLIB_ERR_SPI_CMD_INVALID) {
         radio_has_tcxo = false;          // plain crystal
-        state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, LORA_PREAMBLE, 0.0f, false);
+        state = radio.begin(freq, bw, cfg.sf, cfg.cr, LORA_SYNC, cfg.tx_dbm, base_pre(cfg.sf), 0.0f, false);
     }
     if (state != RADIOLIB_ERR_NONE) {
         Serial1.print("ERROR: radio init failed: "); Serial1.println(state);
@@ -822,10 +858,11 @@ static bool radio_init(void) {
     radio.setRfSwitchPins(PIN_RXEN, PIN_TXEN);
     radio.setCRC(1);
     uint32_t sym_us = (1000000UL << cfg.sf) / cfg.bw_hz;
-    preamble_ms = (uint32_t)((LORA_PREAMBLE * 4 + 17) * sym_us * 3 / 8000) + 5;   // ×1.5 margin
+    preamble_ms = (uint32_t)((base_pre(cfg.sf) * 4 + 17) * sym_us * 3 / 8000) + 5;   // ×1.5 margin
     max_pkt_ms  = airtime_ms(255) + 50;
 #ifdef SPECTER_XL
     if (app.rxgain) radio.setRxBoostedGainMode(true);
+    r2_reset();
 #endif
     return true;
 }
@@ -847,11 +884,15 @@ static bool     header_seen = false;
 #define IRQ_ACTIVITY_CLEAR (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID | \
                             RADIOLIB_SX126X_IRQ_HEADER_ERR | RADIOLIB_SX126X_IRQ_SYNC_WORD_VALID)
 
-static bool channel_busy(uint32_t irq) {
-    uint32_t now = millis();
+static bool rx_active(uint32_t irq);
 #ifdef SPECTER_XL
-    // int.thresh: RSSI above the noise floor counts as busy (RadioLibWrapper::isChannelActive)
-    if (app.int_thresh && noise_floor && radio.rssiInst() > noise_floor + app.int_thresh) return true;
+static bool r2_active(void);
+#endif
+static bool channel_busy(uint32_t irq) {
+#ifdef SPECTER_XL
+    // int.thresh: RSSI above the noise floor counts as busy (RadioLibWrapper::isChannelActive).
+    // Not while scanning two profiles: there is no single noise floor then.
+    if (app.int_thresh && noise_floor && !r2_active() && radio.rssiInst() > noise_floor + app.int_thresh) return true;
     // cad: ask the SX1262 whether a LoRa preamble is on the air right now (only when idle)
     if (more.cad && !(irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID))) {
         int16_t r = radio.scanChannel();
@@ -859,6 +900,12 @@ static bool channel_busy(uint32_t irq) {
         if (r == RADIOLIB_LORA_DETECTED) { stat_cad_busy++; return true; }
     }
 #endif
+    return rx_active(irq);
+}
+
+// A packet is arriving (preamble or header seen, within its time limits).
+static bool rx_active(uint32_t irq) {
+    uint32_t now = millis();
     if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
         radio.clearIrqFlags(IRQ_ACTIVITY_CLEAR);
     } else if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
@@ -873,6 +920,138 @@ static bool channel_busy(uint32_t irq) {
     activity_at = 0; header_seen = false;
     return false;
 }
+
+#ifdef SPECTER_XL
+// ═════════════════════════════════════════════════════════════════════════════
+//  radio2: a second LoRa profile on the same SX1262 (Halo Keymind Cascade 1.18,
+//  docs/radio_profiles.md). The radio alternates between the two profiles: a
+//  4.6-symbol visit on the slower one, the rest of half its preamble on the faster
+//  one. A packet being received holds the profile until it ends. Switch times are
+//  measured (largest successful hop + 10%) and size the automatic preambles:
+//    T = 2^SF / BW, C = L0 + L1 + 2·switch, P_slow = 2C / T_slow,
+//    P_fast = (L_slow + 2·switch) / T_fast + 16, rounded up to 8, 32…512.
+// ═════════════════════════════════════════════════════════════════════════════
+static uint8_t  cur_prof = 0;                  // profile the radio is tuned to
+static uint8_t  rx_prof = 0;                   // profile the packet being handled arrived on
+static uint16_t pre_eff[2], pre_need[2];       // preambles in use / uncapped recommendation
+static uint32_t sym_us[2], visit_us[2], visit_start_us = 0;
+static uint32_t sw_count = 0, sw_fail = 0, sw_max_us = 0, sw_max_ok_us = 0;
+static uint8_t  sw_test[2];                    // successful hops into each profile since the pair changed
+static uint32_t r2_rxn[2], r2_txn[2];
+static uint32_t r2_apply_at = 0;               // deferred apply after a settings change (reply first)
+
+static bool r2_active(void) { return r2.mode != R2_OFF; }
+static bool prof_tx(uint8_t p) { return p == 0 || r2.mode == R2_RXTX; }
+// radio2.cross: off isolates the profiles; on copies traffic between them; auto copies
+// unless one side is temporary (tempradio) and the other isn't.
+static bool r2_crossing(void) { return r2_active() && (r2.cross == R2_CROSS_ON || (r2.cross == R2_CROSS_AUTO && !tr_active)); }
+static uint32_t prof_freq(uint8_t p) { return p ? r2.freq_khz : cfg.freq_khz; }
+static uint32_t prof_bw(uint8_t p)   { return p ? r2.bw_hz : cfg.bw_hz; }
+static uint8_t  prof_sf(uint8_t p)   { return p ? r2.sf : cfg.sf; }
+static uint8_t  prof_cr(uint8_t p)   { return p ? r2.cr : cfg.cr; }
+static uint32_t sw_allow_us(void) { return sw_max_ok_us ? sw_max_ok_us + sw_max_ok_us / 10 + 1 : 2000; }
+static uint8_t  slow_prof(void) { return sym_us[1] > sym_us[0] ? 1 : 0; }      // ties: radio first
+static bool     r2_ready(void) { return sw_test[0] >= 4 && sw_test[1] >= 4; }
+static uint16_t r8(uint32_t v) { v = (v + 7) & ~7UL; return (uint16_t)(v < 32 ? 32 : v > 512 ? 512 : v); }
+
+static void r2_timing(void) {
+    if (!r2_active()) { pre_eff[0] = base_pre(cfg.sf); visit_us[0] = 0; return; }
+    for (int p = 0; p < 2; p++) sym_us[p] = (1000000UL << prof_sf(p)) / prof_bw(p);
+    uint8_t s = slow_prof(), f = !s;
+    uint32_t L[2] = { (sym_us[0] * 46 + 9) / 10, (sym_us[1] * 46 + 9) / 10 };
+    uint32_t O = 2 * sw_allow_us(), C = L[0] + L[1] + O;
+    uint32_t need[2];
+    need[s] = (2 * C + sym_us[s] - 1) / sym_us[s];
+    need[f] = (L[s] + O + sym_us[f] - 1) / sym_us[f] + 16;
+    for (int p = 0; p < 2; p++) {
+        uint32_t n = (need[p] + 7) & ~7UL; if (n < 32) n = 32;
+        pre_need[p] = n > 0xFFFF ? 0xFFFF : (uint16_t)n;
+        pre_eff[p] = (p == 1 && r2.pre) ? r2.pre : r8(need[p]);
+    }
+    visit_us[s] = L[s];
+    int32_t fast = (int32_t)(pre_eff[s] * sym_us[s] / 2) - (int32_t)L[s] - (int32_t)O;
+    visit_us[f] = fast > (int32_t)L[f] ? (uint32_t)fast : L[f];
+}
+
+// Packet-activity windows for the profile the radio is on.
+static void prof_windows(uint8_t p) {
+    uint32_t sym = (1000000UL << prof_sf(p)) / prof_bw(p);
+    preamble_ms = (uint32_t)((pre_eff[p] * 4UL + 17) * sym * 3 / 8000) + 5;
+    max_pkt_ms  = airtime_ms(255) + 50;
+}
+
+static bool radio_tune(uint8_t p) {
+    uint32_t t0 = micros();
+    radio.standby();
+    int st = radio.setFrequency(prof_freq(p) / 1000.0f, true);      // same band: no image recalibration
+    if (!st) st = radio.setBandwidth(prof_bw(p) / 1000.0f);
+    if (!st) st = radio.setSpreadingFactor(prof_sf(p));
+    if (!st) st = radio.setCodingRate(prof_cr(p));
+    if (!st) st = radio.setPreambleLength(pre_eff[p]);
+    activity_at = 0; header_seen = false;
+    if (st) {                                                         // back to what we had
+        sw_fail++; sw_count++;
+        radio.setFrequency(prof_freq(cur_prof) / 1000.0f, true); radio.setBandwidth(prof_bw(cur_prof) / 1000.0f);
+        radio.setSpreadingFactor(prof_sf(cur_prof)); radio.setCodingRate(prof_cr(cur_prof));
+        radio.setPreambleLength(pre_eff[cur_prof]);
+        rx_start();
+        visit_start_us = micros();
+        return false;
+    }
+    rx_start();
+    uint32_t dt = micros() - t0;
+    sw_count++;
+    if (dt > sw_max_us) sw_max_us = dt;
+    if (cur_prof != p && sw_test[p] < 4) sw_test[p]++;
+    cur_prof = p;
+    prof_windows(p);
+    if (dt > sw_max_ok_us) { sw_max_ok_us = dt; r2_timing(); }        // a slower hop lengthens preambles
+    visit_start_us = micros();
+    return true;
+}
+
+// Profile pair changed (or radio re-initialised): measure switching again from scratch.
+static void r2_reset(void) {
+    sw_test[0] = sw_test[1] = 0;
+    sw_max_ok_us = 0;
+    r2_timing();
+    cur_prof = 0;
+    radio.setPreambleLength(pre_eff[0]);
+    prof_windows(0);
+    visit_start_us = micros();
+}
+
+// Apply a radio2 change: retune to radio with its (possibly new) preamble.
+static void r2_apply(void) {
+    r2_apply_at = 0;
+    r2_reset();
+    radio_tune(0);
+    if (!r2_active()) sw_test[0] = 0;
+    LOGLN(r2_active() ? "radio2: scanning two profiles" : "radio2: off");
+}
+
+// Called from loop(): hop to the other profile when this visit is over (not mid-packet).
+static void r2_service(uint32_t irq) {
+    if (r2_apply_at && (int32_t)(millis() - r2_apply_at) >= 0) r2_apply();
+    if (!r2_active() || r2_apply_at) return;
+    if (rx_active(irq)) return;
+    if (micros() - visit_start_us < visit_us[cur_prof]) return;
+    radio_tune(!cur_prof);
+}
+
+// radio2 within 6 kHz of radio's channel edge? Suggest the nearest clear whole-kHz centre.
+static void r2_spacing_warn(char* out) {
+    if (!r2_active() || !r2.freq_khz) return;
+    uint32_t need = (cfg.bw_hz + r2.bw_hz) / 2 + 6000;               // Hz
+    int32_t d = (int32_t)r2.freq_khz - (int32_t)cfg.freq_khz;
+    if ((uint32_t)(d < 0 ? -d : d) * 1000UL > need) return;
+    int32_t k = (int32_t)(need / 1000 + 1), f = (int32_t)cfg.freq_khz + (d >= 0 ? k : -k);
+    if (f > 960000 || f < 150000) f = (int32_t)cfg.freq_khz + (d >= 0 ? -k : k);
+    char a[16]; sprintf(out + strlen(out), "; WARN radio2 overlaps radio1 (6kHz guard); try %sMHz", fmt_fixed(a, f, 3));
+}
+#else
+static inline bool r2_active(void) { return false; }
+#endif
 
 // Airtime budget (Dispatcher::updateTxBudget, 1-hour window); duty = 1/(1+af)
 static uint32_t budget_ms = 0, budget_updated = 0;
@@ -891,7 +1070,12 @@ static void budget_refill(void) {
 static bool transmit(const uint8_t* buf, int len, uint8_t cr) {
     uint32_t toa = airtime_ms(len);
     radio.standby();
-    if (cr && cr != cfg.cr) radio.setCodingRate(cr);
+#ifdef SPECTER_XL
+    uint8_t base_cr = prof_cr(cur_prof);                // the profile the radio is on
+#else
+    uint8_t base_cr = cfg.cr;
+#endif
+    if (cr && cr != base_cr) radio.setCodingRate(cr);
     led(true);
     int state = radio.startTransmit(buf, len);
     if (state == RADIOLIB_ERR_NONE) {
@@ -902,7 +1086,7 @@ static bool transmit(const uint8_t* buf, int len, uint8_t cr) {
         }
     }
     radio.finishTransmit();
-    if (cr && cr != cfg.cr) radio.setCodingRate(cfg.cr);
+    if (cr && cr != base_cr) radio.setCodingRate(base_cr);
     led(false);
     budget_ms = (budget_ms > toa) ? budget_ms - toa : 0;
     stat_tx_air_ms += toa;
@@ -915,18 +1099,70 @@ static bool transmit(const uint8_t* buf, int len, uint8_t cr) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  TX queue — delayed, prioritized retransmits (RX keeps running while waiting)
 // ═════════════════════════════════════════════════════════════════════════════
+#ifdef SPECTER_XL
+#define TXQ_SIZE 8             // radio2 can queue a copy for each profile
+#else
 #define TXQ_SIZE 6
+#endif
 struct TxItem {
     bool     used;
     uint8_t  pri, len, cr;
     int8_t   rslot;            // retry slot to arm after this TX, or -1
     uint8_t  score;            // XL rxdelay: reception score ×100 of the copy queued
+#ifdef SPECTER_XL
+    uint8_t  prof;             // radio2: 0 radio, 1 radio2
+#endif
     uint32_t due, busy_since;
     uint8_t  buf[MAX_PKT];
 };
 static TxItem txq[TXQ_SIZE];
 
+#ifdef SPECTER_XL
+// Which profiles a new packet goes out on (bit 0 radio, bit 1 radio2):
+//   own traffic (adverts, alerts): radio, plus radio2 when crossing
+//   forwarded: the profile it arrived on (if it may transmit there), plus the other when crossing
+//   replies to requests made to us: tx.reply (both by default)
+enum { Q_OWN, Q_FWD, Q_REPLY };
+static uint8_t q_mode = Q_OWN;
+static uint8_t q_rx_mask(void) {
+    uint8_t m = prof_tx(rx_prof) ? 1 << rx_prof : 0;
+    if (r2_crossing() && prof_tx(!rx_prof)) m |= 1 << !rx_prof;
+    return m;
+}
+static uint8_t tx_mask(void) {
+    if (!r2_active()) return 1;
+    if (q_mode == Q_FWD) return q_rx_mask();
+    if (q_mode == Q_REPLY) {
+        bool p1 = r2.mode == R2_RXTX || r2.reply_force;
+        switch (r2.reply) {
+            case REPLY_BOTH:   return 1 | (p1 ? 2 : 0);
+            case REPLY_RADIO:  return 1;
+            case REPLY_RADIO2: return p1 ? 2 : 0;
+            case REPLY_OFF:    return 0;
+            default:           return q_rx_mask();
+        }
+    }
+    return 1 | (r2_crossing() && prof_tx(1) ? 2 : 0);
+}
+static int txq_push1(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms, uint8_t prof);
+// Queue on every profile tx_mask() allows; returns the copy on the arrival profile
+// (or the first one), which is the one a retry slot follows.
 static int txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms) {
+    uint8_t m = tx_mask(), first = (m & (1 << rx_prof)) ? rx_prof : !rx_prof;
+    int q = -1;
+    for (int k = 0; k < 2; k++) {
+        uint8_t p = k ? !first : first;
+        if (!(m & (1 << p))) continue;
+        int r = txq_push1(buf, len, pri, delay_ms, p);
+        if (q < 0) q = r;
+    }
+    return q;
+}
+static int txq_push1(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms, uint8_t prof) {
+#else
+#define txq_push1(b, l, p, d, prof) txq_push(b, l, p, d)
+static int txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms) {
+#endif
     if (len <= 0) return -1;
     int slot = -1;
     for (int i = 0; i < TXQ_SIZE; i++) if (!txq[i].used) { slot = i; break; }
@@ -938,6 +1174,9 @@ static int txq_push(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms)
     TxItem& t = txq[slot];
     t.used = true; t.pri = pri; t.len = (uint8_t)len; t.cr = 0; t.rslot = -1; t.score = 0;
     t.due = millis() + delay_ms; t.busy_since = 0;
+#ifdef SPECTER_XL
+    t.prof = prof;
+#endif
     memcpy(t.buf, buf, len);
     return slot;
 }
@@ -987,6 +1226,9 @@ struct RetrySlot {
     uint8_t  hash[8];
     uint8_t  hops;             // path count in the packet we sent
     uint8_t  left, attempt, cr0, len, pri;
+#ifdef SPECTER_XL
+    uint8_t  prof;             // radio2: the profile this copy goes out on
+#endif
     uint32_t due;
     uint8_t  buf[MAX_PKT];
 };
@@ -1045,6 +1287,9 @@ static void rt_create(const uint8_t h[8], int qslot, bool direct, uint8_t hops, 
     memcpy(r.hash, h, 8);
     r.hops = hops; r.left = count; r.attempt = 0; r.cr0 = cr0;
     r.len = txq[qslot].len; r.pri = txq[qslot].pri;
+#ifdef SPECTER_XL
+    r.prof = txq[qslot].prof;
+#endif
     memcpy(r.buf, txq[qslot].buf, r.len);
     txq[qslot].rslot = i;
 }
@@ -1053,6 +1298,9 @@ static void rt_create(const uint8_t h[8], int qslot, bool direct, uint8_t hops, 
 static bool rt_echo(const uint8_t h[8], bool direct, uint8_t hops) {
     for (int i = 0; i < RT_SLOTS; i++) {
         if (!rt[i].used || memcmp(rt[i].hash, h, 8)) continue;
+#ifdef SPECTER_XL
+        if (rt[i].prof != rx_prof) continue;          // an echo on one profile says nothing about the other
+#endif
         bool ok = rt[i].direct ? (direct && hops < rt[i].hops) : (!direct && hops > rt[i].hops);
         if (!ok) return false;
         rt_free(i);
@@ -1071,7 +1319,7 @@ static void rt_service(void) {
         if (!r.left) { r.used = false; continue; }    // final echo window expired
         if (fwd_paused(!r.direct)) { r.used = false; continue; }   // battery pause: no more relay retries
         r.left--; r.attempt++; r.armed = false;
-        int q = txq_push(r.buf, r.len, r.pri, 0);
+        int q = txq_push1(r.buf, r.len, r.pri, 0, r.prof);
         if (q < 0) { r.used = false; continue; }
         txq[q].rslot = i;
         txq[q].cr = r.direct || r.hops == 0 ? rt_cr(r.cr0, r.attempt) : 0;
@@ -1086,6 +1334,10 @@ static void txq_service(uint32_t irq) {
     uint32_t now = millis();
     int best = -1;
     for (int i = 0; i < TXQ_SIZE; i++) {
+#ifdef SPECTER_XL
+        if (txq[i].used && txq[i].prof && !r2_active()) { txq[i].used = false; continue; }   // radio2 gone
+        if (txq[i].used && txq[i].prof != cur_prof) continue;   // goes out when the radio is on its profile
+#endif
         if (!txq[i].used || (int32_t)(now - txq[i].due) < 0) continue;
         if (best < 0 || txq[i].pri < txq[best].pri ||
             (txq[i].pri == txq[best].pri && (int32_t)(txq[i].due - txq[best].due) < 0)) best = i;
@@ -1108,6 +1360,10 @@ static void txq_service(uint32_t irq) {
     }
     if (transmit(t.buf, t.len, t.cr)) {
         stat_tx++;
+#ifdef SPECTER_XL
+        r2_txn[cur_prof]++;
+        visit_start_us = micros();                    // listen a full visit after sending
+#endif
         if ((t.buf[0] & 3) == ROUTE_FLOOD || (t.buf[0] & 3) == ROUTE_TRANSPORT_FLOOD) stat_flood_tx++; else stat_direct_tx++;
     }
     t.used = false;
@@ -1269,15 +1525,31 @@ static const char* handle_control(const Pkt& p, int8_t snr4) {
 #endif
         if (!(p.payload[1] & (1 << ADV_TYPE_REPEATER)) || mod < since) return "discover filtered";
         disc_count++;
-        uint8_t d[6 + 32];
+        uint8_t d[6 + 32 + 12];
         d[0] = CTL_DISCOVER_RESP | ADV_TYPE_REPEATER;
         d[1] = (uint8_t)snr4;                            // inbound SNR ×4
         memcpy(d + 2, p.payload + 2, 4);                 // tag
         memcpy(d + 6, own_pubkey, 32);
         int len = (p.payload[0] & 1) ? 6 + 8 : 6 + 32;   // prefix_only
+#ifdef SPECTER_XL
+        if (p.payload[0] & 2) {                          // radio2 trailer requested (Halo Keymind Cascade 1.18)
+            uint8_t* t = d + len;
+            t[0] = 1; t[1] = 0; len += 2;
+            if (r2_active()) {
+                t[1] = 1 | (r2.mode == R2_RXTX ? 2 : 1) << 1;
+                uint32_t bw = r2.bw_hz;
+                memcpy(t + 2, &r2.freq_khz, 4); memcpy(t + 6, &bw, 4);
+                t[10] = r2.sf; t[11] = r2.cr; len += 10;
+            }
+        }
+        q_mode = Q_REPLY;
+#endif
         int n = build(out_buf, (PT_CONTROL << 2) | ROUTE_DIRECT, NULL, 0, NULL, 0, d, len);
         uint32_t t = airtime_ms(n) * cfg.txdelay_x100 / 100;
         if (n > 0) txq_push(out_buf, n, 0, rnd_range(0, 5 * t + 2) * 4);   // widened ×4: many may answer
+#ifdef SPECTER_XL
+        q_mode = Q_FWD;
+#endif
         return "discover answered";
     }
 #ifdef SPECTER_XL
@@ -1335,7 +1607,10 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         else if (xl_type(p.ptype)) {                   // addressed to us (last hop removed)
             packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
             if (was_seen(h)) return "dedup";
-            if (xl_handle_for_us(p, snr4, -1)) { mark_seen(h); stat_for_us++; return "for us"; }
+            q_mode = Q_REPLY;
+            bool mine = xl_handle_for_us(p, snr4, -1);
+            q_mode = Q_FWD;
+            if (mine) { mark_seen(h); stat_for_us++; return "for us"; }
         }
 #endif
         return "zero-hop";
@@ -1494,7 +1769,7 @@ static uint32_t rx_delay_ms(const Pkt& p, int8_t snr4, uint8_t* score_out) {
 static bool better_copy(const Pkt& p, int8_t snr4) {
     for (int i = 0; i < TXQ_SIZE; i++) {
         TxItem& t = txq[i];
-        if (!t.used || t.len < p.payload_len || (t.buf[0] & 3) != p.route || ((t.buf[0] >> 2) & 15) != p.ptype) continue;
+        if (!t.used || t.prof != rx_prof || t.len < p.payload_len || (t.buf[0] & 3) != p.route || ((t.buf[0] >> 2) & 15) != p.ptype) continue;
         if (memcmp(t.buf + t.len - p.payload_len, p.payload, p.payload_len)) continue;
         uint8_t score;
         uint32_t d = rx_delay_ms(p, snr4, &score);
@@ -1596,7 +1871,10 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
         int scope = -1;
         if (p.tc[0])
             scope = region_match(p.tc[0], p.ptype, p.payload, p.payload_len);
-        if (xl_handle_for_us(p, snr4, scope)) { mark_seen(h); stat_for_us++; return "for us"; }
+        q_mode = Q_REPLY;
+        bool mine = xl_handle_for_us(p, snr4, scope);
+        q_mode = Q_FWD;
+        if (mine) { mark_seen(h); stat_for_us++; return "for us"; }
     }
 #endif
     if (!cfg.repeat) return "repeat off";
@@ -1654,11 +1932,17 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
 static void on_receive(const uint8_t* d, int len, int8_t snr4) {
     Pkt p;
     const char* why;
+#ifdef SPECTER_XL
+    q_mode = Q_FWD;                                    // anything queued now is a relay (or a reply, see below)
+#endif
     if (!parse(d, len, p)) why = "malformed";
     else if (p.route == ROUTE_DIRECT || p.route == ROUTE_TRANSPORT_DIRECT) { stat_direct_rx++; why = handle_direct(p, snr4); }
     else { stat_flood_rx++; why = handle_flood(p, snr4); }
     if (why) { stat_drop++; LOG("  drop: "); LOGLN(why); }
     else     { stat_fwd++;  LOGLN("  fwd"); }
+#ifdef SPECTER_XL
+    q_mode = Q_OWN;
+#endif
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1894,6 +2178,7 @@ static uint8_t  nf_n = 0;
 static int32_t  nf_sum = 0;
 static uint32_t nf_next_ms = 0;
 static void noise_floor_sample(uint32_t irq) {
+    if (r2_active()) return;                           // no single channel to measure while scanning
     if ((int32_t)(millis() - nf_next_ms) < 0 || header_seen ||
         (irq & (RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID))) return;
     nf_next_ms = millis() + 250;
@@ -2072,7 +2357,7 @@ static bool    rl_active = false;
 static uint8_t rl_n, rl_flags[MAX_REGIONS];
 static char    rl_names[MAX_REGIONS][REGION_NAME];
 static int8_t  rl_stack[8];                          // index per indent level; -1 wildcard, -2 unset
-static bool region_load_line(const char* line, char* reply) {
+XL_HI static bool region_load_line(const char* line, char* reply) {
     reply[0] = 0;
     const char* np = line;
     while (*np == ' ') np++;
@@ -2117,7 +2402,7 @@ static bool region_load_line(const char* line, char* reply) {
 }
 #endif
 
-static void handle_region(const char* args, char* reply) {
+XL_HI static void handle_region(const char* args, char* reply) {
     char a1[16], a2[REGION_NAME + 2], a3[REGION_NAME + 2];
     const char* rest = next_token(args, a1, sizeof(a1));
 #ifdef SPECTER_XL
@@ -2293,7 +2578,110 @@ static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts);
 #include "xl_admin.inc"
 #endif
 
-static void handle_get(const char* k, char* reply) {
+#ifdef SPECTER_XL
+static const char* const r2_modes[] = { "off", "rx", "rxtx" };
+static const char* const r2_cross_names[] = { "off", "auto", "on" };
+static const char* const reply_names[] = { "both", "radio", "radio2", "auto", "off" };
+
+static void r2_tuple(char* out) {
+    char a[16], b[16];
+    sprintf(out, "%s,%s,%u,%u,%s", fmt_fixed(a, r2.freq_khz, 3), fmt_fixed(b, r2.bw_hz, 3), r2.sf, r2.cr, r2_modes[r2.mode]);
+    if (r2.pre) sprintf(out + strlen(out), ",%u", r2.pre);
+}
+
+XL_HI static void r2_get(const char* k, char* reply) {
+    if (!strcmp(k, "radio2")) {
+        if (!r2_active()) { strcpy(reply, "> off"); return; }
+        strcpy(reply, "> "); r2_tuple(reply + 2);
+        if (r2.pre && r2.pre < pre_need[1] && r2_ready()) sprintf(reply + strlen(reply), "; WARN recommended preamble: radio2=%u; short override: radio2", pre_need[1]);
+        r2_spacing_warn(reply);
+    } else if (!strcmp(k, "radio2.cross")) {
+        sprintf(reply, "> %s", r2_cross_names[r2.cross]);
+    } else if (!strcmp(k, "tx.reply")) {
+        sprintf(reply, "> %s%s", reply_names[r2.reply], r2.reply_force ? " force" : "");
+        if ((r2.reply == REPLY_BOTH || r2.reply == REPLY_RADIO2) && r2.mode == R2_RX && !r2.reply_force)
+            strcat(reply, " (radio2 can't transmit)");
+    } else if (!r2_active()) {
+        strcpy(reply, "> off");
+    } else if (!strcmp(k, "radio2.status")) {
+        sprintf(reply, "> mode=%s rx=%lu,%lu tx=%lu,%lu switches=%lu fail=%lu max=%luus switch=%luus pre=%u,%u test=%u/4,%u/4 %s",
+                r2_modes[r2.mode], (unsigned long)r2_rxn[0], (unsigned long)r2_rxn[1], (unsigned long)r2_txn[0], (unsigned long)r2_txn[1],
+                (unsigned long)sw_count, (unsigned long)sw_fail, (unsigned long)sw_max_us, (unsigned long)sw_allow_us(),
+                pre_eff[0], pre_eff[1], sw_test[0], sw_test[1], r2_ready() ? "ready" : "pending");
+    } else if (!strcmp(k, "radio2.scan")) {
+        sprintf(reply, "> first=%s visits=%lu,%luus pre=%u,%u", slow_prof() ? "radio2" : "radio",
+                (unsigned long)visit_us[0], (unsigned long)visit_us[1], pre_eff[0], pre_eff[1]);
+    } else if (!strcmp(k, "radio2.timing") || !strcmp(k, "radio.timing")) {
+        char a[12], b[12];
+        sprintf(reply, "> chirps=%s,%s; need=%u,%u; switch=%luus; test=%u/4,%u/4 %s",
+                fmt_fixed(a, visit_us[0] * 100 / sym_us[0], 2), fmt_fixed(b, visit_us[1] * 100 / sym_us[1], 2),
+                pre_need[0], pre_need[1], (unsigned long)sw_allow_us(), sw_test[0], sw_test[1], r2_ready() ? "ready" : "pending");
+        if (r2_ready()) {
+            bool w0 = pre_need[0] > 32, w1 = pre_need[1] > (r2.pre ? r2.pre : 32);
+            if (w0 || w1) {
+                strcat(reply, "; WARN recommended preamble:");
+                if (w0) sprintf(reply + strlen(reply), " radio=%u", pre_need[0]);
+                if (w1) sprintf(reply + strlen(reply), " radio2=%u", pre_need[1]);
+            }
+            if (pre_need[0] > 512 || pre_need[1] > 512) strcat(reply, "; WARN need >512");
+        }
+    } else strcpy(reply, "??: unknown config");
+}
+
+// set radio2 <MHz>,<kHz>,<SF>,<CR>,<rx|rxtx>[,<preamble>|auto] | mediamesh | mediamesh-range | off
+// set radio2.cross auto|on|off      set tx.reply both|radio|radio2|auto|off [force]
+XL_HI static void r2_set(const char* k, const char* v, char* reply) {
+    if (!strcmp(k, "radio2.cross")) {
+        int i = 0; while (i < 3 && strcmp(v, r2_cross_names[i])) i++;
+        if (i == 3) { strcpy(reply, "Error: use set radio2.cross auto|on|off"); return; }
+        r2.cross = i; cfg_save(); strcpy(reply, "OK"); return;
+    }
+    if (!strcmp(k, "tx.reply")) {
+        char w[12]; const char* rest = next_token(v, w, sizeof(w));
+        int i = 0; while (i < 5 && strcmp(w, reply_names[i])) i++;
+        rest = skip_ws(rest);
+        bool force = !strcmp(rest, "force");
+        if (i == 5 || (*rest && !force) || (force && i != REPLY_BOTH && i != REPLY_RADIO2)) {
+            strcpy(reply, "Error: use set tx.reply both|radio|radio2|auto|off (force: both|radio2)"); return;
+        }
+        r2.reply = i; r2.reply_force = force; cfg_save(); strcpy(reply, "OK"); return;
+    }
+    ConfigR2 n = r2;
+    if (!strcmp(v, "off")) n.mode = R2_OFF;
+    else if (!strcmp(v, "mediamesh") || !strcmp(v, "mediamesh-range")) {   // MeshCore Open TAK / Wadamesh TAK presets
+        n.freq_khz = 911150; n.bw_hz = v[9] ? 125000 : 250000; n.sf = 7; n.cr = 5; n.mode = R2_RXTX; n.pre = 0;
+    } else {
+        int32_t f, bw; char m[8];
+        const char* c1 = strchr(v, ','); const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        const char* c3 = c2 ? strchr(c2 + 1, ',') : NULL; const char* c4 = c3 ? strchr(c3 + 1, ',') : NULL;
+        if (!c4 || !parse_fixed(v, 3, &f) || !parse_fixed(c1 + 1, 3, &bw)) { strcpy(reply, "Error: use set radio2 MHz,kHz,SF,CR,rx|rxtx[,preamble] or mediamesh or off"); return; }
+        int sf = atoi_s(c2 + 1), cr = atoi_s(c3 + 1);
+        const char* c5 = strchr(c4 + 1, ',');
+        int ml = c5 ? (int)(c5 - c4 - 1) : (int)strlen(c4 + 1);
+        if (ml <= 0 || ml >= (int)sizeof(m)) ml = 0;
+        memcpy(m, c4 + 1, ml); m[ml] = 0;
+        static const uint32_t bws[] = { 7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000 };
+        bool bw_ok = false; for (uint32_t b : bws) bw_ok |= (uint32_t)bw == b;
+        int mode = !strcmp(m, "rx") ? R2_RX : (!strcmp(m, "rxtx") || !strcmp(m, "rx&tx")) ? R2_RXTX : -1;
+        int pre = 0;
+        if (c5 && strcmp(c5 + 1, "auto")) { bool ok; pre = atoi_u(c5 + 1, &ok); if (!ok || (pre && (pre < 8 || pre > 1024))) mode = -1; }
+        if (f < 150000 || f > 960000 || !bw_ok || sf < 5 || sf > 12 || cr < 5 || cr > 8 || mode < 0) {
+            strcpy(reply, "Error, invalid radio2 params"); return;
+        }
+        n.freq_khz = f; n.bw_hz = bw; n.sf = sf; n.cr = cr; n.mode = mode; n.pre = pre;
+    }
+    r2 = n;
+    cfg_save();
+    r2_timing();
+    r2_apply_at = (millis() + 2000) | 1;              // switch after the reply has gone out
+    if (!r2_active()) { strcpy(reply, "OK - radio2 off"); return; }
+    strcpy(reply, "OK - radio2 "); r2_tuple(reply + strlen(reply));
+    strcat(reply, "; timing self-test pending");
+    r2_spacing_warn(reply);
+}
+#endif
+
+XL_HI static void handle_get(const char* k, char* reply) {
     char a[16], b[16];
     const ExtKey* e = ext_find(k);
     if (e) { ext_get(e, reply); return; }
@@ -2415,6 +2803,7 @@ static void handle_get(const char* k, char* reply) {
         sprintf(reply, "> battery=%s mv=%lu repeat=%s flood=%s", pc, (unsigned long)last_batt_mv,
                 bf_rep_paused ? "blocked" : "allowed", bf_rep_paused || bf_fl_paused ? "blocked" : "allowed");
     }
+    else if (!strncmp(k, "radio2", 6) || !strcmp(k, "radio.timing") || !strcmp(k, "tx.reply")) r2_get(k, reply);
     else if (!strcmp(k, "guest")) sprintf(reply, "> %s", bp.guest_on ? "on" : "off");
     else if (!strncmp(k, "guests", 6) && (!k[6] || k[6] == ' ')) xl_guests_get(k + 6, reply);
     else if (!strncmp(k, "logins", 6) && (!k[6] || k[6] == ' ')) xl_logins_get(k + 6, reply);
@@ -2426,7 +2815,7 @@ static void handle_get(const char* k, char* reply) {
     else strcpy(reply, "??: unknown config");
 }
 
-static void handle_set(const char* cmd, char* reply) {
+XL_HI static void handle_set(const char* cmd, char* reply) {
     char k[24];
     const char* v = cmd;
     int n = 0;
@@ -2607,6 +2996,9 @@ static void handle_set(const char* cmd, char* reply) {
         bf_update(battery_mv());
         strcpy(reply, "OK - saved");
         return;
+    } else if (!strcmp(k, "radio2") || !strcmp(k, "radio2.cross") || !strcmp(k, "tx.reply")) {
+        r2_set(k, v, reply);
+        return;
     } else if (!strcmp(k, "guest")) {
         if (strcmp(v, "on") && strcmp(v, "off")) { strcpy(reply, "Err - use get guest or set guest on|off"); return; }
         bp.guest_on = v[1] == 'n';
@@ -2630,7 +3022,7 @@ static void handle_set(const char* cmd, char* reply) {
     strcpy(reply, done);
 }
 
-static void handle_command(char* cmd, char* reply) {
+XL_HI static void handle_command(char* cmd, char* reply) {
 #ifdef SPECTER_XL
     if (rl_active) { region_load_line(cmd, reply); return; }
 #endif
@@ -2822,7 +3214,7 @@ static void handle_command(char* cmd, char* reply) {
 
 // Over-the-air CLI (admin login): everything the USB console offers except the
 // identity/erase commands, plus upstream's "clock sync" (sets time from the app).
-static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
+XL_HI static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
     if (rl_active) { region_load_line(cmd, reply); return; }   // lines are consumed before tag stripping (upstream)
     while (*cmd == ' ') cmd++;
     reply[0] = 0;
@@ -2842,7 +3234,10 @@ static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts) {
         } else strcpy(reply, "ERR: clock cannot go backwards");
         return;
     }
+    uint8_t qm = q_mode;
+    q_mode = Q_OWN;                             // adverts etc. a command triggers are our own traffic
     handle_command(cmd, reply);
+    q_mode = qm;
     if (reboot_pending) {                       // let the reply go out first
         reboot_pending = false;
         xl_reboot_at = (millis() + 4000) | 1;
@@ -2940,6 +3335,11 @@ void setup(void) {
         bp.empty_mv = 3000; bp.full_mv = 4200;
         bp.guest_on = auth.guest_pw[0] != 0;          // upgrade: a guest password already set keeps guests working
     }
+    memcpy(&r2, (const void*)R2_ADDR, sizeof(r2));
+    if (r2.magic != R2_MAGIC || r2.check != r2_checksum(r2)) {
+        memset(&r2, 0, sizeof(r2));                   // radio2 off, radio2.cross off, tx.reply both
+        r2.magic = R2_MAGIC;
+    }
     xl_init();
 #endif
     regions_rekey();
@@ -3034,6 +3434,7 @@ void loop(void) {
             last_rssi = rssi; last_snr4 = snr4;
 #ifdef SPECTER_XL
             last_rx_ms = millis();
+            rx_prof = cur_prof; r2_rxn[cur_prof]++;
 #endif
             stat_rx_air_ms += airtime_ms(len);
             if (log_on) {
@@ -3042,6 +3443,9 @@ void loop(void) {
                 Serial1.print(" len="); Serial1.println(len);
             }
             on_receive(rxbuf, len, (int8_t)snr4);
+#ifdef SPECTER_XL
+            rx_prof = 0;
+#endif
         }
         return;
     }
@@ -3057,6 +3461,9 @@ void loop(void) {
 
     rt_service();
     txq_service(irq);
+#ifdef SPECTER_XL
+    r2_service(radio.getIrqFlags());
+#endif
     noise_floor_sample(irq);
 #ifdef SPECTER_XL
     // agc.reset.interval: warm-sleep the radio to reset its front end (RadioLibWrapper::resetAGC)

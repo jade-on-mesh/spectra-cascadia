@@ -7,6 +7,32 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.18.0.3] - 2026-10-23
+
+Adds Halo Keymind Cascade's **radio2** (a second LoRa profile, time-shared on the one SX1262), aimed at relaying MediaMesh next to the normal network. XL only.
+Not yet tested on hardware; the scanner's real switch time on the DX-LR30 is still to be measured (`get radio2.status`).
+
+### Added (XL)
+- `set radio2 MHz,kHz,SF,CR,rx|rxtx[,preamble]`, `set radio2 mediamesh` (911.150 / 250 kHz / SF7 / CR5, rxtx), `mediamesh-range` (125 kHz), `set radio2 off`; `get radio2` warns when radio2 is within 6 kHz of radio's channel and suggests a centre
+- Scanning: 4.6 symbols on the slower profile, then the rest of half its preamble on the faster one; a packet being received holds the profile. The first four hops each way measure the switch time (largest + 10%), which sizes the automatic preambles (radio 32, MediaMesh 48 on the default pair)
+- Relays on the profile a packet arrived on; `set radio2.cross off|auto|on` (default off) copies relays and own adverts to the other profile. A radio2 copy has its own retry slot, and an echo only cancels the retry on its own profile
+- `set tx.reply both|radio|radio2|auto|off [force]` (default both): which profiles replies to logins, requests, CLI and discovery use
+- Discovery: a request with flag `0x02` gets the version-1 radio2 trailer (configured, mode, frequency, bandwidth, SF, CR)
+- `get radio2.status`, `get radio2.scan`, `get radio2.timing` (alias `radio.timing`)
+
+### Fixed
+- Preamble length follows official 1.18 (`preambleLengthForSF`): 32 symbols at SF5–8, 16 above (was always 16). Both builds
+
+### Changed (XL)
+- The CLI and remote-admin handlers moved to the upper 64 KB (`XL_HI`), freeing ~14 KB in the lower 62 KB (14.7 KB now free there)
+- Send queue: 8 slots (was 6) so each profile can hold copies
+
+### Upstream sync
+Ported from mikecarper's `docs/radio_profiles.md` (Halo Keymind Cascade 1.18.0.1): `radio2` / `rx` / `rxtx`, MediaMesh presets, `radio2.cross`, `tx.reply` (+ force), scan timing and automatic preambles, switch self-test, discovery trailer, spacing warning, status/scan/timing getters.
+Left out: `tempradio2`, scheduled profiles (`radioat2`, `tempradioat2`), Meshtext, Ethernet over LoRa, Companion per-contact/channel/media routing, the two-minute advice delay.
+
+Size: standard 63,316-byte image (+56: preamble rule); XL lower 62 KB 48.8 KB used, upper 44.6 KB of 63 KB, RAM +640 bytes.
+
 ## [1.18.0.2] - 2026-10-22
 
 Rolls in mikecarper Halo Keymind Cascade 1.18.0.1 changes from after the last sync (up to [e34e83e6](https://github.com/mikecarper/MeshCore/commit/e34e83e6b), 2026-10-22). XL only; the standard build is unchanged.

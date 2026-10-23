@@ -26,7 +26,7 @@ struct Module { Module(uint32_t,uint32_t,uint32_t,uint32_t,FakeSPI&) {} int16_t 
 struct SX1262 {
   Module* m;
   SX1262(Module* mm) : m(mm) {}
-  int begin(float,float,int,int,int,int,int,float,bool) { return 0; }
+  int begin(float f,float b,int s,int,int,int,int p,float,bool) { f_khz = (uint32_t)(f * 1000.0f + 0.5f); bw_hz = (uint32_t)(b * 1000.0f + 0.5f); sf = s; pre = p; return 0; }
   void setRfSwitchPins(int,int) {}
   void setCRC(int) {}
   uint64_t getTimeOnAir(size_t len) { return (uint64_t)(len * 2000 + 40000); } // ~2ms/byte fake
@@ -49,6 +49,12 @@ struct SX1262 {
   int16_t setRxBoostedGainMode(bool b, bool = true) { boosted = b; return 0; }
   int16_t sleep(bool = true) { sleeps++; return 0; }
   int last_cr = 5; int16_t setCodingRate(int c) { last_cr = c; return 0; }
+  // radio2: what the radio is tuned to (kHz / Hz as integers for easy checks)
+  uint32_t f_khz = 0, bw_hz = 0; int sf = 0; int pre = 0; int tunes = 0; int16_t tune_err = 0;
+  int16_t setFrequency(float f, bool) { if (tune_err) return tune_err; f_khz = (uint32_t)(f * 1000.0f + 0.5f); tunes++; return 0; }
+  int16_t setBandwidth(float b) { bw_hz = (uint32_t)(b * 1000.0f + 0.5f); return 0; }
+  int16_t setSpreadingFactor(int s) { sf = s; return 0; }
+  int16_t setPreambleLength(size_t p) { pre = (int)p; return 0; }
 protected:
   uint32_t getPacketStatus() { return 0; }
   Module* getMod() { return m; }
