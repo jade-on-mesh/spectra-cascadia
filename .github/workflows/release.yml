@@ -9,10 +9,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
-concurrency: release
+concurrency:
+  group: release
+  cancel-in-progress: true      # a newer push replaces a stuck or older run
 jobs:
   check-and-release:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -24,8 +27,10 @@ jobs:
           path: ~/.spectra-deps
           key: spectra-deps-${{ hashFiles('tools/offline/setup.sh') }}
       - name: Pinned toolchain (same as the sync task and local builds)
+        timeout-minutes: 15
         run: tools/offline/setup.sh
       - name: Tests, builds, image checks
+        timeout-minutes: 25
         run: tools/ci.sh
       - name: Already released?
         id: ver

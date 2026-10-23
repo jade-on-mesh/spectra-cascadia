@@ -30,12 +30,12 @@ else
 fi
 
 echo "== host tests"
-TMPDIR="$(mktemp -d)" CRYPTO_DIR="$CRYPTO_DIR" MESHCORE_DIR="$MESHCORE_DIR" test/host/run.sh > "$OUT/tests.log" 2>&1 || fail "host tests" "$OUT/tests.log"
+TMPDIR="$(mktemp -d)" CRYPTO_DIR="$CRYPTO_DIR" MESHCORE_DIR="$MESHCORE_DIR" timeout 600 test/host/run.sh > "$OUT/tests.log" 2>&1 || fail "host tests (exit $?)" "$OUT/tests.log"
 if grep -q "^FAIL" "$OUT/tests.log"; then fail "host tests" "$OUT/tests.log"; fi
 echo "   $(grep -c '^PASS' "$OUT/tests.log") checks passed"
 
 echo "== builds"
-pio run -c "$CONF" $(printf -- '-e %s ' "${ENVS[@]}") > "$OUT/build.log" 2>&1 || fail "firmware builds" "$OUT/build.log"
+timeout 1200 pio run -c "$CONF" $(printf -- '-e %s ' "${ENVS[@]}") > "$OUT/build.log" 2>&1 || fail "firmware builds (exit $?)" "$OUT/build.log"
 grep -E "^(RAM|Flash):" "$OUT/build.log" | sed 's/^/   /'
 
 VER=$(sed -n 's/^#define FW_VERSION *"\(v[^"]*\)".*/\1/p' src/main.cpp)
