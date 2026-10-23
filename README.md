@@ -59,6 +59,7 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | Alerts to a channel (low battery, shutdown, restarts): `set alert.channel #name`, `set alerts on/off`, `alert test` | ✓ (v2.6) |
 | `flood.ratelimit`: cap floods per minute from one source | ✓ (v2.6) |
 | `tempradio` (try radio settings for N minutes, then revert), `cad on/off`, `rxdelay`, `radio.watchdog`, login attempt limits, `neighbors.detail` (RSSI, times heard) | ✓ (1.17.1.2) |
+| `set guest on/off`, `get guests`, `get logins` (recent login attempts); `repeat.battery` / `flood.battery` (pause forwarding on a low battery) | ✓ (1.18.0.2) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**
@@ -66,10 +67,30 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 ```
 password <admin password>        (max 15 characters; also works over the air)
 set guest.password <password>    (optional, read-only access)
+set guest on                     (guest logins are off until you turn them on)
 get guest.password
 ```
 
-An empty password never matches, and upstream's default `password` is **not** set.
+An empty admin password never matches, and upstream's default `password` is **not** set.
+With `guest on` and an empty guest password, anyone can log in as a guest (read-only).
+`set guest off` ends guest sessions at once; a guest that logged in earlier can't come
+back with a blank password. `get guests [page]` lists live guest sessions (one key per
+page) and `get logins [page]` the last 16 keys that tried to log in, newest first, with
+the result (`accepted`, `wrong-password`, `guests-disabled`, `replay/state`) and a count.
+Both are kept in RAM only.
+
+**Pause forwarding on a low battery** (needs `battery.pin`; without it the node can't see
+the battery and never pauses):
+
+```
+set flood.battery on             (stop relaying floods below 20 %; or give a percentage)
+set repeat.battery on            (stop relaying anything below 10 %; or give a percentage)
+get battery.forward              (battery=55% mv=3660 repeat=allowed flood=allowed)
+set battery.empty 3000           (mV for 0 %; battery.full for 100 %, default 4200)
+```
+
+Relaying resumes 2 points above the threshold. The node's own adverts, replies and alerts
+still go out, and `set repeat`, flood limits and `battery.cutoff` work as before.
 Remote `reboot` waits about 4 s so its reply can go out first.
 
 **Before flashing XL, run `tools/flash128_test` on that board** (each chip has to pass).

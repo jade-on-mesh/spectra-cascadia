@@ -327,22 +327,96 @@ static void xl_login_result(bool ok) {
     }
 }
 
+// Recent login attempts (Halo Keymind Cascade LoginHistory, 1.18.0.1): the 16 most
+// recently tried keys, newest first, recorded after the request decrypts. RAM only.
+#define LH_N 16
+enum { LH_ACCEPTED, LH_WRONG_PW, LH_GUESTS_OFF, LH_REPLAY };
+struct LoginRec { uint8_t pfx[8]; uint32_t ts, n; uint8_t res; };
+static LoginRec xl_lh[LH_N];
+static uint8_t xl_lh_count = 0;
+static void xl_lh_record(const uint8_t* pub, uint8_t res) {
+    int i = 0;
+    while (i < xl_lh_count && memcmp(xl_lh[i].pfx, pub, 8)) i++;
+    LoginRec r;
+    if (i < xl_lh_count) r = xl_lh[i];
+    else {                                           // new key: take a free row, or the oldest
+        if (xl_lh_count < LH_N) xl_lh_count++;
+        i = xl_lh_count - 1;
+        memcpy(r.pfx, pub, 8); r.n = 0;
+    }
+    memmove(&xl_lh[1], &xl_lh[0], i * sizeof(LoginRec));
+    if (r.n != 0xFFFFFFFFUL) r.n++;
+    r.ts = clock_now(); r.res = res;
+    xl_lh[0] = r;
+}
+
+static void xl_drop_guests(void) {                   // "set guest off": end guest sessions now
+    for (int i = 0; i < XL_MAX_CLIENTS; i++) if (xl_clients[i].perms == PERM_ACL_GUEST) xl_clients[i].perms = 0xFF;
+}
+
+static int xl_page_arg(const char* a) {              // "" → 1, " n" → n, anything else → 0
+    a = skip_ws(a);
+    if (!*a) return 1;
+    bool ok; int n = atoi_u(a, &ok);
+    return ok && n > 0 ? n : 0;
+}
+
+// "get guests [page]": live guest sessions, one full key per page (GuestCLI)
+static void xl_guests_get(const char* arg, char* reply) {
+    int page = xl_page_arg(arg);
+    if (!page) { strcpy(reply, "Err - usage: get guests [page]"); return; }
+    int total = 0; const XlClient* sel = NULL;
+    for (int i = 0; i < XL_MAX_CLIENTS; i++)
+        if (xl_clients[i].perms == PERM_ACL_GUEST && ++total == page) sel = &xl_clients[i];
+    if (!total && page == 1) { strcpy(reply, "Guests: empty"); return; }
+    if (!sel) { sprintf(reply, "Err - guest page range: 1-%d", total ? total : 1); return; }
+    char hx[65]; to_hex(hx, sel->pub, 32);
+    sprintf(reply, "Guests %d/%d (%d)\n%s last=%lu", page, total, total, hx,
+            (unsigned long)(clock_now() - (uptime_s() - sel->last_active_up)));
+}
+
+// "get logins [page]": recent attempts, two per page (LoginHistory)
+static void xl_logins_get(const char* arg, char* reply) {
+    static const char* const res[] = { "accepted", "wrong-password", "guests-disabled", "replay/state" };
+    int page = xl_page_arg(arg);
+    if (!page) { strcpy(reply, "Err - usage: get logins [page]"); return; }
+    int total = xl_lh_count, pages = total ? (total + 1) / 2 : 1;
+    if (!total && page == 1) { strcpy(reply, "Logins: empty"); return; }
+    if (page > pages) { sprintf(reply, "Err - login page range: 1-%d", pages); return; }
+    char* p = reply + sprintf(reply, "Logins %d/%d (%d)", page, pages, total);
+    for (int i = (page - 1) * 2; i < total && i < page * 2; i++) {
+        char hx[13]; to_hex(hx, xl_lh[i].pfx, 6);
+        p += sprintf(p, "\n%s n=%lu last=%lu %s", hx, (unsigned long)xl_lh[i].n, (unsigned long)xl_lh[i].ts, res[xl_lh[i].res]);
+    }
+}
+
 static int xl_login(XlClient** out, const uint8_t* sender_pub, const uint8_t* secret, uint32_t ts, const char* pw, bool flood) {
     XlClient* c = NULL;
-    if (!pw[0]) c = xl_find(sender_pub);             // blank password: already known?
-    if (!c) {
+    // Blank password: a known admin may reconnect. A cached guest must pass the
+    // current guest policy again (Halo Keymind Cascade 1.18.0.1).
+    if (!pw[0]) { c = xl_find(sender_pub); if (c && c->perms == PERM_ACL_GUEST) c = NULL; }
+    if (c) {
+        if (ts <= c->last_ts) { LOGLN("  login: replay"); xl_lh_record(sender_pub, LH_REPLAY); return 0; }
+        c->last_ts = ts;
+    } else {
         uint8_t perms;
         if (auth.admin_pw[0] && !strcmp(pw, auth.admin_pw)) perms = PERM_ACL_ADMIN;
-        else if (auth.guest_pw[0] && !strcmp(pw, auth.guest_pw)) perms = PERM_ACL_GUEST;
-        else { LOGLN("  login: bad password"); xl_login_result(false); return 0; }
+        else if (bp.guest_on && !strcmp(pw, auth.guest_pw)) perms = PERM_ACL_GUEST;
+        else {
+            LOGLN("  login: refused");
+            xl_lh_record(sender_pub, bp.guest_on ? LH_WRONG_PW : LH_GUESTS_OFF);
+            if (pw[0]) xl_login_result(false);       // a blank password isn't a guess
+            return 0;
+        }
         c = xl_put(sender_pub);
-        if (ts <= c->last_ts) { LOGLN("  login: replay"); return 0; }
+        if (ts <= c->last_ts) { LOGLN("  login: replay"); xl_lh_record(sender_pub, LH_REPLAY); return 0; }
         bool changed = c->perms != perms;
         c->last_ts = ts;
         c->perms = perms;
         memcpy(c->secret, secret, 32);
         if (changed && perms != PERM_ACL_GUEST) xl_acl_dirty();
     }
+    xl_lh_record(sender_pub, LH_ACCEPTED);
     c->last_active_up = uptime_s();
     xl_login_result(true);
     if (flood) c->out_len = OUT_PATH_UNKNOWN;        // rediscover the route

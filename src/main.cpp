@@ -40,7 +40,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.1"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.2"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -280,6 +280,22 @@ static ConfigMore more;
 static_assert(sizeof(ConfigMore) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t more_checksum(const ConfigMore& m) { return fnv_words(&m, offsetof(ConfigMore, check) / 4); }
+
+// XL: battery-gated forwarding and the guest login switch (Halo Keymind Cascade 1.18.0.1).
+#define POW_MAGIC 0x31425053UL   // "SPB1"
+struct ConfigPow {
+    uint32_t magic;
+    uint8_t  rep_on, rep_pct;                 // repeat.battery: pause all forwarding below rep_pct %
+    uint8_t  fl_on, fl_pct;                   // flood.battery: pause flood forwarding below fl_pct %
+    uint8_t  guest_on, pad[3];                // guest on/off
+    uint16_t empty_mv, full_mv;               // battery.empty / battery.full (0 % / 100 %)
+    uint32_t check;
+};
+static ConfigPow bp;
+#define POW_ADDR (MORE_ADDR + sizeof(ConfigMore))
+static_assert(sizeof(ConfigPow) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t pow_checksum(const ConfigPow& p) { return fnv_words(&p, offsetof(ConfigPow, check) / 4); }
 #endif
 
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
@@ -457,6 +473,10 @@ static void cfg_save(void) {
     w = (const uint32_t*)&more;
     for (unsigned i = 0; i < sizeof(ConfigMore) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, MORE_ADDR + i * 4, w[i]);
+    bp.check = pow_checksum(bp);
+    w = (const uint32_t*)&bp;
+    for (unsigned i = 0; i < sizeof(ConfigPow) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, POW_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
 #ifdef SPECTER_XL
@@ -973,6 +993,21 @@ struct RetrySlot {
 static RetrySlot rt[RT_SLOTS];
 static uint32_t stat_retry = 0, stat_echo = 0;
 
+// repeat.battery / flood.battery (Halo Keymind Cascade 1.18.0.1): below the set
+// battery percentage, stop forwarding (all, or floods only). Our own packets and
+// replies still go out. Re-evaluated every 30 s and when a setting changes.
+#ifdef SPECTER_XL
+static bool bf_rep_paused = false, bf_fl_paused = false;
+static uint32_t stat_bf_drop = 0;
+static bool fwd_paused(bool flood) {
+    bool p = bf_rep_paused || (flood && bf_fl_paused);
+    if (p) stat_bf_drop++;
+    return p;
+}
+#else
+static inline bool fwd_paused(bool) { return false; }
+#endif
+
 static uint32_t rt_wait(const RetrySlot& r) {
     uint32_t a = airtime_ms(r.len);
     if (r.direct) {
@@ -1034,6 +1069,7 @@ static void rt_service(void) {
         RetrySlot& r = rt[i];
         if (!r.used || !r.armed || (int32_t)(now - r.due) < 0) continue;
         if (!r.left) { r.used = false; continue; }    // final echo window expired
+        if (fwd_paused(!r.direct)) { r.used = false; continue; }   // battery pause: no more relay retries
         r.left--; r.attempt++; r.armed = false;
         int q = txq_push(r.buf, r.len, r.pri, 0);
         if (q < 0) { r.used = false; continue; }
@@ -1268,6 +1304,7 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         if (offset + (1 << path_sz) > tlen) return "trace bad";
         if (!is_own_hash(p.payload + 9 + offset, 1 << path_sz)) return "trace not ours";
         if (!cfg.repeat) return "repeat off";
+        if (fwd_paused(false)) return "battery";
         packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
         if (was_seen(h)) return "dedup";
         mark_seen(h);
@@ -1312,6 +1349,7 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         return "not next hop";
     }
     if (!cfg.repeat) return "repeat off";
+    if (fwd_paused(false)) return "battery";
 
     uint8_t new_path_len  = (p.path_len & 0xC0) | ((p.hash_count - 1) & 0x3F);
     const uint8_t* rest   = p.path + p.hash_size;
@@ -1494,6 +1532,7 @@ static const char* handle_ota_flood(const Pkt& p) {
     if (!tr_active) return "ota (no tempradio)";                  // invisible outside the window
     if (p.payload_len < 1) return "ota short";
     if (!cfg.repeat) return "repeat off";
+    if (fwd_paused(true)) return "battery";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
     if (!p.tc[0] && p.hash_count >= cfg.flood_max_unscoped) return "flood.max.unscoped";   // tc 0 = un-scoped
     if (p.tc[0]) {
@@ -1561,6 +1600,7 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
     }
 #endif
     if (!cfg.repeat) return "repeat off";
+    if (fwd_paused(true)) return "battery";
     if (p.hash_count >= cfg.flood_max) return "flood.max";
     // Transport code 0 counts as un-scoped (RegionMap::findMatch, isFloodHopLimitExceeded):
     // un-scoped hop limit and the wildcard's flood policy apply.
@@ -1809,12 +1849,36 @@ static void cutoff_shutdown(uint32_t mv) {
     enter_standby();
 }
 
+#ifdef SPECTER_XL
+// Battery percentage between battery.empty and battery.full; 0xFF = no usable reading
+// (no battery.pin set: the chip's own regulated supply says nothing about the battery).
+static uint8_t bf_pct = 0xFF;
+static uint8_t batt_pct(uint32_t mv) {
+    if (bp.full_mv <= bp.empty_mv || mv >= bp.full_mv) return 100;
+    if (mv <= bp.empty_mv) return 0;
+    return (uint8_t)((mv - bp.empty_mv) * 100UL / (bp.full_mv - bp.empty_mv));
+}
+// Pause below the threshold; resume 2 points above it (capped at 100) to avoid flapping.
+static bool bf_eval(bool was, uint8_t on, uint8_t below) {
+    if (!on || bf_pct == 0xFF) return false;
+    uint8_t resume = below + 2 > 100 ? 100 : below + 2;
+    return was ? bf_pct < resume : bf_pct < below;
+}
+static void bf_update(uint32_t mv) {
+    bf_pct = (ext.bat_pin && mv >= 2000 && mv <= 20000) ? batt_pct(mv) : 0xFF;
+    bool r = bf_eval(bf_rep_paused, bp.rep_on, bp.rep_pct), f = bf_eval(bf_fl_paused, bp.fl_on, bp.fl_pct);
+    if (r != bf_rep_paused || f != bf_fl_paused) LOGLN(r || f ? "battery: forwarding paused" : "battery: forwarding resumed");
+    bf_rep_paused = r; bf_fl_paused = f;
+}
+#endif
+
 // Every 30 s: three consecutive readings under battery.cutoff → standby.
 static void battery_monitor(uint32_t up) {
     if ((int32_t)(up - next_batt_s) < 0) return;
     next_batt_s = up + 30;
     last_batt_mv = battery_mv();
 #ifdef SPECTER_XL
+    bf_update(last_batt_mv);
     xl_alert_battery(last_batt_mv);
 #endif
     if (!ext.cut_mv || !last_batt_mv) { low_count = 0; return; }
@@ -2337,6 +2401,23 @@ static void handle_get(const char* k, char* reply) {
         for (const char* q = app.owner_info; *q; q++) *p++ = (*q == '\n') ? '|' : *q;
         *p = 0;
     }
+    else if (!strcmp(k, "repeat.battery") || !strcmp(k, "flood.battery")) {
+        bool r = k[0] == 'r';
+        sprintf(reply, "> %s below=%u%%", (r ? bp.rep_on : bp.fl_on) ? "on" : "off", r ? bp.rep_pct : bp.fl_pct);
+    }
+    else if (!strcmp(k, "battery.empty")) sprintf(reply, "> %u", bp.empty_mv);
+    else if (!strcmp(k, "battery.full"))  sprintf(reply, "> %u", bp.full_mv);
+    else if (!strcmp(k, "battery.forward")) {
+        last_batt_mv = battery_mv();
+        bf_update(last_batt_mv);
+        char pc[8] = "unknown";
+        if (bf_pct != 0xFF) sprintf(pc, "%u%%", bf_pct);
+        sprintf(reply, "> battery=%s mv=%lu repeat=%s flood=%s", pc, (unsigned long)last_batt_mv,
+                bf_rep_paused ? "blocked" : "allowed", bf_rep_paused || bf_fl_paused ? "blocked" : "allowed");
+    }
+    else if (!strcmp(k, "guest")) sprintf(reply, "> %s", bp.guest_on ? "on" : "off");
+    else if (!strncmp(k, "guests", 6) && (!k[6] || k[6] == ' ')) xl_guests_get(k + 6, reply);
+    else if (!strncmp(k, "logins", 6) && (!k[6] || k[6] == ' ')) xl_logins_get(k + 6, reply);
 #endif
     else if (!strcmp(k, "reset.reason")) sprintf(reply, "> %s (watchdog resets since power-on: %u)", reset_why, wdt_resets);
     else if (!strcmp(k, "public.key")) { strcpy(reply, "> "); to_hex(reply + 2, own_pubkey, 32); }
@@ -2506,11 +2587,39 @@ static void handle_set(const char* cmd, char* reply) {
         char* d = app.owner_info;
         for (; *v && d - app.owner_info < (int)sizeof(app.owner_info) - 1; v++) *d++ = (*v == '|') ? '\n' : *v;
         *d = 0;
+    } else if (!strcmp(k, "repeat.battery") || !strcmp(k, "flood.battery")) {
+        bool r = k[0] == 'r';
+        uint8_t& on = r ? bp.rep_on : bp.fl_on;
+        if (!strcmp(v, "off")) on = 0;
+        else if (!strcmp(v, "on")) on = 1;
+        else if (ok && iv >= 1 && iv <= 100) { on = 1; (r ? bp.rep_pct : bp.fl_pct) = iv; }
+        else { sprintf(reply, "Error: use set %s off|on|1-100", k); return; }
+        cfg_save();
+        bf_update(battery_mv());
+        strcpy(reply, "OK - saved");
+        return;
+    } else if (!strcmp(k, "battery.empty") || !strcmp(k, "battery.full")) {
+        if (!ok || iv < 2000 || iv > 20000) { sprintf(reply, "Error: use set %s 2000-20000 (mV)", k); return; }
+        uint16_t e = k[8] == 'e' ? iv : bp.empty_mv, f = k[8] == 'f' ? iv : bp.full_mv;
+        if (f < e + 100) { strcpy(reply, "Error: battery.full must exceed battery.empty by at least 100 mV"); return; }
+        bp.empty_mv = e; bp.full_mv = f;
+        cfg_save();
+        bf_update(battery_mv());
+        strcpy(reply, "OK - saved");
+        return;
+    } else if (!strcmp(k, "guest")) {
+        if (strcmp(v, "on") && strcmp(v, "off")) { strcpy(reply, "Err - use get guest or set guest on|off"); return; }
+        bp.guest_on = v[1] == 'n';
+        if (!bp.guest_on) xl_drop_guests();
+        cfg_save();
+        sprintf(reply, "OK - guest %s", bp.guest_on ? "on" : "off");
+        return;
 #endif
     } else if (!strcmp(k, "password") || !strcmp(k, "guest.password")) {
 #ifdef SPECTER_XL
         if (strlen(v) > 15) { strcpy(reply, "Error, max 15 characters"); return; }
         strcpy(k[0] == 'p' ? auth.admin_pw : auth.guest_pw, v);
+        if (k[0] == 'g' && !bp.guest_on) done = "OK - guest logins are off (set guest on)";
 #else
         strcpy(reply, "Error: remote admin needs the XL (128 KB) build"); return;
 #endif
@@ -2823,10 +2932,22 @@ void setup(void) {
         more.alerts = 1;                              // on, but nothing is sent until a channel is set
     }
     more.label[sizeof(more.label) - 1] = 0;
+    memcpy(&bp, (const void*)POW_ADDR, sizeof(bp));
+    if (bp.magic != POW_MAGIC || bp.check != pow_checksum(bp)) {
+        memset(&bp, 0, sizeof(bp));
+        bp.magic = POW_MAGIC;
+        bp.rep_pct = 10; bp.fl_pct = 20;              // thresholds used by "on" (both off)
+        bp.empty_mv = 3000; bp.full_mv = 4200;
+        bp.guest_on = auth.guest_pw[0] != 0;          // upgrade: a guest password already set keeps guests working
+    }
     xl_init();
 #endif
     regions_rekey();
     if (ext.bat_pin) pinMode(ext.bat_pin == 1 ? PB0 : PB1, INPUT_ANALOG);
+#ifdef SPECTER_XL
+    bf_rep_paused = bf_fl_paused = false;
+    bf_update(battery_mv());
+#endif
 
     bool woke = bkp_read() == CUTOFF_FLAG;          // woke from low-battery standby?
     reset_reason_capture(woke);

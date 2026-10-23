@@ -7,6 +7,44 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.18.0.2] - 2026-10-22
+
+Rolls in mikecarper Halo Keymind Cascade 1.18.0.1 changes from after the last sync (up to [e34e83e6](https://github.com/mikecarper/MeshCore/commit/e34e83e6b), 2026-10-22). XL only; the standard build is unchanged.
+Not yet tested on hardware.
+
+### Added (XL)
+- `set repeat.battery off|on|1-100` and `set flood.battery off|on|1-100`: stop relaying (everything, or floods only) when the battery drops below a percentage. `on` uses 10 % and 20 %; a number sets the threshold and turns it on. Relaying resumes 2 points above the threshold. Own adverts, replies and alerts still go out; pending relay retries are dropped while paused. Needs `battery.pin`: without it there is no battery reading and nothing is paused. Both off by default
+- `get battery.forward` (`> battery=55% mv=3660 repeat=allowed flood=allowed`), and `set battery.empty` / `battery.full` (mV for 0 % / 100 %, default 3000 / 4200)
+- `get guest` / `set guest on|off`: guest logins have a switch. `off` ends guest sessions at once. With `on` and an empty guest password, guests need no password (as Halo Keymind Cascade)
+- `get guests [page]`: live guest sessions, one full key and last activity per page
+- `get logins [page]`: the 16 keys that most recently tried to log in, newest first: 12-hex key prefix, attempt count, time and result (`accepted`, `wrong-password`, `guests-disabled`, `replay/state`). RAM only
+
+### Changed (XL)
+- Guest logins default to **off** on new installs. Nodes upgrading with a guest password already set keep guests on; nodes without one stay as they were (no guest access)
+- `set guest.password` while guests are off replies `OK - guest logins are off (set guest on)`
+- A cached guest can no longer log back in with a blank password; it must pass the current guest policy. Admins still can. A blank password doesn't count toward the login lockout
+- A blank-password admin reconnect now gets the same replay (timestamp) check as a password login
+
+### Upstream sync
+Ported:
+- [af106a0e](https://github.com/mikecarper/MeshCore/commit/af106a0ee) battery thresholds for repeat and flood forwarding (same commands, defaults, 2-point recovery and reply text; percentage from our battery.pin reading)
+- [c433b40e](https://github.com/mikecarper/MeshCore/commit/c433b40e5) guest login switch and `get guests`
+- [f68d4ca5](https://github.com/mikecarper/MeshCore/commit/f68d4ca54) `get logins` (we keep 8-byte key prefixes, not full keys, to save RAM; the display is the same)
+
+Already have / not applicable:
+- [862260de](https://github.com/mikecarper/MeshCore/commit/862260de1) AGC interval range: we follow official 1.18 (clamp to 1020 s)
+- [e980d983](https://github.com/mikecarper/MeshCore/commit/e980d983b), [4dc3b43f](https://github.com/mikecarper/MeshCore/commit/4dc3b43f1) flood retry bucket CLI checks: we have no `flood.retry.bucket`
+- [e4119a12](https://github.com/mikecarper/MeshCore/commit/e4119a120), [41564bf6](https://github.com/mikecarper/MeshCore/commit/41564bf6b) SX126x driver fixes: his RadioLib wrappers, not used here
+- [21ab0b9d](https://github.com/mikecarper/MeshCore/commit/21ab0b9d4), [ca67494f](https://github.com/mikecarper/MeshCore/commit/ca67494f8) and other radio-profile work: needs a second radio profile
+
+Declined:
+- [f4ade738](https://github.com/mikecarper/MeshCore/commit/f4ade738d) noise-floor history: part of his telemetry history/upload system, which he also leaves out of STM32 repeaters
+- [ab6412e7](https://github.com/mikecarper/MeshCore/commit/ab6412e73) battery ADC calibration: `battery.divider` already does this here
+- [953ad6de](https://github.com/mikecarper/MeshCore/commit/953ad6def) flood filters / moderation rules engine: large, and we don't have the base feature
+- Solar/MPPT, regulator modes, LED controls, ESP-NOW/UDP/RS232 bridges, Wi-Fi, BLE, MQTT, displays, new boards: other hardware
+
+Size: standard build unchanged (63,260-byte image); XL +4.0 KB flash (≈3.5 KB left in the lower 62 KB), +356 bytes RAM.
+
 ## [1.18.0.1] - 2026-10-16
 
 Covers official MeshCore `repeater-v1.18.0` and mikecarper Halo Keymind Cascade `v1.18.0.1` (preview1, incl. `v1.17.1.10`).

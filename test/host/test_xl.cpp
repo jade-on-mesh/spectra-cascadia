@@ -163,7 +163,11 @@ int main() {
     CHECK(queued() == 0, "no password configured: upstream's default 'password' refused");
 
     CHECK(cli("password hunter2") == "password now: hunter2", "password <x> over USB");
-    CHECK(cli("set guest.password visitor") == "OK" && cli("get guest.password") == "> visitor", "guest.password set/get");
+    CHECK(cli("get guest") == "> off", "fresh install: guest logins off (1.18.0.1)");
+    CHECK(cli("set guest.password visitor") == "OK - guest logins are off (set guest on)" && cli("get guest.password") == "> visitor",
+          "guest.password set/get, with a hint while guests are off");
+    CHECK(cli("set guest maybe") == "Err - use get guest or set guest on|off", "set guest: on or off only");
+    CHECK(cli("set guest on") == "OK - guest on" && cli("get guest") == "> on", "set guest on");
     CHECK(cli("password 0123456789abcdefg").find("max 15") != std::string::npos, "password length limit");
 
     // persists across reboot
@@ -304,7 +308,37 @@ int main() {
       req(a, ts_now++, b, sizeof(b), PT_REQ);
       uint8_t d2[200]; int n2 = open_reply(last_q(), a, p, d2);
       CHECK(n2 >= 4 + 14 && !memcmp(d2 + 4, a.pub, 6) && d2[10] == 3 && !memcmp(d2 + 11, g.pub, 6) && d2[17] == 0,
-            "admin: access list shows admin + guest"); }
+            "admin: access list shows admin + guest");
+      // 1.18.0.1: guest sessions, login history, guest switch
+      char ghx[65]; to_hex(ghx, g.pub, 32);
+      std::string gl = rcli(a, "get guests", 1);
+      CHECK(gl.find("Guests 1/1 (1)\n") == 0 && gl.find(ghx) != std::string::npos && gl.find(" last=") != std::string::npos,
+            "get guests: one full key per page, last activity");
+      CHECK(rcli(a, "get guests 2", 1) == "Err - guest page range: 1-1" && rcli(a, "get guests x", 1) == "Err - usage: get guests [page]",
+            "get guests: page checks");
+      std::string ll = rcli(a, "get logins", 1);
+      char gp[13]; memcpy(gp, ghx, 12); gp[12] = 0;
+      CHECK(ll.find("Logins 1/") == 0 && ll.find(std::string("\n") + gp + " n=1 last=") != std::string::npos
+            && ll.find(" accepted") != std::string::npos, "get logins: newest first, 12-hex key prefix, count, result");
+      login(g, "", ts_now++, false);
+      CHECK(queued() == 0, "a cached guest can't come back with a blank password (guest password set)");
+      CHECK(xl_bad == 0, "a blank password doesn't count toward the lockout");
+      login(g, "wrong", ts_now++, false);
+      CHECK(queued() == 0 && rcli(a, "get logins", 1).find(std::string("\n") + gp + " n=3 last=") != std::string::npos
+            && rcli(a, "get logins", 1).find("wrong-password") != std::string::npos, "wrong guest password recorded, same row counted up");
+      login(g, "visitor", ts_now++, false);
+      CHECK(queued() == 1, "guest logs in again with the password"); clearq();
+      CHECK(rcli(a, "set guest off", 1) == "OK - guest off" && !xl_find(g.pub), "set guest off ends guest sessions");
+      login(g, "visitor", ts_now++, false);
+      CHECK(queued() == 0 && rcli(a, "get logins", 1).find("guests-disabled") != std::string::npos, "guests off: guest password refused, recorded");
+      CHECK(rcli(a, "get guests", 1) == "Guests: empty", "no guests listed");
+      CHECK(rcli(a, "set guest on", 1) == "OK - guest on", "guest on again (remote)");
+      login(g, "visitor", ts_now++, false); clearq();
+      cli("set guest.password "); cli("set guest off"); login(g, "", ts_now++, false);
+      CHECK(queued() == 0, "guest off + blank guest password: still refused");
+      cli("set guest on"); login(g, "", ts_now++, false);
+      CHECK(queued() == 1, "guest on + blank guest password: open guest access (as Halo Keymind Cascade)");
+      clearq(); cli("set guest.password visitor"); }
 
     // ── anonymous clock query (BASIC), answered along the supplied reply path
     { Client s; mk_client(s, 22);
@@ -564,6 +598,49 @@ int main() {
       CHECK(ok == 5, "ACKs are never rate limited");
       cli("set flood.ratelimit off"); clearq(); }
 
+    // ── 1.18.0.1: repeat.battery / flood.battery
+    { uint8_t seq = 0;
+      auto flood = [&]() { uint8_t pk[40]; int n = 0; pk[n++] = (PT_GRP_TXT << 2) | ROUTE_FLOOD; pk[n++] = 1; pk[n++] = 0x45;
+          pk[n++] = 0x34; seq++; for (int i = 0; i < 18; i++) pk[n++] = (uint8_t)(seq * 11 + i);
+          clearq(); on_receive(pk, n, 0); return queued(); };
+      auto direct = [&]() { seq++; uint8_t pk[] = { (PT_ACK<<2)|ROUTE_DIRECT, 0x02, own_pubkey[0], 0x66, seq, 0x5A, 0x5B, 0x5C };
+          clearq(); on_receive(pk, sizeof(pk), 0); return queued() > 0 ? 1 : 0; };
+      auto batt = [&](uint32_t mv) { set_pin_mv(8, mv / 2, 3300); fake_ms += 31000; loop(); };
+      CHECK(cli("get repeat.battery") == "> off below=10%" && cli("get flood.battery") == "> off below=20%"
+            && cli("get battery.empty") == "> 3000" && cli("get battery.full") == "> 4200", "battery forwarding defaults: off, 10% / 20%, 3000-4200 mV");
+      cli("set battery.pin off");
+      CHECK(cli("set flood.battery 40") == "OK - saved" && cli("get flood.battery") == "> on below=40%", "set flood.battery <pct> turns it on");
+      CHECK(cli("get battery.forward").find("> battery=unknown mv=") == 0 && flood() == 1,
+            "no battery.pin: no battery reading, nothing paused");
+      cli("set battery.pin pb0"); cli("set battery.divider 2.00");
+      batt(3400);                                                     // 33 %
+      CHECK(cli("get battery.forward").find("> battery=33% mv=3") == 0
+            && cli("get battery.forward").find("repeat=allowed flood=blocked") != std::string::npos, "battery.forward status");
+      CHECK(flood() == 0 && direct() == 1, "below flood.battery: floods paused, direct still relayed");
+      CHECK(cli("set repeat.battery 35") == "OK - saved" && direct() == 0, "below repeat.battery: direct paused too (applies at once)");
+      { Client s; mk_client(s, 23); uint32_t ts = ts_now++; uint8_t data[16]; memcpy(data, &ts, 4); data[4] = ANON_REQ_TYPE_BASIC; data[5] = 0;
+        uint8_t pl[120]; pl[0] = own_pubkey[0]; memcpy(pl + 1, s.pub, 32); int pn = 33 + c_enc(s.ss, pl + 33, data, 6);
+        uint8_t pk[200]; int n = mk_pkt(pk, (PT_ANON_REQ << 2) | ROUTE_DIRECT, NULL, 0, pl, pn);
+        xl_lg_n = 0; xl_lock_until = 0; clearq(); on_receive(pk, n, 20);
+        CHECK(queued() == 1, "own replies still go out while paused"); }
+      batt(3420);                                                     // 35 %: not yet 2 points above
+      CHECK(direct() == 0, "no resume until 2 points above the threshold");
+      batt(3450);                                                     // 37 %
+      CHECK(direct() == 1 && flood() == 0, "37%: repeat resumes, floods stay paused until 42%");
+      batt(3510);                                                     // 42 %
+      CHECK(flood() == 1, "42%: floods resume");
+      CHECK(cli("set battery.full 3050") == "Error: battery.full must exceed battery.empty by at least 100 mV"
+            && cli("set battery.empty 1999") == "Error: use set battery.empty 2000-20000 (mV)"
+            && cli("set flood.battery 0") == "Error: use set flood.battery off|on|1-100", "range checks");
+      CHECK(cli("set battery.full 3500") == "OK - saved" && cli("get battery.forward").find("battery=100%") != std::string::npos,
+            "battery.full changes the percentage");
+      cli("set repeat.battery off"); cli("set flood.battery off");
+      setup();
+      CHECK(cli("get flood.battery") == "> off below=40%" && cli("get repeat.battery") == "> off below=35%" && cli("get battery.full") == "> 3500",
+            "settings survive reboot; off keeps the threshold for the next 'on'");
+      cli("set battery.full 4200"); cli("set battery.pin off");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
+
 
     // ── 1.17.1.2: CAD before transmitting
     { CHECK(cli("get cad") == "> off (busy 0)" && cli("set cad on") == "OK", "cad on");
@@ -631,6 +708,7 @@ int main() {
 
     // ── 1.17.1.2: neighbour RSSI and times heard
     { memset(xl_nb, 0, sizeof(xl_nb));
+      while (uptime_s() & 1) fake_ms += 1000;                     // heard_up is stored as uptime | 1
       uint8_t k1[32]; memset(k1, 0x2A, 32);
       last_rssi = -97; xl_note_neighbour(k1, 12); fake_ms += 5000; last_rssi = -95; xl_note_neighbour(k1, 14); fake_ms += 5000;
       CHECK(cli("neighbors.detail") == "p1/1\n2A2A2A2A:5:14:-95:2", "neighbors.detail: key:secs:snr:rssi:times heard");
