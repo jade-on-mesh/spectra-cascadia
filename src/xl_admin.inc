@@ -502,6 +502,7 @@ static int xl_anon_query(uint8_t type, uint32_t ts, const uint8_t* data) {
     if (type == ANON_REQ_TYPE_BASIC) { xl_reply[8] = cfg.repeat ? 0 : 0x80; return 9; }
     if (type == ANON_REQ_TYPE_OWNER) return 8 + sprintf(t, "%s\n%s", cfg.name, app.owner_info);
     if (type == ANON_REQ_TYPE_REGIONS) {
+        if (bp.disc_off & DISC_REGION_OFF) return 0;   // discovery.region.responses off: no reply
         region_list(t, 1, false);
         if (!strcmp(t, "-none-")) *t = 0;
         return 8 + strlen(t);
@@ -618,7 +619,9 @@ XL_HI static bool xl_handle_for_us(const Pkt& p, int8_t snr4, int scope) {
             if (t == ts) t++;
             memcpy(temp, &t, 4);
             temp[4] = TXT_TYPE_CLI_DATA << 2;
+            q_mode = Q_REPLY;                          // tx.reply applies to admin CLI replies only
             xl_send_datagram(c, PT_TXT_MSG, temp, 5 + tl, p.hash_size, scope, CLI_REPLY_DELAY);
+            q_mode = Q_FWD;
         }
         return true;
     }

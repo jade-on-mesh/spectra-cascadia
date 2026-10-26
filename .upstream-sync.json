@@ -7,8 +7,8 @@
   "keymind": {
     "repo": "mikecarper/MeshCore",
     "branch": "keymindCascade",
-    "last_version": "v1.18.0.1",
-    "last_commit": "e34e83e6b"
+    "last_version": "v1.18.0.2",
+    "last_commit": "a87b2a33a"
   },
   "ported": [
     "keymind: echo-cancelled flood/direct retries, CR ladder, presets (v2.2)",
@@ -19,13 +19,15 @@
     "keymind 1.18.0.1: drop payload version > 1 (direct LoRa OTA frames not relayed) (1.18.0.1)",
     "keymind 1.18.0.1: repeat.battery/flood.battery, battery.empty/full, battery.forward; guest on/off, get guests, get logins (1.18.0.2)",
     "official 1.18.0: preambleLengthForSF (32 symbols at SF<=8) (1.18.0.3)",
-    "keymind 1.18.0.1: radio2 (rx/rxtx, mediamesh presets), radio2.cross, tx.reply, scan timing/auto preambles, switch self-test, discovery trailer, spacing warning, radio2.status/scan/timing (1.18.0.3)"
+    "keymind 1.18.0.1: radio2 (rx/rxtx, mediamesh presets), radio2.cross, tx.reply, scan timing/auto preambles, switch self-test, discovery trailer, spacing warning, radio2.status/scan/timing (1.18.0.3)",
+    "keymind 1.18.0.2: tx.reply limited to admin CLI replies; discovery.node.responses / discovery.region.responses (1.18.0.4)"
   ],
   "declined": [
     "keymind: LoRa OTA install (needs bootloader; ~10 KB patch limit on STM32F103 \u2014 paused, see Cheapeater OTA design)",
     "official 1.18.0: loop.detect default minimal (ours moderate), SUBSCRIBE/region load-save (sensor), LR11xx/LR2021, FEM, gps diag",
     "keymind 1.18.0.1: negotiated direct LoRa OTA transport, Ethernet/WiFi/BLE/MQTT/Meshtext",
     "keymind 1.18.0.1: noise-floor telemetry history, battery ADC calibration (battery.divider), flood filter/moderation engine, solar/MPPT, regulator, LED, bridges",
-    "keymind 1.18.0.1: tempradio2, radioat2/tempradioat2 schedules, Meshtext, Ethernet over LoRa, Companion tx.user/tx.channel/tx.media routing"
+    "keymind 1.18.0.1: tempradio2, radioat2/tempradioat2 schedules, Meshtext, Ethernet over LoRa, Companion tx.user/tx.channel/tx.media routing",
+    "keymind 1.18.0.2: set radio/freq live apply after 2 s (official keeps reboot-to-apply), RXPS / PowerSaving (no DIO1), busy-radio deferred apply, telemetry type controls/spacing, LR11xx/LR2021/W12, nRF52/ESP32 SPI, bootloader migration"
   ]
 }

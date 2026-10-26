@@ -61,6 +61,7 @@ room in the lower 62 KB for the server side of upstream `simple_repeater`:
 | `tempradio` (try radio settings for N minutes, then revert), `cad on/off`, `rxdelay`, `radio.watchdog`, login attempt limits, `neighbors.detail` (RSSI, times heard) | ✓ (1.17.1.2) |
 | `set guest on/off`, `get guests`, `get logins` (recent login attempts); `repeat.battery` / `flood.battery` (pause forwarding on a low battery) | ✓ (1.18.0.2) |
 | `radio2`: a second LoRa profile (e.g. MediaMesh) on the same radio, `radio2.cross`, `tx.reply` | ✓ (1.18.0.3) |
+| `discovery.node.responses` / `discovery.region.responses` on/off (stop answering discovery or region queries) | ✓ (1.18.0.4) |
 | `get/set prv.key`, `erase`, `log` over the air | refused: USB only |
 
 **Login is off until you set a password over USB:**
@@ -109,10 +110,11 @@ set radio2 off
 ```
 
 Packets are relayed on the profile they arrived on. `set radio2.cross on` copies them to the
-other profile as well (default `off` keeps the two networks apart). Replies to logins, requests
-and discovery go out on both profiles by default; `set tx.reply radio|radio2|auto|off` changes
-that (`both force` / `radio2 force` lets replies use an `rx`-only radio2). The node's own adverts
-stay on `radio` unless crossing is on.
+other profile as well (default `off` keeps the two networks apart). CLI replies to a logged-in
+admin go out on both profiles by default; `set tx.reply radio|radio2|auto|off` changes that
+(`both force` / `radio2 force` lets them use an `rx`-only radio2). Other replies (logins, ACKs,
+status, discovery) follow the same rules as relayed packets, as in Halo Keymind Cascade 1.18.0.2.
+The node's own adverts stay on `radio` unless crossing is on.
 
 **It is one radio taking turns, not two.** It listens about 9 ms on the slower profile and
 about 19 ms on the faster one, and can't hear either while it is receiving or sending on the

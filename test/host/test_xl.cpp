@@ -488,6 +488,31 @@ int main() {
       CHECK(queued() == 0, "adverts off (hidden node): discover not answered (1.18)"); clearq();
       cfg.flood_advert_h = sf; rq[4] ^= 2; on_receive(rq, 12, 22);
       CHECK(queued() == 1, "flood adverts on: discover answered again"); clearq();
+      // 1.18.0.4: discovery.node.responses / discovery.region.responses (Halo Keymind Cascade 1.18.0.2)
+      fake_ms += 121000;
+      CHECK(cli("get discovery.node.responses") == "> on" && cli("get discovery.region.responses") == "> on",
+            "discovery responses: both on by default");
+      CHECK(cli("set discovery.node.responses maybe") == "Err - use get discovery.node.responses or set discovery.node.responses on|off",
+            "discovery.node.responses: on or off only (upstream text)");
+      CHECK(cli("set discovery.node.responses off") == "OK - discovery.node.responses off"
+            && cli("get discovery.node.responses") == "> off" && bp.disc_off == 1, "set discovery.node.responses off");
+      rq[4] ^= 4; on_receive(rq, 12, 22);
+      CHECK(queued() == 0, "node responses off: discover not answered"); clearq();
+      auto regions_q = [&]() { Client s; mk_client(s, 24);
+          uint32_t ts = ts_now++; uint8_t data[16]; memcpy(data, &ts, 4); data[4] = ANON_REQ_TYPE_REGIONS; data[5] = 0;
+          uint8_t pl[120]; pl[0] = own_pubkey[0]; memcpy(pl + 1, s.pub, 32);
+          int pn = 33 + c_enc(s.ss, pl + 33, data, 6);
+          uint8_t pk2[200]; int n = mk_pkt(pk2, (PT_ANON_REQ << 2) | ROUTE_DIRECT, NULL, 0, pl, pn);
+          clearq(); on_receive(pk2, n, 20); int q = queued(); clearq(); return q; };
+      CHECK(regions_q() == 1, "node responses off: region query still answered (independent)");
+      CHECK(cli("set discovery.region.responses off") == "OK - discovery.region.responses off" && bp.disc_off == 3,
+            "set discovery.region.responses off");
+      CHECK(regions_q() == 0, "region responses off: anonymous region query not answered");
+      cli("set discovery.node.responses on");
+      rq[4] ^= 8; on_receive(rq, 12, 22);
+      CHECK(queued() == 1 && bp.disc_off == 2, "node responses on again: discover answered"); clearq();
+      CHECK(cli("set discovery.region.responses on") == "OK - discovery.region.responses on" && regions_q() == 1 && bp.disc_off == 0,
+            "region responses on again");
       cfg.advert_interval_min = sa; }
 
     // ── 1.18: MACThenDecrypt rejects ciphertext that isn't whole AES blocks
@@ -816,17 +841,24 @@ int main() {
       // replies: tx.reply
       auto login_on = [&](uint8_t prof) { rx_prof = prof; login(a, "swordfish", ts_now++, false); rx_prof = 0;
           int m = 0; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) m |= 1 << txq[i].prof; clearq(); return m; };
-      CHECK(login_on(1) == 3 && login_on(0) == 3, "tx.reply both: a reply goes out on both profiles");
-      cli("set tx.reply radio");  CHECK(login_on(1) == 1, "tx.reply radio: radio only");
-      cli("set tx.reply radio2"); CHECK(login_on(0) == 2, "tx.reply radio2: radio2 only");
-      cli("set tx.reply auto");   CHECK(login_on(1) == 2 && login_on(0) == 1, "tx.reply auto: the profile the request came in on");
+      auto cli_on = [&](uint8_t prof) { rx_prof = prof; rcli(a, "get name", 1); rx_prof = 0;
+          int m = 0; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) m |= 1 << txq[i].prof; clearq(); return m; };
+      // 1.18.0.4: tx.reply covers admin CLI replies only (Halo Keymind Cascade 1.18.0.2)
+      CHECK(cli_on(1) == 3 && cli_on(0) == 3, "tx.reply both: an admin CLI reply goes out on both profiles");
+      CHECK(login_on(1) == 2 && login_on(0) == 1, "login replies follow crossing (cross off: the arrival profile), not tx.reply");
+      cli("set tx.reply radio");  CHECK(cli_on(1) == 1, "tx.reply radio: radio only");
+      cli("set tx.reply radio2"); CHECK(cli_on(0) == 2, "tx.reply radio2: radio2 only");
+      cli("set tx.reply auto");   CHECK(cli_on(1) == 2 && cli_on(0) == 1, "tx.reply auto: the profile the request came in on");
+      cli("set tx.reply off");    CHECK(cli_on(0) == 0 && login_on(0) == 1, "tx.reply off: admin CLI replies suppressed, login replies not");
       cli("set tx.reply both");
       // rx-only radio2
       cli("set radio2 911.15,250,7,5,rx"); fake_ms += 2100; loop();
       CHECK(cli("get radio2") == "> 911.15,250,7,5,rx", "radio2 rx-only");
       CHECK(flood_on(1) == 0, "rx-only, cross off: nothing relayed from radio2");
-      CHECK(login_on(1) == 1 && cli("get tx.reply") == "> both (radio2 can't transmit)", "rx-only: replies on radio only");
-      cli("set tx.reply both force"); CHECK(login_on(1) == 3 && cli("get tx.reply") == "> both force", "tx.reply both force: replies on rx-only radio2 too");
+      CHECK(cli_on(1) == 1 && cli("get tx.reply") == "> both (radio2 can't transmit)", "rx-only: admin CLI replies on radio only");
+      CHECK(login_on(1) == 0, "rx-only, cross off: a login reply from radio2 has nowhere to go (as forwarding)");
+      cli("set tx.reply both force"); CHECK(cli_on(1) == 3 && cli("get tx.reply") == "> both force", "tx.reply both force: admin CLI replies on rx-only radio2 too");
+      CHECK(login_on(1) == 0, "force does not apply to login replies");
       cli("set tx.reply both"); cli("set radio2.cross on");
       CHECK(flood_on(1) == 1, "rx-only + cross on: radio2 traffic relayed on radio");
       cli("set radio2.cross off");

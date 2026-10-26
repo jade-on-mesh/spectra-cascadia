@@ -7,6 +7,39 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.18.0.4] - 2026-10-26
+
+Rolls in the repeater-relevant changes from Halo Keymind Cascade **1.18.0.2** (preview `w12-v1.18.0.2-alpha1`). XL only; the standard build is unchanged apart from the version.
+**Auto-ported by the upstream-sync task and not yet tested on hardware.**
+
+### Changed (XL)
+- `tx.reply` now applies only to CLI replies to a logged-in admin (including `tx.reply off` and `force`). Login replies, ACKs, status/telemetry responses, region/owner/clock queries and discovery answers follow the same profile rules as relayed packets (`radio2.cross`)
+
+### Added (XL)
+- `get/set discovery.node.responses on|off` and `get/set discovery.region.responses on|off` (both default on, saved): stop answering zero-hop node discovery, or anonymous region queries. Our own adverts and `discover.neighbors` are unaffected; the hidden-node rule still applies
+
+### Upstream sync
+Range reviewed: mikecarper/MeshCore `keymindCascade` e34e83e6b → a87b2a33 (Halo Keymind Cascade 1.18.0.1 → 1.18.0.2 alpha 1). No new official MeshCore release (still `repeater-v1.18.0`).
+
+Ported:
+- [Restrict dual-profile reply overrides to admin CLI responses](https://github.com/mikecarper/MeshCore/commit/c98684021ae05570517d86fa5a810afaf6c5685c)
+- [Saved node and region discovery response switches](https://github.com/mikecarper/MeshCore/commit/4fd3358a45df7e55ea9a0899cd1fc0698ec4cd12) (exact CLI names and reply text)
+
+Already have:
+- [Direct-route echo retries for telemetry snapshots](https://github.com/mikecarper/MeshCore/commit/ea4b53ceee217f8eff4573571909c5c32454b995): our direct retries already cover every payload type, RAW_CUSTOM included
+- [Retire stale channel-busy waits](https://github.com/mikecarper/MeshCore/commit/adb11e7b41f2d3c561bc6aba4ebf6c92a45623bd): our listen-before-talk wait is tracked per queued packet, so a dropped packet can't leave a stale wait behind
+- [Apply saved TX power automatically](https://github.com/mikecarper/MeshCore/commit/65928aae9518e8722fcb012e079ead8b5833ea9e): `set tx` already applies at once
+- [Warn admins on login while the default password is unchanged](https://github.com/mikecarper/MeshCore/commit/98c28580873fd5977d8d0721a1a4844e5a4b15f3): there is no default password here; remote login stays off until one is set over USB
+
+Declined:
+- [Apply `set radio` / `set freq` after a two-second handoff without reboot](https://github.com/mikecarper/MeshCore/commit/4f76345b676bc8cfd80ebecf4a075829c9ba6f84): official 1.18.0 keeps "reboot to apply"; we follow official until it changes
+- [RX power saving (RXPS)](https://github.com/mikecarper/MeshCore/commit/2195d20b31141e92b8b28ec5d3c2672d447678ea) and [repeater PowerSaving](https://github.com/mikecarper/MeshCore/commit/60e9e41028c50cc13aebe9668536c1eb658a37ec): duty-cycled receive needs DIO1 wake-up, which the DX-LR30 doesn't expose (we poll), and risks missed packets; we have our own power saving
+- [Busy-radio deferred apply / service restarts](https://github.com/mikecarper/MeshCore/commit/73c5f572eb4dfeeabd4926de6d1fefa5dc260d57): Companion, Wi-Fi, MQTT, BLE
+- [Telemetry packet type controls](https://github.com/mikecarper/MeshCore/commit/bbe29fbf95e4e46cdf6946b65358c76830fd9a6a) and batch spacing: part of the telemetry history feature we don't carry
+- LR1110/LR2021/W12 RF switching, nRF52/ESP32 SPI and IRQ work, bootloader migration, OTA direct transport changes, displays, Companion, docs and release tooling: out of scope
+
+Size: standard 63,316-byte image (unchanged); XL static RAM 14,148 bytes.
+
 ## [1.18.0.3] - 2026-10-23
 
 Adds Halo Keymind Cascade's **radio2** (a second LoRa profile, time-shared on the one SX1262), aimed at relaying MediaMesh next to the normal network. XL only.

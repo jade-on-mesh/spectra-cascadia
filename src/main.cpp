@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 1.18.0.1 (official MeshCore 1.18.0 + Spectra-Cascadia release 1)
+ * Version: 1.18.0.4 (official MeshCore 1.18.0 + Spectra-Cascadia release 4)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -48,7 +48,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.3"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.4"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -295,11 +295,15 @@ struct ConfigPow {
     uint32_t magic;
     uint8_t  rep_on, rep_pct;                 // repeat.battery: pause all forwarding below rep_pct %
     uint8_t  fl_on, fl_pct;                   // flood.battery: pause flood forwarding below fl_pct %
-    uint8_t  guest_on, pad[3];                // guest on/off
+    uint8_t  guest_on;                        // guest on/off
+    uint8_t  disc_off;                        // DISC_*_OFF: discovery.node/region.responses off (0 = both on)
+    uint8_t  pad[2];
     uint16_t empty_mv, full_mv;               // battery.empty / battery.full (0 % / 100 %)
     uint32_t check;
 };
 static ConfigPow bp;
+#define DISC_NODE_OFF   1
+#define DISC_REGION_OFF 2
 #define POW_ADDR (MORE_ADDR + sizeof(ConfigMore))
 static_assert(sizeof(ConfigPow) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) <= PAGE_SIZE, "config must fit one flash page");
@@ -1121,7 +1125,8 @@ static TxItem txq[TXQ_SIZE];
 // Which profiles a new packet goes out on (bit 0 radio, bit 1 radio2):
 //   own traffic (adverts, alerts): radio, plus radio2 when crossing
 //   forwarded: the profile it arrived on (if it may transmit there), plus the other when crossing
-//   replies to requests made to us: tx.reply (both by default)
+//   CLI replies to an authenticated admin: tx.reply (both by default)
+//   other replies (login, ACKs, status, discovery): like forwarding (Halo Keymind Cascade 1.18.0.2)
 enum { Q_OWN, Q_FWD, Q_REPLY };
 static uint8_t q_mode = Q_OWN;
 static uint8_t q_rx_mask(void) {
@@ -1524,6 +1529,9 @@ static const char* handle_control(const Pkt& p, int8_t snr4) {
         uint32_t mod = 0;
 #endif
         if (!(p.payload[1] & (1 << ADV_TYPE_REPEATER)) || mod < since) return "discover filtered";
+#ifdef SPECTER_XL
+        if (bp.disc_off & DISC_NODE_OFF) return "discover off";      // discovery.node.responses
+#endif
         disc_count++;
         uint8_t d[6 + 32 + 12];
         d[0] = CTL_DISCOVER_RESP | ADV_TYPE_REPEATER;
@@ -1542,14 +1550,10 @@ static const char* handle_control(const Pkt& p, int8_t snr4) {
                 t[10] = r2.sf; t[11] = r2.cr; len += 10;
             }
         }
-        q_mode = Q_REPLY;
 #endif
         int n = build(out_buf, (PT_CONTROL << 2) | ROUTE_DIRECT, NULL, 0, NULL, 0, d, len);
         uint32_t t = airtime_ms(n) * cfg.txdelay_x100 / 100;
         if (n > 0) txq_push(out_buf, n, 0, rnd_range(0, 5 * t + 2) * 4);   // widened ×4: many may answer
-#ifdef SPECTER_XL
-        q_mode = Q_FWD;
-#endif
         return "discover answered";
     }
 #ifdef SPECTER_XL
@@ -1607,9 +1611,7 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         else if (xl_type(p.ptype)) {                   // addressed to us (last hop removed)
             packet_hash(h, p.ptype, p.path_len, p.payload, p.payload_len);
             if (was_seen(h)) return "dedup";
-            q_mode = Q_REPLY;
             bool mine = xl_handle_for_us(p, snr4, -1);
-            q_mode = Q_FWD;
             if (mine) { mark_seen(h); stat_for_us++; return "for us"; }
         }
 #endif
@@ -1871,9 +1873,7 @@ static const char* handle_flood(const Pkt& p, int8_t snr4) {
         int scope = -1;
         if (p.tc[0])
             scope = region_match(p.tc[0], p.ptype, p.payload, p.payload_len);
-        q_mode = Q_REPLY;
         bool mine = xl_handle_for_us(p, snr4, scope);
-        q_mode = Q_FWD;
         if (mine) { mark_seen(h); stat_for_us++; return "for us"; }
     }
 #endif
@@ -2579,6 +2579,12 @@ static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts);
 #endif
 
 #ifdef SPECTER_XL
+// discovery.node.responses / discovery.region.responses (Halo Keymind Cascade 1.18.0.2)
+static uint8_t disc_flag(const char* k) {
+    if (!strcmp(k, "discovery.node.responses")) return DISC_NODE_OFF;
+    if (!strcmp(k, "discovery.region.responses")) return DISC_REGION_OFF;
+    return 0;
+}
 static const char* const r2_modes[] = { "off", "rx", "rxtx" };
 static const char* const r2_cross_names[] = { "off", "auto", "on" };
 static const char* const reply_names[] = { "both", "radio", "radio2", "auto", "off" };
@@ -2805,6 +2811,7 @@ XL_HI static void handle_get(const char* k, char* reply) {
     }
     else if (!strncmp(k, "radio2", 6) || !strcmp(k, "radio.timing") || !strcmp(k, "tx.reply")) r2_get(k, reply);
     else if (!strcmp(k, "guest")) sprintf(reply, "> %s", bp.guest_on ? "on" : "off");
+    else if (disc_flag(k)) sprintf(reply, "> %s", (bp.disc_off & disc_flag(k)) ? "off" : "on");
     else if (!strncmp(k, "guests", 6) && (!k[6] || k[6] == ' ')) xl_guests_get(k + 6, reply);
     else if (!strncmp(k, "logins", 6) && (!k[6] || k[6] == ' ')) xl_logins_get(k + 6, reply);
 #endif
@@ -2816,7 +2823,7 @@ XL_HI static void handle_get(const char* k, char* reply) {
 }
 
 XL_HI static void handle_set(const char* cmd, char* reply) {
-    char k[24];
+    char k[32];                                   // longest key: discovery.region.responses (26)
     const char* v = cmd;
     int n = 0;
     while (*v && *v != ' ' && n < (int)sizeof(k) - 1) k[n++] = *v++;
@@ -3005,6 +3012,12 @@ XL_HI static void handle_set(const char* cmd, char* reply) {
         if (!bp.guest_on) xl_drop_guests();
         cfg_save();
         sprintf(reply, "OK - guest %s", bp.guest_on ? "on" : "off");
+        return;
+    } else if (disc_flag(k)) {                        // Halo Keymind Cascade 1.18.0.2
+        if (strcmp(v, "on") && strcmp(v, "off")) { sprintf(reply, "Err - use get %s or set %s on|off", k, k); return; }
+        if (v[1] == 'n') bp.disc_off &= ~disc_flag(k); else bp.disc_off |= disc_flag(k);
+        cfg_save();
+        sprintf(reply, "OK - %s %s", k, v);
         return;
 #endif
     } else if (!strcmp(k, "password") || !strcmp(k, "guest.password")) {
