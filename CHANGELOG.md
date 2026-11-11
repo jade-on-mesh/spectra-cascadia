@@ -7,6 +7,27 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.18.0.5] - 2026-11-10
+
+Power and battery-reading improvements from [vaddieg/meshcore-specter-dx-lr30](https://github.com/vaddieg/meshcore-specter-dx-lr30), another SPECTER fork with measurements on a battery-powered DX-LR30.
+Not yet tested on hardware.
+
+### Added
+- `powersaving deep`: 8 MHz straight from HSI with the PLL powered down (vaddieg measured about 8 mA less on battery than 64 MHz). `powersaving on` stays 16 MHz. Both builds
+- XL: `battery.charged [V]` calibrates the internal 1.2 V reference against a fully charged cell (default 4.20 V). The F103 has no factory calibration and the reference varies 1.16–1.24 V (up to ±3 %), which shifts the cutoff and battery thresholds
+- XL: `get/set battery.vref` (1000–1400 mV), `get/set temp.offset` (−12…12 °C), `get temp`
+- XL: `get/set battery.offset` (0–1000 mV): added to the supply reading when no `battery.pin` is set, for boards fed through a diode
+
+### Changed
+- ADC readings average 8 samples (was 4). Both builds
+
+### Not taken
+- vaddieg's STOP-mode sleep and serial auto-sleep: they removed both (missed packets and watchdog resets; 0.12 mA saved)
+- Serial `dfu`: needs BOOT0 rewired, since the board's CH340 isn't connected to it
+- Feeding a Li-ion cell straight to 3V3 through a Schottky diode: a full cell puts about 3.85–4.0 V on the rail, above the SX1262's 3.7 V maximum. `battery.offset` is there for diode-fed boards on a lower-voltage supply
+
+Size: standard image 63,460 bytes (20 bytes left of 63,488); XL lower 62 KB 48.6 KB used. RAM unchanged.
+
 ## [1.18.0.4] - 2026-10-26
 
 Rolls in the repeater-relevant changes from Halo Keymind Cascade **1.18.0.2** (preview `w12-v1.18.0.2-alpha1`). XL only; the standard build is unchanged apart from the version.

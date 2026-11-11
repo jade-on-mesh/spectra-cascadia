@@ -160,6 +160,12 @@ Trade-off: signature checks on adverts take about 4× longer, so a burst of adve
 little latency. `powersaving` shows the current setting. The boot banner prints the active
 clock speed.
 
+`powersaving deep` (1.18.0.5) goes further: 8 MHz straight from the internal oscillator
+with the PLL switched off. On the same board vaddieg measured about **8 mA less** on
+battery than at 64 MHz ([meshcore-specter-dx-lr30](https://github.com/vaddieg/meshcore-specter-dx-lr30)).
+Logins, advert signature checks and radio2 hops are slowest in this mode; radio2 measures
+its own switch time and lengthens its preambles to match.
+
 **Battery voltage.** With no wiring, `get battery` reports the chip's own supply voltage
 (VDD). That only tracks the battery when you use a plain LDO regulator, such as the HT7333.
 **With a buck-boost** (TPS63020, XL63802), VDD stays at 3.3 V, so add a divider:
@@ -174,8 +180,24 @@ set battery.pin pb0
 set battery.divider 2.00        (2.00 for two equal resistors)
 get battery
 ```
-The divider draws about 20 µA. The board's POW LED and the regulator's LED draw far more,
-so remove those LEDs on solar nodes.
+The divider draws about 20 µA. The board's POW LED and the regulator's LED draw far more
+(vaddieg measured about **2.1 mA** for the red PWR LED alone), so remove them on solar nodes.
+
+Feed the regulated 3.3 V into the board's **3V3** pin, not 5V: the board's own AMS1117
+regulator sits on the 5V line and drops about 1.1 V.
+
+**Calibrating the reading (XL, 1.18.0.5).** The F103 has no factory calibration for its
+internal 1.2 V reference, which varies 1.16–1.24 V between chips, so readings can be off by
+up to ±3 % (about ±130 mV at a full cell). That moves the cutoff and battery thresholds.
+With a fully charged cell connected, run `battery.charged` (or `battery.charged 4.15` if your
+cell tops out lower); it sets `battery.vref` so the reading matches. `get/set battery.vref`
+(1000–1400 mV) reads or sets it directly, and `get/set temp.offset` (−12…12 °C) corrects the
+chip temperature. Readings are now an 8-sample average.
+
+`set battery.offset <mV>` adds a fixed drop back onto the supply reading when no
+`battery.pin` is set, for boards fed from the cell through a diode. **Don't feed a Li-ion
+cell to 3V3 through just a Schottky diode:** a full 4.2 V cell gives about 3.85–4.0 V on the
+rail, above the SX1262's 3.7 V maximum supply.
 
 **Telemetry history.** Battery voltage and chip temperature are recorded every 30 minutes
 for 7 days (cleared on reboot). Use `get telemetry.volt [page]` and
@@ -303,7 +325,8 @@ Replies come back as `  -> OK`, `  -> > value`, etc., like upstream.
 | `log start` / `log stop` | Live packet log (off by default so tools see clean replies) |
 | `stats` | Uptime, packet, retry, echo and advert-guard counters, battery |
 | `stats-core`, `stats-radio`, `stats-packets` | Upstream-format JSON stats |
-| `powersaving [on\|off]` | 16 MHz core (reboot to apply) |
+| `powersaving [on\|off\|deep]` | 16 MHz core, or 8 MHz with the PLL off (reboot to apply) |
+| `battery.charged [V]`, `get`/`set battery.vref`, `battery.offset`, `temp.offset`, `get temp` | XL: analog calibration |
 | `get battery`, `get`/`set battery.pin off\|pb0\|pb1`, `battery.divider`, `battery.cutoff`, `battery.resume` | Battery reading and low-voltage cutoff |
 | `get telemetry.volt [page]`, `get telemetry.temp [page]` | 7-day, 30-minute history |
 

@@ -48,7 +48,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.4"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.5"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -327,6 +327,27 @@ static ConfigR2 r2;
 static_assert(sizeof(ConfigR2) % 4 == 0, "word-aligned config");
 static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) + sizeof(ConfigR2) <= PAGE_SIZE, "config must fit one flash page");
 static uint32_t r2_checksum(const ConfigR2& c) { return fnv_words(&c, offsetof(ConfigR2, check) / 4); }
+
+// XL: analog calibration (as vaddieg/meshcore-specter-dx-lr30). The F103 has no factory
+// VREFINT calibration and the real value ranges 1.16-1.24 V, i.e. up to ±3 % on every
+// voltage reading. battery.offset adds a fixed drop (e.g. a Schottky diode feeding 3V3)
+// back onto the supply reading when no battery.pin is used.
+#define CAL_MAGIC 0x31435053UL   // "SPC1"
+struct ConfigCal {
+    uint32_t magic;
+    uint16_t vref_mv;                         // battery.vref: VREFINT in mV (0 = 1200)
+    int8_t   temp_off;                        // temp.offset: whole °C added to the MCU sensor
+    uint8_t  pad;
+    uint16_t bat_off_mv;                      // battery.offset: added to the VDD reading (no battery.pin)
+    uint16_t pad2;
+    uint32_t check;
+};
+static ConfigCal cal;
+#define CAL_ADDR (R2_ADDR + sizeof(ConfigR2))
+static_assert(sizeof(ConfigCal) % 4 == 0, "word-aligned config");
+static_assert(sizeof(Config) + sizeof(ConfigExt) + sizeof(ConfigAuth) + sizeof(ConfigApp) + sizeof(ConfigMore) + sizeof(ConfigPow) + sizeof(ConfigR2) + sizeof(ConfigCal) <= PAGE_SIZE, "config must fit one flash page");
+static uint32_t cal_checksum(const ConfigCal& c) { return fnv_words(&c, offsetof(ConfigCal, check) / 4); }
+static uint32_t cal_vref(void) { return cal.vref_mv ? cal.vref_mv : 1200; }
 #endif
 
 // retry.preset values (mikecarper/MeshCore Halo/Keymind defaults)
@@ -512,6 +533,10 @@ static void cfg_save(void) {
     w = (const uint32_t*)&r2;
     for (unsigned i = 0; i < sizeof(ConfigR2) / 4; i++)
         HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, R2_ADDR + i * 4, w[i]);
+    cal.check = cal_checksum(cal);
+    w = (const uint32_t*)&cal;
+    for (unsigned i = 0; i < sizeof(ConfigCal) / 4; i++)
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CAL_ADDR + i * 4, w[i]);
 #endif
     HAL_FLASH_Lock();
 #ifdef SPECTER_XL
@@ -806,21 +831,24 @@ Radio radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
 #if defined(ARDUINO_ARCH_STM32)
 // Core clock is chosen before setup() runs, from the saved powersaving flag:
 //   off → 64 MHz (HSI/2 × 16, stock)   on → 16 MHz (HSI/2 × 4)
+//   deep → 8 MHz straight from HSI with the PLL powered down (vaddieg measured
+//          ~8 mA less on battery than 64 MHz); crypto and radio2 hops are slowest here.
 // Sleeping between polls at 16 MHz draws roughly a quarter of what it does at 64 MHz.
 extern "C" void SystemClock_Config(void) {
     const ConfigExt* e = (const ConfigExt*)(CONFIG_ADDR + sizeof(Config));
-    bool low = e->magic == EXT_MAGIC && e->check == fnv_words(e, offsetof(ConfigExt, check) / 4) && e->power;
+    uint8_t pw = (e->magic == EXT_MAGIC && e->check == fnv_words(e, offsetof(ConfigExt, check) / 4)) ? e->power : 0;
+    bool low = pw != 0, deep = pw == 2;
     RCC_OscInitTypeDef osc = {};
     RCC_ClkInitTypeDef clk = {};
     osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
     osc.HSIState = RCC_HSI_ON;
     osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLState = deep ? RCC_PLL_OFF : RCC_PLL_ON;   // deep: 8 MHz HSI direct, PLL powered down
     osc.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
     osc.PLL.PLLMUL = low ? RCC_PLL_MUL4 : RCC_PLL_MUL16;
     if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
     clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.SYSCLKSource = deep ? RCC_SYSCLKSOURCE_HSI : RCC_SYSCLKSOURCE_PLLCLK;
     clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
     clk.APB1CLKDivider = low ? RCC_HCLK_DIV1 : RCC_HCLK_DIV2;
     clk.APB2CLKDivider = RCC_HCLK_DIV1;
@@ -2009,13 +2037,13 @@ static uint16_t adc_read(uint8_t ch) {            // direct registers: no HAL AD
     }
     uint32_t sum = 0;
     ADC1->SQR3 = ch;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {                  // 8-sample average (vaddieg/meshcore-specter-dx-lr30)
         ADC1->CR2 |= ADC_CR2_ADON;                 // ADON again = start conversion
         uint32_t t0 = millis();
         while (!(ADC1->SR & ADC_SR_EOC)) if (millis() - t0 > 5) return 0;
         sum += ADC1->DR;
     }
-    return sum / 4;
+    return sum / 8;
 }
 static void bkp_enable(void) {
     RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
@@ -2081,17 +2109,28 @@ static void radio_cold_sleep(void) {
 
 static uint32_t vdd_mv(void) {
     uint32_t r = adc_read(17);                     // VREFINT ≈ 1.20 V
+#ifdef SPECTER_XL
+    return r ? cal_vref() * 4095UL / r : 0;
+#else
     return r ? 1200UL * 4095UL / r : 0;
+#endif
 }
 // Battery mV: from the PB0/PB1 divider if configured, else the chip's own supply (VDD).
 static uint32_t battery_mv(void) {
     uint32_t vdd = vdd_mv();
+#ifdef SPECTER_XL
+    if (!ext.bat_pin && vdd) return vdd + cal.bat_off_mv;   // supply fed from the cell through a diode
+#endif
     if (!ext.bat_pin || !vdd) return vdd;
     return (uint32_t)adc_read(ext.bat_pin == 1 ? 8 : 9) * vdd / 4095UL * ext.bat_div_x100 / 100UL;
 }
 static int temp_c(void) {                         // internal sensor: V25 ≈ 1.43 V, 4.3 mV/°C (±several °C)
     int32_t vs = (int32_t)((uint32_t)adc_read(16) * vdd_mv() / 4095UL);
+#ifdef SPECTER_XL
+    return (int)((1430 - vs) * 10 / 43 + 25) + cal.temp_off;
+#else
     return (int)((1430 - vs) * 10 / 43 + 25);
+#endif
 }
 
 // Telemetry history: one sample every 30 min, 7 days, newest overwrites oldest.
@@ -2799,6 +2838,10 @@ XL_HI static void handle_get(const char* k, char* reply) {
         bool r = k[0] == 'r';
         sprintf(reply, "> %s below=%u%%", (r ? bp.rep_on : bp.fl_on) ? "on" : "off", r ? bp.rep_pct : bp.fl_pct);
     }
+    else if (!strcmp(k, "battery.vref"))   sprintf(reply, "> %lu mV%s", (unsigned long)cal_vref(), cal.vref_mv ? "" : " (default)");
+    else if (!strcmp(k, "battery.offset")) sprintf(reply, "> %u mV", cal.bat_off_mv);
+    else if (!strcmp(k, "temp.offset"))    sprintf(reply, "> %d", cal.temp_off);
+    else if (!strcmp(k, "temp"))           sprintf(reply, "> %d C", temp_c());
     else if (!strcmp(k, "battery.empty")) sprintf(reply, "> %u", bp.empty_mv);
     else if (!strcmp(k, "battery.full"))  sprintf(reply, "> %u", bp.full_mv);
     else if (!strcmp(k, "battery.forward")) {
@@ -2994,6 +3037,25 @@ XL_HI static void handle_set(const char* cmd, char* reply) {
         bf_update(battery_mv());
         strcpy(reply, "OK - saved");
         return;
+    } else if (!strcmp(k, "battery.vref")) {
+        if (!ok || iv < 1000 || iv > 1400) { strcpy(reply, "Error: 1000-1400 mV"); return; }
+        cal.vref_mv = iv;
+        cfg_save(); bf_update(battery_mv());
+        sprintf(reply, "OK - battery now %lu mV", (unsigned long)battery_mv());
+        return;
+    } else if (!strcmp(k, "battery.offset")) {
+        if (!ok || iv > 1000) { strcpy(reply, "Error: 0-1000 mV"); return; }
+        cal.bat_off_mv = iv;
+        cfg_save(); bf_update(battery_mv());
+        sprintf(reply, "OK - battery now %lu mV%s", (unsigned long)battery_mv(), ext.bat_pin ? " (offset only applies with battery.pin off)" : "");
+        return;
+    } else if (!strcmp(k, "temp.offset")) {
+        int t = atoi_s(v);
+        if (!*v || t < -12 || t > 12) { strcpy(reply, "Error: -12 to 12"); return; }
+        cal.temp_off = t;
+        cfg_save();
+        sprintf(reply, "OK - temp now %d C", temp_c());
+        return;
     } else if (!strcmp(k, "battery.empty") || !strcmp(k, "battery.full")) {
         if (!ok || iv < 2000 || iv > 20000) { sprintf(reply, "Error: use set %s 2000-20000 (mV)", k); return; }
         uint16_t e = k[8] == 'e' ? iv : bp.empty_mv, f = k[8] == 'f' ? iv : bp.full_mv;
@@ -3062,11 +3124,16 @@ XL_HI static void handle_command(char* cmd, char* reply) {
         else strcpy(reply, "(ERR: clock cannot go backwards)");
     } else if (!strncmp(cmd, "powersaving", 11)) {
         const char* v = skip_ws(cmd + 11);
-        if (!strcmp(v, "on") || !strcmp(v, "off")) {
-            ext.power = v[1] == 'n';
+        static const char* const pw_names[] = { "off", "on", "deep" };
+        int m = 0; while (m < 3 && strcmp(v, pw_names[m])) m++;
+        if (m < 3) {
+            static const char* const pw_reply[] = { "off - reboot to apply", "on - reboot to apply (16 MHz core)",
+                                                    "deep - reboot to apply (8 MHz core, PLL off)" };
+            ext.power = m;
             cfg_save();
-            strcpy(reply, ext.power ? "on - reboot to apply (16 MHz core)" : "off - reboot to apply");
-        } else strcpy(reply, ext.power ? "on" : "off");
+            strcpy(reply, pw_reply[m]);
+        } else if (*v) strcpy(reply, "Error: powersaving on, off or deep");
+        else strcpy(reply, pw_names[ext.power > 2 ? 0 : ext.power]);
     } else if (!strcmp(cmd, "stats-core")) {
         int q = 0; for (int i = 0; i < TXQ_SIZE; i++) q += txq[i].used;
         sprintf(reply, "{\"battery_mv\":%lu,\"uptime_secs\":%lu,\"errors\":0,\"queue_len\":%d}",
@@ -3105,6 +3172,21 @@ XL_HI static void handle_command(char* cmd, char* reply) {
         tr_apply_at = 0;
         if (tr_active) tr_revert_at = millis() + 2000;   // the loop reverts once the reply is on air
         strcpy(reply, "OK - restoring normal radio");
+    } else if (!strncmp(cmd, "battery.charged", 15) && (!cmd[15] || cmd[15] == ' ')) {
+        // With a fully charged cell (vaddieg): scale VREFINT so the reading matches V (default 4.20).
+        const char* v = skip_ws(cmd + 15);
+        int32_t x = 420;
+        if (*v && (!parse_fixed(v, 2, &x) || x < 300 || x > 450)) { strcpy(reply, "Error: battery.charged [3.00-4.50] (volts, default 4.20)"); return; }
+        uint32_t off = ext.bat_pin ? 0 : cal.bat_off_mv, now = battery_mv(), target = (uint32_t)x * 10;
+        if (now <= off || target <= off) { strcpy(reply, "Error: no battery reading"); return; }
+        uint32_t nv = (cal_vref() * (target - off) + (now - off) / 2) / (now - off);
+        if (nv < 1000 || nv > 1400) {
+            sprintf(reply, "Error: reading %lu mV would need battery.vref %lu mV (1000-1400); check wiring and the voltage", (unsigned long)now, (unsigned long)nv);
+            return;
+        }
+        cal.vref_mv = (uint16_t)nv;
+        cfg_save(); bf_update(battery_mv());
+        sprintf(reply, "OK - battery.vref %lu mV, battery now %lu mV", (unsigned long)nv, (unsigned long)battery_mv());
     } else if (!strcmp(cmd, "alert test")) {
         if (!more.key_len) strcpy(reply, "Error: no alert.channel set");
         else if (!more.alerts) strcpy(reply, "Error: alerts are off");
@@ -3352,6 +3434,11 @@ void setup(void) {
     if (r2.magic != R2_MAGIC || r2.check != r2_checksum(r2)) {
         memset(&r2, 0, sizeof(r2));                   // radio2 off, radio2.cross off, tx.reply both
         r2.magic = R2_MAGIC;
+    }
+    memcpy(&cal, (const void*)CAL_ADDR, sizeof(cal));
+    if (cal.magic != CAL_MAGIC || cal.check != cal_checksum(cal)) {
+        memset(&cal, 0, sizeof(cal));                 // VREFINT 1200 mV, no offsets
+        cal.magic = CAL_MAGIC;
     }
     xl_init();
 #endif

@@ -888,6 +888,39 @@ int main() {
             "off: back on radio only, radio2 copies dropped");
       clearq(); }
 
+    // ── 1.18.0.5: power mode and analog calibration (from vaddieg/meshcore-specter-dx-lr30)
+    { CHECK(cli("powersaving deep") == "deep - reboot to apply (8 MHz core, PLL off)" && ext.power == 2
+            && cli("powersaving") == "deep", "powersaving deep: 8 MHz, saved");
+      CHECK(cli("powersaving fast") == "Error: powersaving on, off or deep" && ext.power == 2, "powersaving: bad value refused");
+      setup();
+      CHECK(ext.power == 2, "deep survives reboot");
+      cli("powersaving off");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq();
+      auto mv = [&]() { return (int)battery_mv(); };
+      cli("set battery.pin off"); set_vdd(3300);
+      CHECK(cli("get battery.vref") == "> 1200 mV (default)" && cli("get battery.offset") == "> 0 mV", "calibration defaults");
+      int base = mv();
+      CHECK(cli("set battery.vref 1236").find("OK - battery now") == 0 && abs(mv() - base * 1236 / 1200) <= 3, "battery.vref scales the reading");
+      CHECK(cli("set battery.vref 1500") == "Error: 1000-1400 mV" && cal.vref_mv == 1236, "battery.vref range");
+      cal.vref_mv = 0;
+      CHECK(cli("set battery.offset 300").find("OK - battery now") == 0 && abs(mv() - base - 300) <= 3, "battery.offset adds a diode drop to the supply reading");
+      std::string r = cli("battery.charged 4.0");
+      CHECK(r.find("OK - battery.vref ") == 0 && abs(mv() - 4000) <= 6, "battery.charged 4.0: supply + offset now reads 4.0 V");
+      CHECK(cli("battery.charged 4.50").find("Error: reading") == 0, "battery.charged refuses a calibration outside 1000-1400 mV");
+      cal.vref_mv = 0; cli("set battery.offset 0");
+      cli("set battery.pin pb0"); cli("set battery.divider 2.00"); set_pin_mv(8, 2050, 3300);
+      CHECK(cli("battery.charged").find("OK - battery.vref ") == 0 && abs(mv() - 4200) <= 6, "battery.charged (default 4.20) with a divider on PB0");
+      CHECK(cli("set battery.offset 200").find("(offset only applies with battery.pin off)") != std::string::npos, "offset ignored with battery.pin");
+      cli("set battery.offset 0"); cal.vref_mv = 0; cli("set battery.pin off"); cfg_save();
+      int t0 = temp_c();
+      CHECK(cli("set temp.offset 3") == std::string("OK - temp now ") + std::to_string(t0 + 3) + " C"
+            && cli("get temp") == std::string("> ") + std::to_string(t0 + 3) + " C", "temp.offset");
+      CHECK(cli("set temp.offset -13") == "Error: -12 to 12" && cal.temp_off == 3, "temp.offset range");
+      cli("set temp.offset 0");
+      setup();
+      CHECK(cal.vref_mv == 0 && cal.temp_off == 0 && cal.bat_off_mv == 0, "calibration saved and reloaded");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
+
     // ── packets for other nodes are untouched
     { uint8_t pl[40]; pl[0] = own_pubkey[0] ^ 1; pl[1] = 5; memset(pl + 2, 0xAB, 18);
       uint8_t pk[64]; int n = mk_pkt(pk, (PT_REQ << 2) | ROUTE_FLOOD, &hop, 1, pl, 20);
