@@ -5,7 +5,7 @@
 > The DX-LR30 is a cheap Chinese LoRa shell device. MeshCore has no official
 > firmware for STM32F103 + SX1262.
 
-**Version numbers** track Halo Keymind Cascade: `v1.18.0.2.1` is Keymind Cascade 1.18.0.2 (itself official MeshCore 1.18.0) plus our release 1. Releases up to 1.18.0.6 used official MeshCore + ours; see [CHANGELOG.md](CHANGELOG.md).
+**Version numbers** track Halo Keymind Cascade: `v1.18.0.3.1` is Keymind Cascade 1.18.0.3 (itself official MeshCore 1.18.0) plus our release 1. Releases up to 1.18.0.6 used official MeshCore + ours; see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -103,7 +103,9 @@ MediaMesh side channel (MeshCore Open TAK / Wadamesh TAK photos and voice) as we
 normal network:
 
 ```
-set radio2 mediamesh             (911.150 MHz, 250 kHz, SF7, CR5, rx+tx; mediamesh-range = 125 kHz)
+set radio2 mediamesh             (regional preset from your radio frequency, rx+tx: US 911.150 MHz / 250 kHz / SF7 / CR5;
+                                  EU868 869.525 / 125 kHz / SF5 / CR7; AU/NZ/BR/TH/VN 922.500; EU433 434.250.
+                                  mediamesh-range halves the bandwidth. Custom frequencies need a tuple)
 set radio2 911.15,250,7,5,rxtx   (any profile: MHz,kHz,SF,CR,rx|rxtx[,preamble])
 get radio2                       (warns if radio2 sits within 6 kHz of radio's channel, and suggests a centre)
 get radio2.status                (packets per profile, switches, measured switch time, preambles)
@@ -116,7 +118,9 @@ other profile as well (default `off` keeps the two networks apart). CLI replies 
 admin go out on both profiles by default; `set tx.reply radio|radio2|auto|off` changes that
 (`both force` / `radio2 force` lets them use an `rx`-only radio2). Other replies (logins, ACKs,
 status, discovery) follow the same rules as relayed packets, as in Halo Keymind Cascade 1.18.0.2.
-The node's own adverts stay on `radio` unless crossing is on.
+The node's own adverts stay on `radio` unless crossing is on. With a transmit-capable radio2,
+the periodic flood advert goes out on `radio` only and radio2 gets its own flood advert halfway
+between two of them (`set radio2.advert on|off`, default on; as Halo Keymind Cascade 1.18.0.3).
 
 **It is one radio taking turns, not two.** It listens about 9 ms on the slower profile and
 about 19 ms on the faster one, and can't hear either while it is receiving or sending on the

@@ -3,11 +3,51 @@
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
 Version numbers follow the Halo Keymind Cascade release this one tracks (the
-first four numbers, currently 1.18.0.2; its first three are the official
+first four numbers, currently 1.18.0.3; its first three are the official
 MeshCore release, 1.18.0), plus a fifth number for our own releases on that
 base. That number resets to 1 when Keymind Cascade moves. Releases 1.17.1.1
 through 1.18.0.6 used four numbers (official MeshCore + ours); before that,
 internal numbers 2.0–2.6.
+
+## [1.18.0.3.1] - 2026-11-16
+
+Rolls in the repeater-relevant changes from Halo Keymind Cascade **1.18.0.3** (preview `t096-v1.18.0.3-preview1`).
+**Auto-ported by the upstream-sync task and not yet tested on hardware.**
+
+### Fixed
+- Adverts carrying bytes past the 32 signed app-data bytes are dropped instead of being checked against only the signed part and relayed with the unsigned tail (a varied tail would make "new" copies of a real advert). Both builds
+- XL: adverts whose flags announce lat/lon or feature fields that aren't all there are dropped before relaying
+- XL: a routed-direct advert is relayed only after its signature checks out (only the next hop checks it); forged ones were relayed unchecked
+
+### Added (XL)
+- `get/set radio2.advert on|off` (default on, saved): with a transmit-capable radio2, the periodic flood advert goes out on `radio` only and radio2 gets its own flood advert halfway between two of them (12 h interval: 6 h after each). A midpoint missed by more than a minute is skipped. `off` restores the old behaviour (radio, plus radio2 when crossing). Manual `advert` is unchanged
+
+### Changed (XL)
+- `set radio2 mediamesh` / `mediamesh-range` pick the regional MediaMesh channel from the saved radio frequency: US 911.150 MHz (250/125 kHz, SF7, CR5), EU868 869.525 MHz (125/62.5 kHz, SF5, CR7), AU/NZ/Brazil/Thailand/Vietnam presets 922.500 MHz, EU433 434.250 MHz. A custom radio frequency gets `Error: no regional MediaMesh preset; use tuple`. EU builds previously got the US channel. Saved radio2 settings don't change
+
+### Upstream sync
+Range reviewed: mikecarper/MeshCore `keymindCascade` a87b2a33 → 6a6078b0 (Halo Keymind Cascade 1.18.0.2 alpha 1 → 1.18.0.3 preview 1, including the later 1.18.0.2 work). No new official MeshCore release (still `repeater-v1.18.0`).
+
+Ported:
+- [Validate advert metadata and direct relay signatures](https://github.com/mikecarper/MeshCore/commit/c9679056a2763ff811899810da4351ce67cf3071) and [Reject incomplete adverts before direct forwarding](https://github.com/mikecarper/MeshCore/commit/e2ab2c2f2ef6646a2c39c2ff02537fd12ff51c80) (standard build: the unsigned-tail rejection only, for flash)
+- [Stagger radio2 flood adverts](https://github.com/mikecarper/MeshCore/commit/e936dc7eb4ec0152fe5697edf80ee06ee2beb7aa), [Add radio2 flood advert setting](https://github.com/mikecarper/MeshCore/commit/f3abf1d05cabc067e89832e0fcb5f0ab477664f6), [Preserve flood routing when staggered adverts are off](https://github.com/mikecarper/MeshCore/commit/b3bfbf3074f44151cd133e5897fe8561a465bf60) (exact CLI name and reply text)
+- [Choose regional MediaMesh defaults from saved primary settings](https://github.com/mikecarper/MeshCore/commit/44ee364bea36b0202e291542a43b7092072fa7e9) (the `set radio2` presets)
+
+Already have:
+- [Saturate duplicate packet stats](https://github.com/mikecarper/MeshCore/commit/26e438904e19e374c798ce2dfd4b453e0f40741c): our status response reports 0 for the duplicate counters
+- [Negative TX power in CommonRadioPrefs](https://github.com/mikecarper/MeshCore/commit/85ad886589e29ec1dfb3f41ab00f97f3adc6d730): `tx` is stored signed here
+- Region reload invalidating cached transport keys: our region keys are recomputed whenever regions change
+
+Declined:
+- [Per-profile radio flood controls and deferred cross-profile floods](https://github.com/mikecarper/MeshCore/commit/5c193b1e0bba2d3f58cab5e81fd9d4d95c101397) and [MediaMesh forwarding region](https://github.com/mikecarper/MeshCore/commit/71e42b2e62fa3296646840cdada64230774d905c): a new flood-policy layer we don't carry; `radio2.cross` covers our case
+- [Split RX/TX repeater modes with bridge routing](https://github.com/mikecarper/MeshCore/commit/d270cd611a13430db57055fcb10e0022a954aed3): ESP-NOW/bridge hardware
+- [Repeater radio presets](https://github.com/mikecarper/MeshCore/commit/6dea450861e56aedadafb1146706756b81047e8e) and [live-apply preset confirmation](https://github.com/mikecarper/MeshCore/commit/382bfa52243e360b5f9a8acd0b405dccf6343f4b): need a file system and live `set radio` apply (official keeps reboot-to-apply)
+- [Wardriving filter default](https://github.com/mikecarper/MeshCore/commit/7724fad719512a0e2b9a45a9e169a169529cb831): part of the flood filter engine we don't carry
+- [Emergency battery sleep](https://github.com/mikecarper/MeshCore/commit/0c7dec9f1989aa7c511ba62aa18b08bd19e30806) and [operating hours](https://github.com/mikecarper/MeshCore/commit/4518f3db81fbaf8cb06b574a7f87e3a7328b7f46): we have our own power saving and low-voltage cutoff; no budget for schedules
+- [Automatic beacon TX power](https://github.com/mikecarper/MeshCore/commit/57670a2348b31879f7fe17c6e7c7e54cfaa1bc9a), [uncoded LoRa profiles](https://github.com/mikecarper/MeshCore/commit/0cc6bb77746e89785b6f1392f12f4b27d9152acf) (LR2021 only), [seven-day temperature/battery extrema](https://github.com/mikecarper/MeshCore/commit/ddc5533ec927b1ddf37f72aaff0a1ea68a313d69) (telemetry history)
+- AGC/RXPS pulse maintenance, W12 multi-SF/PRAM experiments, LR2021/LR11xx/SX1268/T096 drivers, nRF52 crypto scratch, OTA install/pacing, ESP-NOW, USB logging, Companion, docs and tooling: out of scope
+
+Size: standard image 63,476 bytes (12 bytes left; EU 63,484, 4 left); XL lower 62 KB 49.6 KB used, static RAM 14,172 bytes.
 
 ## [1.18.0.2.1] - 2026-11-15
 

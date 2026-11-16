@@ -1,6 +1,6 @@
 /*
  * Spectra-Cascadia — Native MeshCore Repeater for STM32F103C8T6 + SX1262 (DX-LR30)
- * Version: 1.18.0.4 (official MeshCore 1.18.0 + Spectra-Cascadia release 4)
+ * Version: 1.18.0.3.1 (Halo Keymind Cascade 1.18.0.3, on official MeshCore 1.18.0, + Spectra-Cascadia release 1)
  *
  * Built with -DSPECTER_XL (the "XL" 128 KB build) it also accepts logins from the
  * normal MeshCore app: status, telemetry, neighbours and the full CLI over the air.
@@ -48,7 +48,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.2.1" // Halo Keymind Cascade version + our release number
+#define FW_VERSION "v1.18.0.3.1" // Halo Keymind Cascade version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -297,7 +297,8 @@ struct ConfigPow {
     uint8_t  fl_on, fl_pct;                   // flood.battery: pause flood forwarding below fl_pct %
     uint8_t  guest_on;                        // guest on/off
     uint8_t  disc_off;                        // DISC_*_OFF: discovery.node/region.responses off (0 = both on)
-    uint8_t  pad[2];
+    uint8_t  r2_adv_off;                      // radio2.advert off (0 = on, the default)
+    uint8_t  pad;
     uint16_t empty_mv, full_mv;               // battery.empty / battery.full (0 % / 100 %)
     uint32_t check;
 };
@@ -1465,11 +1466,26 @@ static uint32_t delay_for(const Pkt& p, uint8_t factor_x100) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Advert verification (+ clock learning)
 // ═════════════════════════════════════════════════════════════════════════════
+// Advert layout (AdvertSignature + AdvertDataLayout, Halo Keymind Cascade 1.18.0.3): every
+// app-data byte must be signed (no unsigned tail past MAX_ADVERT_DATA_SIZE), and the
+// fixed fields its flags announce (lat/lon, feat1, feat2) must all be present.
+// Standard build: only the unsigned-tail rejection fits; XL also checks the flagged fields.
+static bool advert_shape_ok(const uint8_t* payload, int plen) {
+    int app_len = plen - 100;
+    if (app_len < 0 || app_len > MAX_ADVERT_DATA_SIZE) return false;
+#ifdef SPECTER_XL
+    uint8_t f = payload[100];
+    return !app_len || app_len >= 1 + (f & ADV_LATLON_MASK ? 8 : 0) + (f & 0x20 ? 2 : 0) + (f & 0x40 ? 2 : 0);
+#else
+    return true;
+#endif
+}
+
+// hops 0xFF: routed-direct advert (signature check only, no clock sample)
 static bool advert_verify(const uint8_t* payload, int plen, uint8_t hops) {
-    if (plen < 100) return false;
+    if (!advert_shape_ok(payload, plen)) return false;
     if (memcmp(payload, own_pubkey, 32) == 0) return false;
     int app_len = plen - 100;
-    if (app_len > MAX_ADVERT_DATA_SIZE) app_len = MAX_ADVERT_DATA_SIZE;
     uint8_t msg[36 + MAX_ADVERT_DATA_SIZE];
     memcpy(msg, payload, 36);
     memcpy(msg + 36, payload + 100, app_len);
@@ -1477,6 +1493,9 @@ static bool advert_verify(const uint8_t* payload, int plen, uint8_t hops) {
     if (!Ed25519::verify(payload + 36, payload, msg, 36 + app_len)) return false;
     uint32_t ts;
     memcpy(&ts, payload + 32, 4);
+#ifdef SPECTER_XL
+    if (hops != 0xFF)
+#endif
     clock_sample(payload, ts, hops, plen + 2 + hops);
     return true;
 }
@@ -1627,7 +1646,7 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
             packet_hash(h, p.ptype, 0, p.payload, p.payload_len);
             if (!was_seen(h)) {
                 mark_seen(h);
-                if (advert_verify(p.payload, p.payload_len, 0) && (p.payload[100] & 0x0F) == ADV_TYPE_REPEATER) {
+                if (advert_verify(p.payload, p.payload_len, 0) && p.payload_len > 100 && (p.payload[100] & 0x0F) == ADV_TYPE_REPEATER) {
                     rr_note(p.payload, 3, snr4);
 #ifdef SPECTER_XL
                     xl_note_neighbour(p.payload, snr4);
@@ -1676,6 +1695,10 @@ static const char* handle_direct(const Pkt& p, int8_t snr4) {
         if (p.ptype == PT_ACK) header = hdr_ack;      // routeDirectRecvAcks
     }
     if (was_seen(h)) return "dedup";
+    // routed-direct adverts: only the intended next hop checks the signature (Mesh::onRecvPacket)
+#ifdef SPECTER_XL
+    if (p.ptype == PT_ADVERT && !advert_verify(pl, plen, 0xFF)) return "advert sig";
+#endif
     mark_seen(h);
 #ifdef SPECTER_XL
     // multi.acks (Mesh::routeDirectRecvAcks): send N extra copies as multipart ACKs
@@ -1717,7 +1740,7 @@ static bool flood_type_ok(const Pkt& p) {
         case PT_ANON_REQ:   return 1 + 32 + 2 < p.payload_len;
         case PT_GRP_DATA:
         case PT_GRP_TXT:    return 1 + 2 < p.payload_len;
-        case PT_ADVERT:     return p.payload_len >= 100;
+        case PT_ADVERT:     return advert_shape_ok(p.payload, p.payload_len);
         default:            return false;
     }
 }
@@ -1976,6 +1999,30 @@ static void on_receive(const uint8_t* d, int len, int8_t snr4) {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Adverts (Mesh::createAdvert + sendZeroHop / sendFloodScoped)
 // ═════════════════════════════════════════════════════════════════════════════
+#ifdef SPECTER_XL
+// radio2.advert (Halo Keymind Cascade 1.18.0.2/1.18.0.3, StaggeredFloodAdvert): the periodic flood
+// advert goes out on radio only, and a transmit-capable radio2 gets its own flood advert halfway
+// between two of them. A midpoint missed by more than a minute is skipped, never replayed.
+// Manual adverts and radio2.advert off keep the usual policy (radio, plus radio2 when crossing).
+static uint8_t adv_only = 0;                     // 0 usual policy, 1 radio only, 2 radio2 only
+static uint32_t r2_adv_s = 0;                    // uptime (s) of the next radio2 midpoint, 0 = none
+static bool r2_adv_before = false;               // eligible since it was scheduled
+static bool r2_adv_eligible(void) { return r2.mode == R2_RXTX && !bp.r2_adv_off; }
+static void r2_adv_schedule(uint32_t up, uint32_t next_flood_s) {
+    uint32_t mid = next_flood_s - cfg.flood_advert_h * 1800UL;
+    r2_adv_s = (cfg.flood_advert_h && (int32_t)(mid - up) > 0) ? mid : 0;
+    r2_adv_before = r2_adv_eligible();
+}
+static bool r2_adv_due(uint32_t up) {
+    if (!r2_adv_s) return false;
+    bool elig = r2_adv_eligible();
+    int32_t late = (int32_t)(up - r2_adv_s);
+    if (late < 0) { r2_adv_before = elig; return false; }
+    r2_adv_s = 0;
+    return elig && r2_adv_before && late <= 60;
+}
+#endif
+
 static void send_advert(bool flood) {
     uint8_t payload[100 + MAX_ADVERT_DATA_SIZE];
     memcpy(payload, own_pubkey, 32);
@@ -2010,9 +2057,14 @@ static void send_advert(bool flood) {
         } else {
             n = build(out_buf, (PT_ADVERT << 2) | ROUTE_FLOOD, NULL, path_len, NULL, 0, payload, i);
         }
-        j_last_flood_ts = ts;
-        journal_write(ts, j_last_flood_ts);
+#ifdef SPECTER_XL
+        if (adv_only != 2)                       // the radio2 midpoint doesn't move the primary schedule
+#endif
+        { j_last_flood_ts = ts; journal_write(ts, j_last_flood_ts); }
     }
+#ifdef SPECTER_XL
+    if (adv_only) txq_push1(out_buf, n, 3, 0, adv_only - 1); else
+#endif
     txq_push(out_buf, n, 3, 0);
     LOGLN(flood ? "ADVERT flood" : "ADVERT zero-hop");
 }
@@ -2662,6 +2714,8 @@ XL_HI static void r2_get(const char* k, char* reply) {
         r2_spacing_warn(reply);
     } else if (!strcmp(k, "radio2.cross")) {
         sprintf(reply, "> %s", r2_cross_names[r2.cross]);
+    } else if (!strcmp(k, "radio2.advert")) {
+        strcpy(reply, bp.r2_adv_off ? "> off" : "> on");
     } else if (!strcmp(k, "tx.reply")) {
         sprintf(reply, "> %s%s", reply_names[r2.reply], r2.reply_force ? " force" : "");
         if ((r2.reply == REPLY_BOTH || r2.reply == REPLY_RADIO2) && r2.mode == R2_RX && !r2.reply_force)
@@ -2695,7 +2749,13 @@ XL_HI static void r2_get(const char* k, char* reply) {
 
 // set radio2 <MHz>,<kHz>,<SF>,<CR>,<rx|rxtx>[,<preamble>|auto] | mediamesh | mediamesh-range | off
 // set radio2.cross auto|on|off      set tx.reply both|radio|radio2|auto|off [force]
+// set radio2.advert on|off
 XL_HI static void r2_set(const char* k, const char* v, char* reply) {
+    if (!strcmp(k, "radio2.advert")) {
+        bool on = !strcmp(v, "on");
+        if (!on && strcmp(v, "off")) { strcpy(reply, "Error: use set radio2.advert on|off"); return; }
+        bp.r2_adv_off = !on; cfg_save(); strcpy(reply, "OK"); return;
+    }
     if (!strcmp(k, "radio2.cross")) {
         int i = 0; while (i < 3 && strcmp(v, r2_cross_names[i])) i++;
         if (i == 3) { strcpy(reply, "Error: use set radio2.cross auto|on|off"); return; }
@@ -2714,7 +2774,22 @@ XL_HI static void r2_set(const char* k, const char* v, char* reply) {
     ConfigR2 n = r2;
     if (!strcmp(v, "off")) n.mode = R2_OFF;
     else if (!strcmp(v, "mediamesh") || !strcmp(v, "mediamesh-range")) {   // MeshCore Open TAK / Wadamesh TAK presets
-        n.freq_khz = 911150; n.bw_hz = v[9] ? 125000 : 250000; n.sf = 7; n.cr = 5; n.mode = R2_RXTX; n.pre = 0;
+        // Regional centre from the saved primary frequency (Halo Keymind Cascade 1.18.0.3,
+        // RadioProfilePresets.h): the community primary presets, not a guess from any 915 MHz value.
+        uint32_t f = tr_active ? tr_freq : cfg.freq_khz;
+        uint8_t g = 0;                                // 1 US, 2 EU868, 3 AU/NZ/BR/TH/VN, 4 EU433
+        if (f >= 869400 && f <= 869650) g = 2;
+        else switch (f) {
+            case 910525: case 927875: g = 1; break;
+            case 915075: case 915800: case 916575: case 917375: case 920250: case 921000: case 923125: g = 3; break;
+            case 433375: case 433650: g = 4; break;
+        }
+        if (!g) { strcpy(reply, "Error: no regional MediaMesh preset; use tuple"); return; }
+        static const uint32_t centre[4] = { 911150, 869525, 922500, 434250 };
+        bool eu = g == 2, range = v[9];
+        n.freq_khz = centre[g - 1];
+        n.bw_hz = eu ? (range ? 62500 : 125000) : (range ? 125000 : 250000);
+        n.sf = eu ? 5 : 7; n.cr = eu ? 7 : 5; n.mode = R2_RXTX; n.pre = 0;
     } else {
         int32_t f, bw; char m[8];
         const char* c1 = strchr(v, ','); const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
@@ -3085,7 +3160,7 @@ XL_HI static void handle_set(const char* cmd, char* reply) {
         bf_update(battery_mv());
         strcpy(reply, "OK - saved");
         return;
-    } else if (!strcmp(k, "radio2") || !strcmp(k, "radio2.cross") || !strcmp(k, "tx.reply")) {
+    } else if (!strcmp(k, "radio2") || !strcmp(k, "radio2.cross") || !strcmp(k, "radio2.advert") || !strcmp(k, "tx.reply")) {
         r2_set(k, v, reply);
         return;
     } else if (!strcmp(k, "guest")) {
@@ -3557,9 +3632,34 @@ void setup(void) {
     next_flood_advert_s = (!cfg.flood_advert_h) ? 0xFFFFFFFFUL
                         : (j_last_flood_ts == 0 || since_flood >= flood_iv) ? up + rnd_range(20, 60)
                         : up + (flood_iv - since_flood);
+#ifdef SPECTER_XL
+    r2_adv_schedule(up, next_flood_advert_s);
+#endif
     next_persist_s = up + PERSIST_INTERVAL_MIN * 60UL;
     next_beat_s = up + 60;
     led(false);
+}
+
+static void advert_tick(uint32_t up) {
+    if (cfg.flood_advert_h && (int32_t)(up - next_flood_advert_s) >= 0) {
+#ifdef SPECTER_XL
+        adv_only = !bp.r2_adv_off;               // radio only; radio2 gets the midpoint
+#endif
+        send_advert(true);
+        next_flood_advert_s = up + cfg.flood_advert_h * 3600UL;
+        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
+#ifdef SPECTER_XL
+        adv_only = 0;
+        r2_adv_schedule(up, next_flood_advert_s);
+    } else if (r2_adv_due(up)) {
+        adv_only = 2;
+        send_advert(true);
+        adv_only = 0;
+#endif
+    } else if (cfg.advert_interval_min && (int32_t)(up - next_local_advert_s) >= 0) {
+        send_advert(false);
+        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
+    }
 }
 
 void loop(void) {
@@ -3599,14 +3699,7 @@ void loop(void) {
         return;
     }
 
-    if (cfg.flood_advert_h && (int32_t)(up - next_flood_advert_s) >= 0) {
-        send_advert(true);
-        next_flood_advert_s = up + cfg.flood_advert_h * 3600UL;
-        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
-    } else if (cfg.advert_interval_min && (int32_t)(up - next_local_advert_s) >= 0) {
-        send_advert(false);
-        next_local_advert_s = up + cfg.advert_interval_min * 60UL;
-    }
+    advert_tick(up);
 
     rt_service();
     txq_service(irq);
@@ -3678,6 +3771,9 @@ void loop(void) {
         timers_dirty = false;
         next_local_advert_s = up + cfg.advert_interval_min * 60UL;
         next_flood_advert_s = cfg.flood_advert_h ? up + cfg.flood_advert_h * 3600UL : 0xFFFFFFFFUL;
+#ifdef SPECTER_XL
+        r2_adv_schedule(up, next_flood_advert_s);
+#endif
     }
 
     __WFI();

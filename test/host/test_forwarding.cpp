@@ -211,6 +211,32 @@ int main() {
       n = mk(buf, 8, base+2, false); on_receive(buf, n, 0);
       CHECK(queued() == 0, "advert at flood.max.advert (8) dropped"); clearq(); }
 
+    // ── advert size: no unsigned tail (Halo Keymind Cascade 1.18.0.3; field/direct checks: test_xl) ──
+    { uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = i*5+1; Ed25519::derivePublicKey(pkey, sk);
+      // route: ROUTE_FLOOD or ROUTE_DIRECT; app/app_len: signed app data; tail: unsigned bytes appended
+      auto mk = [&](uint8_t* out, uint8_t route, uint8_t hops, const uint8_t* path, uint32_t ts,
+                    const uint8_t* app, int app_len, int tail, bool forge) {
+          int n = 0; out[n++] = (PT_ADVERT<<2)|route; out[n++] = hops;
+          for (int i = 0; i < hops; i++) out[n++] = path ? path[i] : 0x50+i;
+          uint8_t* pl = out+n; memcpy(pl, pkey, 32); memcpy(pl+32, &ts, 4); memcpy(pl+100, app, app_len);
+          uint8_t m[80]; memcpy(m, pl, 36); memcpy(m+36, app, app_len);
+          Ed25519::sign(pl+36, sk, pkey, m, 36+app_len); if (forge) pl[40] ^= 1;
+          for (int i = 0; i < tail; i++) pl[100+app_len+i] = 0xA0+i;
+          return n+100+app_len+tail; };
+      uint8_t buf[260]; uint32_t base = clock_now() + 200000;
+      uint8_t name[] = {0x82,'R','p','t'};
+      uint8_t full[32]; full[0] = 0x82; for (int i = 1; i < 32; i++) full[i] = 'a'+i%26;
+      int n = mk(buf, ROUTE_FLOOD, 1, NULL, base, full, 32, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with 32 bytes of signed app data forwarded"); clearq();
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+1, full, 32, 3, false); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "advert with an unsigned tail past 32 bytes dropped (oversized)"); clearq();
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+2, NULL, 0, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with no app data still forwarded"); clearq();
+      uint8_t latlon_ok[] = {0x92,1,2,3,4,5,6,7,8};
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+4, latlon_ok, 9, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with complete lat/lon (no name) forwarded"); clearq();
+      (void)name; }
+
     // ── mesh clock sync (consensus of signed advert timestamps) ──────────
     { auto zh = [&](int k, uint32_t ts) {
           uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = (uint8_t)(i * 3 + k * 37 + 11); Ed25519::derivePublicKey(pkey, sk);

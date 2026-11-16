@@ -790,6 +790,47 @@ int main() {
       clearq(); ota(0x07, 1, 4);
       CHECK(queued() == 0, "and OTA relay stops"); clearq(); }
 
+    // ── advert layout + routed-direct signature (Halo Keymind Cascade 1.18.0.3) ──
+    { uint8_t sk[32], pkey[32]; for (int i = 0; i < 32; i++) sk[i] = i*5+1; Ed25519::derivePublicKey(pkey, sk);
+      // route: ROUTE_FLOOD or ROUTE_DIRECT; app/app_len: signed app data; tail: unsigned bytes appended
+      auto mk = [&](uint8_t* out, uint8_t route, uint8_t hops, const uint8_t* path, uint32_t ts,
+                    const uint8_t* app, int app_len, int tail, bool forge) {
+          int n = 0; out[n++] = (PT_ADVERT<<2)|route; out[n++] = hops;
+          for (int i = 0; i < hops; i++) out[n++] = path ? path[i] : 0x50+i;
+          uint8_t* pl = out+n; memcpy(pl, pkey, 32); memcpy(pl+32, &ts, 4); memcpy(pl+100, app, app_len);
+          uint8_t m[80]; memcpy(m, pl, 36); memcpy(m+36, app, app_len);
+          Ed25519::sign(pl+36, sk, pkey, m, 36+app_len); if (forge) pl[40] ^= 1;
+          for (int i = 0; i < tail; i++) pl[100+app_len+i] = 0xA0+i;
+          return n+100+app_len+tail; };
+      uint8_t buf[260]; uint32_t base = clock_now() + 200000;
+      uint8_t name[] = {0x82,'R','p','t'};
+      uint8_t full[32]; full[0] = 0x82; for (int i = 1; i < 32; i++) full[i] = 'a'+i%26;
+      int n = mk(buf, ROUTE_FLOOD, 1, NULL, base, full, 32, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with 32 bytes of signed app data forwarded"); clearq();
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+1, full, 32, 3, false); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "advert with an unsigned tail past 32 bytes dropped (oversized)"); clearq();
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+2, NULL, 0, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with no app data still forwarded"); clearq();
+      uint8_t latlon_short[] = {0x92,1,2,3,4,5,6};                 // lat/lon flag, 6 of 8 bytes
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+3, latlon_short, 7, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "advert with truncated lat/lon dropped"); clearq();
+      uint8_t latlon_ok[] = {0x92,1,2,3,4,5,6,7,8};
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+4, latlon_ok, 9, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 1, "advert with complete lat/lon (no name) forwarded"); clearq();
+      uint8_t feat_short[] = {0x62,1,2,3};                         // feat1+feat2 need 4 bytes
+      n = mk(buf, ROUTE_FLOOD, 1, NULL, base+5, feat_short, 4, 0, false); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "advert with truncated feat1/feat2 dropped"); clearq();
+      uint8_t path[2] = { own_pubkey[0], 0x77 };
+      n = mk(buf, ROUTE_DIRECT, 2, path, base+6, name, 4, 0, true); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "routed-direct forged advert not relayed"); clearq();
+      n = mk(buf, ROUTE_DIRECT, 2, path, base+7, name, 4, 0, false); on_receive(buf, n, 0);
+      TxItem* t = last_q();
+      CHECK(queued() == 1 && t && t->buf[1] == 1 && t->buf[2] == 0x77, "routed-direct valid advert relayed to the next hop"); clearq();
+      on_receive(buf, n, 0);
+      CHECK(queued() == 0, "routed-direct advert duplicate dropped"); clearq();
+      n = mk(buf, ROUTE_DIRECT, 2, path, base+8, full, 32, 2, false); on_receive(buf, n, 0);
+      CHECK(queued() == 0, "routed-direct oversized advert not relayed"); clearq(); }
+
     // ── 1.18.0.3: radio2 (second profile, time-shared)
     { clearq(); fake_ms += 121000;
       CHECK(radio.pre == 32 && pre_eff[0] == 32, "SF7 primary sends a 32-symbol preamble, as upstream 1.18");
@@ -798,6 +839,20 @@ int main() {
       CHECK(cli("set radio2 911,300,7,5,rxtx") == "Error, invalid radio2 params", "radio2: bandwidth must be a LoRa one");
       CHECK(cli("set radio2 911,250,7,5,both") == "Error, invalid radio2 params", "radio2: mode rx or rxtx");
       CHECK(cli("set radio2.cross maybe").find("Error") == 0 && cli("set tx.reply radio force").find("Error") == 0, "cross / tx.reply checks");
+      // regional MediaMesh presets from the saved primary frequency (Halo Keymind Cascade 1.18.0.3)
+      { uint32_t f0 = cfg.freq_khz;
+        cfg.freq_khz = 869618;
+                CHECK(cli("set radio2 mediamesh").find("OK - radio2 869.525,125,5,7,rxtx; timing self-test pending") == 0, "EU868 primary: mediamesh = 869.525 / 125 kHz / SF5 / CR7");
+        CHECK(cli("set radio2 mediamesh-range").find("OK - radio2 869.525,62.5,5,7,rxtx; timing self-test pending") == 0, "EU868 primary: mediamesh-range = 62.5 kHz");
+        cfg.freq_khz = 915800;
+        CHECK(cli("set radio2 mediamesh").find("OK - radio2 922.5,250,7,5,rxtx") == 0, "AU/NZ primary: mediamesh = 922.500");
+        cfg.freq_khz = 433650;
+        CHECK(cli("set radio2 mediamesh-range").find("OK - radio2 434.25,125,7,5,rxtx") == 0, "EU433 primary: mediamesh-range = 434.250 / 125 kHz");
+        cfg.freq_khz = 915000;
+        CHECK(cli("set radio2 mediamesh") == "Error: no regional MediaMesh preset; use tuple", "custom primary: no preset");
+        cfg.freq_khz = 927875;
+        CHECK(cli("set radio2 mediamesh").find("OK - radio2 911.15,250,7,5,rxtx") == 0, "US (927.875) primary: the US channel");
+        cfg.freq_khz = f0; }
       std::string r = cli("set radio2 mediamesh");
       CHECK(r == "OK - radio2 911.15,250,7,5,rxtx; timing self-test pending", "set radio2 mediamesh (911.150 / 250 kHz / SF7 / CR5, rxtx)");
       CHECK(radio.f_khz == 910525, "radio2 waits 2 s so the reply goes out first");
@@ -882,6 +937,54 @@ int main() {
       setup();
       CHECK(cli("get radio2") == "> 911.15,250,7,5,rxtx" && r2_active() && pre_eff[1] == 48, "radio2 survives reboot");
       xl_init(); login(a, "swordfish", ts_now++, false); clearq();
+      // radio2.advert (Halo Keymind Cascade 1.18.0.2/1.18.0.3): periodic flood advert on radio only,
+      // radio2 gets its own halfway between
+      { auto profs = [&]() { int m = 0; for (int i = 0; i < TXQ_SIZE; i++) if (txq[i].used) m |= 1 << txq[i].prof; return m; };
+        auto flood_adv = [&]() { int k = 0; for (int i = 0; i < TXQ_SIZE; i++)
+            if (txq[i].used && ((txq[i].buf[0] >> 2) & 15) == PT_ADVERT && (txq[i].buf[0] & 3) != ROUTE_DIRECT) k++; return k; };
+        CHECK(cli("get radio2.advert") == "> on", "radio2.advert defaults to on");
+        CHECK(cli("set radio2.advert maybe") == "Error: use set radio2.advert on|off", "radio2.advert: on|off only");
+        cli("set flood.advert.interval 12"); cli("set radio2.cross on");
+        uint32_t up = uptime_s(); clearq();
+        next_flood_advert_s = up; uint32_t jt = j_last_flood_ts;
+        advert_tick(up);
+        CHECK(flood_adv() == 1 && profs() == 1, "periodic flood advert: radio only, even with cross on");
+        CHECK(r2_adv_s == up + 6 * 3600UL, "radio2 midpoint scheduled 6 h later (12 h interval)");
+        jt = j_last_flood_ts; clearq();
+        advert_tick(up + 6 * 3600UL - 1);
+        CHECK(queued() == 0, "nothing before the midpoint");
+        advert_tick(up + 6 * 3600UL + 5);
+        CHECK(flood_adv() == 1 && profs() == 2, "midpoint: flood advert on radio2 only");
+        CHECK(j_last_flood_ts == jt && next_flood_advert_s == up + 12 * 3600UL, "midpoint leaves the primary schedule alone");
+        clearq(); advert_tick(up + 6 * 3600UL + 10);
+        CHECK(queued() == 0, "one radio2 advert per interval");
+        // a midpoint missed by more than a minute is skipped
+        up = next_flood_advert_s; advert_tick(up); clearq();
+        advert_tick(up + 6 * 3600UL + 61);
+        CHECK(queued() == 0 && r2_adv_s == 0, "midpoint more than 60 s late: skipped");
+        // radio2.advert off: no midpoint, periodic advert follows the usual policy (cross on: both)
+        CHECK(cli("set radio2.advert off") == "OK" && cli("get radio2.advert") == "> off", "set radio2.advert off");
+        next_flood_advert_s = up; clearq(); advert_tick(up);
+        CHECK(flood_adv() == 2 && profs() == 3, "radio2.advert off: periodic advert follows radio2.cross (both)");
+        clearq(); advert_tick(up + 6 * 3600UL);
+        CHECK(queued() == 0, "radio2.advert off: no midpoint advert");
+        // turned off before the midpoint: not sent
+        cli("set radio2.advert on"); up = next_flood_advert_s; advert_tick(up); clearq();
+        cli("set radio2.advert off"); advert_tick(up + 3600); cli("set radio2.advert on"); advert_tick(up + 3601);
+        advert_tick(up + 6 * 3600UL);
+        CHECK(flood_adv() == 1 && profs() == 2, "off and on again before the midpoint: still sent");
+        clearq(); up = next_flood_advert_s; advert_tick(up); clearq();
+        cli("set radio2.advert off"); advert_tick(up + 6 * 3600UL);
+        CHECK(queued() == 0, "off at the midpoint: not sent");
+        cli("set radio2.advert on");
+        // manual advert keeps the usual policy
+        clearq(); cli("advert");
+        CHECK(profs() == 3, "manual flood advert: usual policy (cross on: both)");
+        // the setting survives reboot
+        cli("set radio2.advert off"); setup();
+        CHECK(cli("get radio2.advert") == "> off", "radio2.advert survives reboot");
+        cli("set radio2.advert on"); cli("set radio2.cross off"); cli("set flood.advert.interval 83");
+        xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
       // off
       flood_on(1);
       CHECK(cli("set radio2 off") == "OK - radio2 off", "set radio2 off");

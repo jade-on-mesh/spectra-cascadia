@@ -45,7 +45,9 @@ nRF52/ESP32-only drivers and bootloaders, OTA install, build tooling, docs-only 
 Bump `FW_VERSION` in `src/main.cpp` (and the `* Version:` header line), add the `CHANGELOG.md` section, push to `main`.
 
 ## Versioning
-- The first three numbers follow official MeshCore. A new official release `X.Y.Z` → `vX.Y.Z.1`.
-- Otherwise bump the fourth number.
-- mikecarper also uses four-part versions. Ours are independent; the changelog names the upstream versions each
-  release covers.
+Since v1.18.0.2.1, versions track Halo Keymind Cascade: its four numbers (the first three are official MeshCore)
+plus a fifth for our own releases on that base.
+- A sync that moves to a new Keymind Cascade version `W.X.Y.Z` → `vW.X.Y.Z.1`.
+- Otherwise bump the fifth number.
+- A new official release that Keymind Cascade hasn't picked up yet: keep the Keymind base, bump the fifth number,
+  and name the official version in the changelog.
