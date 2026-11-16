@@ -7,6 +7,15 @@ Version numbers follow the official MeshCore firmware release this one tracks
 fourth number for our own releases on that base. That number resets to 1 when
 upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
 
+## [1.18.0.6] - 2026-11-15
+
+### Added (XL)
+- `bootloader` (USB console only): restarts into the STM32's built-in ROM bootloader, which takes new firmware over the same USB-C port (115200 baud, 8 data bits, even parity). No ST-Link or BOOT0 jumper needed for updates. The firmware sets a backup-register flag and resets; the next boot jumps to the bootloader before anything else runs, including the watchdog (the ROM bootloader never feeds it). Refused over the air
+- A half-flashed XL board (upper 64 KB missing) also accepts `bootloader` on the USB console, so an interrupted USB update can be retried without the ST-Link
+
+Flash with a tool that erases only the firmware's own pages, so the settings pages (0x0800F800–0x0800FFFF, 0x0801FC00) survive: the MediaMesh Flasher's Spectra-Cascadia tab (Web Serial, coming after bench testing) or STM32CubeProgrammer in UART mode. The first install still needs an ST-Link.
+**Not yet tested on hardware.**
+
 ## [1.18.0.5] - 2026-11-10
 
 Power and battery-reading improvements from [vaddieg/meshcore-specter-dx-lr30](https://github.com/vaddieg/meshcore-specter-dx-lr30), another SPECTER fork with measurements on a battery-powered DX-LR30.

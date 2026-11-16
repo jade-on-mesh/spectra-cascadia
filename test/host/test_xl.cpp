@@ -54,6 +54,8 @@ uint16_t adc_read(uint8_t ch) { return fake_adc[ch]; }
 uint16_t bkp_read(void) { return fake_bkp; }
 void bkp_write(uint16_t v) { fake_bkp = v; }
 void enter_standby(void) { throw StandbyEntered(); }
+struct BootloaderEntered {};
+void rom_bootloader(void) { throw BootloaderEntered(); }
 static uint16_t fake_bkp_dr[8];
 static uint32_t fake_csr = (1UL << 27) | (1UL << 26);     // power-on
 uint16_t bkp_get(int n) { return fake_bkp_dr[n]; }
@@ -919,6 +921,19 @@ int main() {
       cli("set temp.offset 0");
       setup();
       CHECK(cal.vref_mv == 0 && cal.temp_off == 0 && cal.bat_off_mv == 0, "calibration saved and reloaded");
+      xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
+
+    // ── 1.18.0.6: USB firmware updates through the STM32 ROM bootloader
+    { CHECK(rcli(a, "bootloader", 1) == "Error: USB console only" && fake_bkp_dr[4] == 0, "bootloader refused over the air");
+      CHECK(cli("bootloader") == "OK - bootloader" && fake_bkp_dr[4] == BKP_BOOTLOADER && fake_bkp_dr[2] == BKP_REBOOT_MARK,
+            "bootloader (USB): flag set, reset requested");
+      CHECK(Serial1.out.find("115200, 8 data bits, even parity") != std::string::npos, "tells you the port settings");
+      bool entered = false;
+      try { setup(); } catch (BootloaderEntered&) { entered = true; }
+      CHECK(entered && fake_bkp_dr[4] == 0, "next boot goes straight to the ROM bootloader, flag cleared");
+      entered = false;
+      try { setup(); } catch (BootloaderEntered&) { entered = true; }
+      CHECK(!entered && r2_active() == r2_active(), "the boot after that is normal");
       xl_init(); login(a, "swordfish", ts_now++, false); clearq(); }
 
     // ── packets for other nodes are untouched

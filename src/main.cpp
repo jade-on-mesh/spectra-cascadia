@@ -48,7 +48,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.5"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.6"   // upstream MeshCore version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at
@@ -2063,7 +2063,26 @@ static void enter_standby(void) {                 // woken only by the watchdog 
     SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
     while (true) __WFI();
 }
+#ifdef SPECTER_XL
+// Start the STM32's own ROM bootloader, as if BOOT0 were held high. It listens on
+// USART1 (PA9/PA10), which is the USB-C console through the CH340, so firmware can
+// be written over USB at 115200 baud, 8 data bits, even parity. Called from the top
+// of setup(), before the watchdog is started (the ROM bootloader never feeds it).
+static void rom_bootloader(void) {
+    HAL_RCC_DeInit();                              // back to the 8 MHz HSI the bootloader expects
+    __disable_irq();
+    SysTick->CTRL = 0; SysTick->LOAD = 0; SysTick->VAL = 0;
+    for (int i = 0; i < 8; i++) { NVIC->ICER[i] = 0xFFFFFFFFUL; NVIC->ICPR[i] = 0xFFFFFFFFUL; }
+    RCC->APB2RSTR = 0xFFFFFFFFUL; RCC->APB2RSTR = 0;   // GPIO, USART1, SPI1, ADC back to reset state
+    __set_MSP(*(volatile uint32_t*)0x1FFFF000UL);
+    void (*boot)(void) = (void (*)(void))(*(volatile uint32_t*)0x1FFFF004UL);
+    __enable_irq();
+    boot();
+    while (true) {}
+}
+#endif
 #else
+void     rom_bootloader(void);
 uint16_t adc_read(uint8_t ch);                    // host tests provide these
 uint16_t bkp_read(void);
 void     bkp_write(uint16_t v);
@@ -2094,6 +2113,7 @@ static void reset_reason_capture(bool cutoff_wake) {
     bkp_set(3, wdt_resets);
 }
 static void reboot_now(void) { bkp_set(2, BKP_REBOOT_MARK); NVIC_SystemReset(); }
+#define BKP_BOOTLOADER 0xB10DU                     // DR4: start the ROM bootloader on the next boot
 
 // Put the SX1262 in cold sleep with raw SPI (works before/without radio.begin()).
 static void radio_cold_sleep(void) {
@@ -3172,6 +3192,14 @@ XL_HI static void handle_command(char* cmd, char* reply) {
         tr_apply_at = 0;
         if (tr_active) tr_revert_at = millis() + 2000;   // the loop reverts once the reply is on air
         strcpy(reply, "OK - restoring normal radio");
+    } else if (!strcmp(cmd, "bootloader")) {          // USB console only (refused over the air)
+        Serial1.println("Starting the STM32 bootloader: flash over this port at 115200, 8 data bits, even parity.");
+        Serial1.println("Settings survive if only the firmware pages are erased (MediaMesh Flasher, CubeProgrammer).");
+        Serial1.flush();
+        journal_write(clock_now(), j_last_flood_ts);
+        bkp_set(4, BKP_BOOTLOADER);
+        reboot_now();
+        strcpy(reply, "OK - bootloader");                // host tests only (the reset doesn't return)
     } else if (!strncmp(cmd, "battery.charged", 15) && (!cmd[15] || cmd[15] == ' ')) {
         // With a fully charged cell (vaddieg): scale VREFINT so the reading matches V (default 4.20).
         const char* v = skip_ws(cmd + 15);
@@ -3318,7 +3346,8 @@ XL_HI static void handle_command_from(char* cmd, char* reply, uint32_t sender_ts
         reply += 3; cmd += 3;
         reply[0] = 0;
     }
-    if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4) || !strcmp(cmd, "get acl")) {
+    if (strstr(cmd, "prv.key") || !strcmp(cmd, "erase") || !strncmp(cmd, "log ", 4) || !strcmp(cmd, "get acl")
+        || !strcmp(cmd, "bootloader")) {
         strcpy(reply, "Error: USB console only"); return;
     }
     if (!strcmp(cmd, "clock sync")) {
@@ -3373,6 +3402,10 @@ static void cli_poll(void) {
 static uint32_t next_local_advert_s = 0, next_flood_advert_s = 0, next_persist_s = 0, next_beat_s = 0;
 
 void setup(void) {
+#ifdef SPECTER_XL
+    // "bootloader" (USB console) set this and reset; nothing else has run yet.
+    if (bkp_get(4) == BKP_BOOTLOADER) { bkp_set(4, 0); rom_bootloader(); }
+#endif
     pinMode(PIN_LED, OUTPUT);
     led(true);
     pinMode(PIN_TXEN, OUTPUT); digitalWrite(PIN_TXEN, LOW);
@@ -3383,7 +3416,23 @@ void setup(void) {
     if (xl_magic_word != XL_MAGIC) {                 // nothing from the upper half has run yet
         Serial1.println(FW_NAME " XL: upper 64 KB of flash is blank or missing.");
         Serial1.println("Flash the complete .hex file (this build needs a 128 KB chip).");
-        while (true) { led(true); delay(150); led(false); delay(850); }
+        Serial1.println("Type 'bootloader' to flash over USB.");
+        // Recovery after an interrupted USB update: accept "bootloader" here too.
+        static const char bl[] = "bootloader";
+        uint8_t got = 0;
+        while (true) {
+            led(true); delay(150); led(false);
+            for (int i = 0; i < 85; i++) {
+                delay(10);
+                while (Serial1.available()) {
+                    char c = Serial1.read();
+                    if (c == '\r' || c == '\n') {
+                        if (got == sizeof(bl) - 1) { bkp_set(4, BKP_BOOTLOADER); Serial1.flush(); NVIC_SystemReset(); }
+                        got = 0;
+                    } else got = (got < sizeof(bl) - 1 && c == bl[got]) ? got + 1 : 0xFF;
+                }
+            }
+        }
     }
     radio_p = new Radio(new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI));
 #endif

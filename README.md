@@ -124,6 +124,13 @@ a switch takes and sets its own preambles to match (radio: 32 symbols, MediaMesh
 covers the normal network; MediaMesh senders need about 48. Noise-floor sampling and
 `int.thresh` pause while scanning. Changes take effect 2 s after the reply.
 
+**Updating over USB (1.18.0.6+).** Once a board runs XL 1.18.0.6 or later, type `bootloader`
+on the USB console. The board restarts into the STM32's built-in bootloader on the same
+USB-C port (115200 baud, 8 data bits, even parity) and takes the new `.hex` without an
+ST-Link. Use a tool that erases only the firmware's pages so settings survive (the
+MediaMesh Flasher, or STM32CubeProgrammer in UART mode; not a full-chip erase). A board
+left half-flashed by an interrupted update still accepts `bootloader` while it blinks.
+
 **Before flashing XL, run `tools/flash128_test` on that board** (each chip has to pass).
 If the upper half is missing or wasn't written, XL stops at boot, prints why on the
 serial port and blinks the LED slowly. It doesn't run half-installed.
