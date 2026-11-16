@@ -48,7 +48,7 @@
 #endif
 
 #define FW_NAME    "Spectra-Cascadia"
-#define FW_VERSION "v1.18.0.6"   // upstream MeshCore version + our release number
+#define FW_VERSION "v1.18.0.2.1" // Halo Keymind Cascade version + our release number
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  First-boot defaults — override with -D in platformio.ini (or change at

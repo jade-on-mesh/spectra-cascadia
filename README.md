@@ -5,6 +5,8 @@
 > The DX-LR30 is a cheap Chinese LoRa shell device. MeshCore has no official
 > firmware for STM32F103 + SX1262.
 
+**Version numbers** track Halo Keymind Cascade: `v1.18.0.2.1` is Keymind Cascade 1.18.0.2 (itself official MeshCore 1.18.0) plus our release 1. Releases up to 1.18.0.6 used official MeshCore + ours; see [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## v2.x (CascadiaMesh fork): what changed and why

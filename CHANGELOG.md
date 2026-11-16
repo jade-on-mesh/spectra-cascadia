@@ -2,10 +2,17 @@
 
 All notable changes to Spectra-Cascadia (formerly SPECTER) firmware are documented here.
 
-Version numbers follow the official MeshCore firmware release this one tracks
-(the first three numbers, currently 1.18.0, as on meshcore.io/flasher), plus a
-fourth number for our own releases on that base. That number resets to 1 when
-upstream moves. Releases before 1.17.1.1 used internal numbers 2.0–2.6.
+Version numbers follow the Halo Keymind Cascade release this one tracks (the
+first four numbers, currently 1.18.0.2; its first three are the official
+MeshCore release, 1.18.0), plus a fifth number for our own releases on that
+base. That number resets to 1 when Keymind Cascade moves. Releases 1.17.1.1
+through 1.18.0.6 used four numbers (official MeshCore + ours); before that,
+internal numbers 2.0–2.6.
+
+## [1.18.0.2.1] - 2026-11-15
+
+### Changed
+- Version numbering now tracks Halo Keymind Cascade: 1.18.0.2.1 is Keymind Cascade 1.18.0.2 + our release 1. The firmware is the same as 1.18.0.6 (radio2, power modes and calibration, USB updates). Version strings compare lower than 1.18.0.3–1.18.0.6 even though this is newer; go by the date.
 
 ## [1.18.0.6] - 2026-11-15
 
